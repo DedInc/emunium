@@ -1,10 +1,10 @@
 # 🤖 Emunium
 
-A Python module for automating interactions to mimic human behavior in browsers when using Selenium. Provides utilities to programmatically move the mouse cursor, click on page elements, type text, and scroll as if performed by a human user.
+A Python module for automating interactions to mimic human behavior in browsers when using Selenium or Pyppeteer. Provides utilities to programmatically move the mouse cursor, click on page elements, type text, and scroll as if performed by a human user.
 
-## 🚀 Quickstart
+## 🚀 Quickstart (with Selenium)
 
-![Emunium preview](preview.gif)
+![Emunium preview](https://raw.githubusercontent.com/DedInc/emunium/main/preview.gif)
 
 ```python
 import time
@@ -12,11 +12,11 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from emunium import Emunium
+from emunium import EmuniumSelenium
 
 driver = webdriver.Chrome()
 wait = WebDriverWait(driver, 10)
-emunium = Emunium(driver)
+emunium = EmuniumSelenium(driver)
 
 driver.get('https://duckduckgo.com/')
 
@@ -29,6 +29,37 @@ submit = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, '[aria-label="S
 emunium.find_and_move(submit, click=True)
 time.sleep(5)
 driver.quit()
+```
+
+## 🚀 Quickstart (with Pyppeteer)
+
+![Emunium preview](https://raw.githubusercontent.com/DedInc/emunium/main/preview_ppeteer.gif)
+
+```python
+import asyncio
+import pyppeteer
+from emunium import EmuniumPpeteer
+
+async def main():
+    browser = await pyppeteer.launch(headless=False)  
+    page = await browser.newPage()
+    await page.bringToFront()
+    emunium = EmuniumPpeteer(page)
+
+    await page.goto('https://duckduckgo.com/')
+
+    element = await page.waitForSelector('[data-state="suggesting"]')
+    await emunium.find_and_move(element, click=True)
+
+    await emunium.silent_type('Automating searches')
+
+    submit = await page.waitForSelector('[aria-label="Search"]')
+    await emunium.find_and_move(submit, click=True)
+    await asyncio.sleep(5)
+
+    await browser.close()
+
+asyncio.get_event_loop().run_until_complete(main())
 ```
 
 ## 🖱 Moving the Mouse
@@ -59,4 +90,4 @@ Includes timeouts and checks to handle issues scroll getting stuck.
 
 Emunium provides a set of utilities to help automate browser interactions in a more human-like way when using Selenium. By moving the mouse, clicking, typing, and scrolling in a less robotic fashion, tests can avoid detection and run more reliably.
 
-While basic Selenium scripts can still get the job done, Emunium aims to make tests appear even more life-like. Using the randomizations and smooth behaviors it offers can be beneficial for automation projects that require avoiding detections.
+While basic Selenium or Pyppeteer scripts can still get the job done, Emunium aims to make tests appear even more life-like. Using the randomizations and smooth behaviors it offers can be beneficial for automation projects that require avoiding detections.

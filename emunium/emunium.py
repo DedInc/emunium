@@ -1,11 +1,15 @@
-import pyautogui
+import asyncio
 import keyboard
 import time
 import random
+import pyautogui
+import math
+import pyclick
 
-class Emunium:
+class EmuniumSelenium:
     def __init__(self, driver):
         self.driver = driver
+        self.clicker = pyclick.HumanClicker()
         
     def get_center(self, element):
         coords = self.driver.execute_script("""
@@ -24,36 +28,19 @@ class Emunium:
 
     def find_and_move(self, element, click=False, offset_x=0, offset_y=0):
         center = self.get_center(element)
-        target_x, target_y = center['x'], center['y']
-
-        target_x += offset_x
-        target_y += offset_y
+        target_x, target_y = round(center['x'] + offset_x), round(center['y'] + offset_y)
 
         current_x, current_y = pyautogui.position()
-        distance = ((target_x - current_x) ** 2 + (target_y - current_y) ** 2) ** 0.5
-        steps = random.randint(5, 10)
-        speed = random.uniform(0.1, 0.15)
+        distance = math.sqrt((target_x - current_x) ** 2 + (target_y - current_y) ** 2)
 
-        steps = round(steps / 1.5)
+        speed = max(0.3, min(2.0, distance / 500))
 
-        x_distance = (target_x - current_x) / steps
-        y_distance = (target_y - current_y) / steps
-
-        for step in range(steps):
-            pyautogui.moveTo(current_x + x_distance, current_y + y_distance, duration=speed)
-            current_x, current_y = pyautogui.position()
-            remaining_distance = ((target_x - current_x) ** 2 + (target_y - current_y) ** 2) ** 0.5
-            time.sleep(0.01)
-
-            if remaining_distance < distance / 2:
-                speed /= 2
-
-        pyautogui.moveTo(target_x, target_y, duration=speed)
+        self.clicker.move((target_x, target_y), speed)
 
         if click:
-            pyautogui.click(target_x, target_y)
+            self.clicker.click()
 
-    def silent_type(self, text, characters_per_minute=250, offset=20):
+    def silent_type(self, text, characters_per_minute=280, offset=20):
         total_chars = len(text)
         time_per_char = 60 / characters_per_minute
 
@@ -88,3 +75,66 @@ class Emunium:
 
             scroll_to_element(element)
             time.sleep(interval)
+
+class EmuniumPpeteer:
+    def __init__(self, page):
+        self.page = page        
+        self.clicker = pyclick.HumanClicker()
+
+    async def get_center(self, element):
+        return await self.page.evaluate('''(element) => {
+            const rect = element.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2 + window.scrollX;
+            const centerY = rect.top + rect.height / 2 + (window.scrollY || window.pageYOffset) + (screen.height - window.innerHeight) / 1.4;
+            return {x: centerX, y: centerY};
+        }''', element)
+
+    async def find_and_move(self, element, click=False, offset_x=0, offset_y=0):
+        center = await self.get_center(element)        
+        target_x, target_y = round(center['x'] + offset_x), round(center['y'] + offset_y)
+
+        current_x, current_y = pyautogui.position()
+        distance = math.sqrt((target_x - current_x) ** 2 + (target_y - current_y) ** 2)
+
+        speed = max(0.3, min(2.0, distance / 500))
+
+        self.clicker.move((target_x, target_y), speed)
+
+        if click:
+            self.clicker.click()
+
+    async def silent_type(self, text, characters_per_minute=280, offset=20):
+        total_chars = len(text)
+        time_per_char = 60 / characters_per_minute
+
+        for i, char in enumerate(text):
+            randomized_offset = random.uniform(-offset, offset) / 1000
+            delay = time_per_char + randomized_offset
+
+            keyboard.write(char)
+            await asyncio.sleep(delay)
+
+    async def scroll_smoothly_to_element(self, element):
+        is_element_in_viewport = await self.page.evaluate('''(element) => {
+            const rect = element.getBoundingClientRect();
+            return (
+                rect.top >= 0 &&
+                rect.left >= 0 &&
+                rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
+                rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+            );
+        }''', element)
+
+        scroll_to_element = await self.page.evaluate('''(element) => {
+            element.scrollIntoView({ behavior: "smooth", block: "start" });
+        }''', element)
+
+        interval = 0.1
+        start_time = time.time()
+
+        while not is_element_in_viewport:
+            if time.time() - start_time > 5:
+                break
+
+            await scroll_to_element
+            await asyncio.sleep(interval)
