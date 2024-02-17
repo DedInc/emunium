@@ -26,14 +26,14 @@ class EmuniumSelenium:
             'y': coords['y']
         }
 
-    def find_and_move(self, element, click=False, offset_x=0, offset_y=0):
+    def find_and_move(self, element, click=False, offset_x=random.uniform(0.0, 1.5), offset_y=random.uniform(0.0, 1.5)):
         center = self.get_center(element)
         target_x, target_y = round(center['x'] + offset_x), round(center['y'] + offset_y)
 
         current_x, current_y = pyautogui.position()
         distance = math.sqrt((target_x - current_x) ** 2 + (target_y - current_y) ** 2)
 
-        speed = max(0.3, min(2.0, distance / 500))
+        speed = max(random.uniform(0.3, 0.6), min(random.uniform(2.0, 2.5), distance / random.randint(500, 700)))
 
         self.clicker.move((target_x, target_y), speed)
 
@@ -89,14 +89,14 @@ class EmuniumPpeteer:
             return {x: centerX, y: centerY};
         }''', element)
 
-    async def find_and_move(self, element, click=False, offset_x=0, offset_y=0):
+    async def find_and_move(self, element, click=False, offset_x=random.uniform(0.0, 1.5), offset_y=random.uniform(0.0, 1.5)):
         center = await self.get_center(element)        
         target_x, target_y = round(center['x'] + offset_x), round(center['y'] + offset_y)
 
         current_x, current_y = pyautogui.position()
         distance = math.sqrt((target_x - current_x) ** 2 + (target_y - current_y) ** 2)
 
-        speed = max(0.3, min(2.0, distance / 500))
+        speed = max(random.uniform(0.3, 0.6), min(random.uniform(2.0, 2.5), distance / random.randint(500, 700)))
 
         self.clicker.move((target_x, target_y), speed)
 
