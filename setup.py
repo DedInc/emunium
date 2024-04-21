@@ -5,7 +5,7 @@ with open('README.md', 'r', encoding='utf-8') as f:
 
 setup(
     name='emunium',
-    version='1.0.2',
+    version='1.5.0',
     author='Maehdakvan',
     author_email='visitanimation@google.com',
     description='A Python module for automating interactions to mimic human behavior in browsers when using Selenium or Pyppeteer. Provides utilities to programmatically move the mouse cursor, click on page elements, type text, and scroll as if performed by a human user.',

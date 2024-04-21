@@ -1,29 +1,56 @@
 import asyncio
-import keyboard
-import time
-import random
-import pyautogui
 import math
+import os
+import random
+import tempfile
+import time
+import struct
+
+import keyboard
+import pyautogui
 import pyclick
+
+def get_image_size(file_path):
+    with open(file_path, 'rb') as file:
+        file.seek(16)
+        width_bytes = file.read(4)
+        height_bytes = file.read(4)
+        width = struct.unpack('>I', width_bytes)[0]
+        height = struct.unpack('>I', height_bytes)[0]
+        return (width, height,)
 
 class EmuniumSelenium:
     def __init__(self, driver):
         self.driver = driver
         self.clicker = pyclick.HumanClicker()
+        self.browser_offsets = ()
+        self.browser_inner_window = ()
         
+    def _get_browser_properties_if_not_found(self):
+        if not self.browser_offsets or not self.browser_inner_window:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_screen_path = temp_file.name
+            self.driver.save_screenshot(temp_screen_path)
+            location = pyautogui.locateOnScreen(temp_screen_path, confidence=0.8)
+            self.browser_offsets = (location.left, location.top,)
+            self.browser_inner_window = get_image_size(temp_screen_path)
+            os.remove(temp_screen_path)
+
     def get_center(self, element):
-        coords = self.driver.execute_script("""
-            var element = arguments[0];
-            var rect = element.getBoundingClientRect();
-            var centerX = rect.left + rect.width / 2 + window.scrollX;
-            var centerY = rect.top + rect.height / 2 + (window.scrollY || window.pageYOffset) + (screen.height - window.innerHeight) / 1.5;
+        self._get_browser_properties_if_not_found()
 
-            return {x: centerX, y: centerY};
-        """, element)
+        element_location = element.location
+        offset_to_screen_x, offset_to_screen_y = self.browser_offsets
+        element_x = element_location['x'] + offset_to_screen_x
+        element_y = element_location['y'] + offset_to_screen_y
 
+        element_size = element.size
+        centered_x = element_x + (element_size['width'] // 2)
+        centered_y = element_y + (element_size['height'] // 2)
+    
         return {
-            'x': coords['x'],
-            'y': coords['y']
+            'x': centered_x,
+            'y': centered_y
         }
 
     def find_and_move(self, element, click=False, offset_x=random.uniform(0.0, 1.5), offset_y=random.uniform(0.0, 1.5)):
@@ -52,42 +79,64 @@ class EmuniumSelenium:
             time.sleep(delay)
 
     def scroll_smoothly_to_element(self, element):
-        def is_element_in_viewport(element):
-            return self.driver.execute_script("""
-                var rect = arguments[0].getBoundingClientRect();
-                return (
-                    rect.top >= 0 &&
-                    rect.left >= 0 &&
-                    rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-                    rect.right <= (window.innerWidth || document.documentElement.clientWidth)
-                );
-            """, element)
+        self._get_browser_properties_if_not_found()
 
-        def scroll_to_element(element):
-            self.driver.execute_script("arguments[0].scrollIntoView({ behavior: 'smooth', block: 'start' });", element)
-
-        interval = 0.1
-        start_time = time.time()
-
-        while not is_element_in_viewport(element):
-            if time.time() - start_time > 5:
-                break
-
-            scroll_to_element(element)
-            time.sleep(interval)
+        element_rect = element.rect        
+        window_width = self.browser_inner_window[0]
+        window_height = self.browser_inner_window[1]
+        
+        scroll_amount = element_rect['y'] - window_height // 2
+        scroll_steps = abs(scroll_amount) // 100
+        
+        if scroll_amount > 0:
+            scroll_direction = -1
+        else:
+            scroll_direction = 1
+        
+        for _ in range(scroll_steps):
+            pyautogui.scroll(scroll_direction * 100)
+            time.sleep(random.uniform(0.05, 0.1))
+        
+        remaining_scroll = scroll_amount % 100
+        if remaining_scroll != 0:
+            pyautogui.scroll(scroll_direction * remaining_scroll)
+            time.sleep(random.uniform(0.05, 0.1))
 
 class EmuniumPpeteer:
     def __init__(self, page):
         self.page = page        
         self.clicker = pyclick.HumanClicker()
+        self.browser_offsets = ()
+        self.browser_inner_window = ()
+
+    async def _get_browser_properties_if_not_found(self):
+        if not self.browser_offsets or not self.browser_inner_window:
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_screen_path = temp_file.name
+            await self.page.screenshot(path=temp_screen_path)
+            location = pyautogui.locateOnScreen(temp_screen_path, confidence=0.8)
+            self.browser_offsets = (location.left, location.top,)
+            self.browser_inner_window = get_image_size(temp_screen_path)
+            os.remove(temp_screen_path)
 
     async def get_center(self, element):
-        return await self.page.evaluate('''(element) => {
-            const rect = element.getBoundingClientRect();
-            const centerX = rect.left + rect.width / 2 + window.scrollX;
-            const centerY = rect.top + rect.height / 2 + (window.scrollY || window.pageYOffset) + (screen.height - window.innerHeight) / 1.4;
-            return {x: centerX, y: centerY};
-        }''', element)
+        await self._get_browser_properties_if_not_found()
+
+        rect = await element.boundingBox()
+        if rect is None:
+            return None
+
+        offset_to_screen_x, offset_to_screen_y = self.browser_offsets
+        element_x = rect['x'] + offset_to_screen_x
+        element_y = rect['y'] + offset_to_screen_y
+        element_width = rect['width']
+        element_height = rect['height']
+        centered_x = element_x + (element_width // 2)
+        centered_y = element_y + (element_height // 2)
+        return {
+            'x': centered_x,
+            'y': centered_y
+        }
 
     async def find_and_move(self, element, click=False, offset_x=random.uniform(0.0, 1.5), offset_y=random.uniform(0.0, 1.5)):
         center = await self.get_center(element)        
@@ -115,26 +164,28 @@ class EmuniumPpeteer:
             await asyncio.sleep(delay)
 
     async def scroll_smoothly_to_element(self, element):
-        is_element_in_viewport = await self.page.evaluate('''(element) => {
-            const rect = element.getBoundingClientRect();
-            return (
-                rect.top >= 0 &&
-                rect.left >= 0 &&
-                rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-                rect.right <= (window.innerWidth || document.documentElement.clientWidth)
-            );
-        }''', element)
+        await self._get_browser_properties_if_not_found()
 
-        scroll_to_element = await self.page.evaluate('''(element) => {
-            element.scrollIntoView({ behavior: "smooth", block: "start" });
-        }''', element)
+        element_rect = await element.boundingBox()
+        if element_rect is None:
+            return None
 
-        interval = 0.1
-        start_time = time.time()
-
-        while not is_element_in_viewport:
-            if time.time() - start_time > 5:
-                break
-
-            await scroll_to_element
-            await asyncio.sleep(interval)
+        window_width = self.browser_inner_window[0]
+        window_height = self.browser_inner_window[1]
+        
+        scroll_amount = element_rect['y'] - window_height // 2
+        scroll_steps = abs(scroll_amount) // 100
+        
+        if scroll_amount > 0:
+            scroll_direction = -1
+        else:
+            scroll_direction = 1
+        
+        for _ in range(scroll_steps):
+            pyautogui.scroll(scroll_direction * 100)
+            await asyncio.sleep(random.uniform(0.05, 0.1))
+        
+        remaining_scroll = scroll_amount % 100
+        if remaining_scroll != 0:
+            pyautogui.scroll(scroll_direction * remaining_scroll)
+            await asyncio.sleep(random.uniform(0.05, 0.1))
