@@ -1,2 +1,5 @@
 include README.MD
 include LICENSE
+include emunium/base.py
+include emunium/browsers.py
+include emunium/standalone.py
