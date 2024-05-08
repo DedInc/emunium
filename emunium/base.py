@@ -6,7 +6,11 @@ import tempfile
 import time
 import struct
 
-import keyboard
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
+
 import pyautogui
 import pyclick
 
@@ -118,21 +122,16 @@ class EmuniumBase:
             randomized_offset = random.uniform(-offset, offset) / 1000
             delay = time_per_char + randomized_offset
 
-            keyboard.write(char)
+            # Update by Pranav (https://github.com/ps428)
+            # keyboard.write used in silent_type needs sudo mode on Linux machines
+            # This uses pyautogui.press instead of keyboard.write
+            if keyboard is None:
+                pyautogui.press(char)
+            else:
+                keyboard.write(char)
+
             time.sleep(delay)
 
-    # Update by Pranav (https://github.com/ps428)
-    # keyboard.write used in silent_type needs sudo mode on Linux machines
-    # This uses pyautogui.press instead of keyboard.write
-    def silent_type_pyautogui(self, text, characters_per_minute=280, offset=20):
-        time_per_char = 60 / characters_per_minute
-
-        for i, char in enumerate(text):
-            randomized_offset = random.uniform(-offset, offset) / 1000
-            delay = time_per_char + randomized_offset
-
-            pyautogui.press(char)
-            time.sleep(delay)
 
     def _scroll_smoothly_to_element(self, element_rect):
         window_width = self.browser_inner_window[0]
