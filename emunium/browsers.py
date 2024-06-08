@@ -72,7 +72,7 @@ class EmuniumPpeteer(EmuniumBase):
         center = await self.get_center(element)
         self._move(center)
         self._click(click_type)
-        await self.silent_type(text, characters_per_minute, offset)
+        self.silent_type(text, characters_per_minute, offset)
 
     async def scroll_to(self, element):
         await self._get_browser_properties_if_not_found()
@@ -91,7 +91,14 @@ class EmuniumPlaywright(EmuniumBase):
 
     async def _get_browser_properties_if_not_found(self):
         async def screenshot_func(path):
-            await self.page.screenshot(path=path)
+            viewport_size = self.page.viewport_size
+            clip = {
+                'x': 0,
+                'y': 0,
+                'width': viewport_size['width'] // 2,
+                'height': viewport_size['height'] // 2
+            }
+            await self.page.screenshot(path=path, clip=clip)
         await super()._get_browser_properties_if_not_found(screenshot_func)
 
     async def get_center(self, element):
@@ -116,7 +123,7 @@ class EmuniumPlaywright(EmuniumBase):
         center = await self.get_center(element)
         self._move(center)
         self._click(click_type)
-        await self.silent_type(text, characters_per_minute, offset)
+        self.silent_type(text, characters_per_minute, offset)
 
     async def scroll_to(self, element):
         await self._get_browser_properties_if_not_found()

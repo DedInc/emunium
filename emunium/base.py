@@ -66,7 +66,8 @@ class EmuniumBase:
                 await screenshot_func(temp_screen_path)
             else:
                 screenshot_func(temp_screen_path)
-            location = pyautogui.locateOnScreen(temp_screen_path, confidence=0.8)
+
+            location = pyautogui.locateOnScreen(temp_screen_path, confidence=0.6)
             self.browser_offsets = (
                 location.left,
                 location.top,
