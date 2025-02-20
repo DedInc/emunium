@@ -5,7 +5,7 @@ with open('README.md', 'r', encoding='utf-8') as f:
 
 setup(
     name='emunium',
-    version='2.0.2',
+    version='2.1.0',
     author='Maehdakvan',
     author_email='visitanimation@google.com',
     description='A Python module for automating interactions to mimic human behavior in standalone apps or browsers when using Selenium, Pyppeteer, or Playwright.',
@@ -22,6 +22,6 @@ setup(
     ],
     packages=find_packages(),
     include_package_data = True,
-    install_requires = ['asyncio', 'pyclick', 'keyboard'],
+    install_requires = ['asyncio', 'HumanCursor', 'keyboard'],
     python_requires='>=3.6'
 )

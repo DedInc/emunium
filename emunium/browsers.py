@@ -24,14 +24,12 @@ class EmuniumSelenium(EmuniumBase):
 
     def click_at(self, element, click_type=ClickType.LEFT):
         center = self.get_center(element)
-        self._move(center)
-        self._click(click_type)
+        self._click([center['x'], center['y']], click_type=click_type)
 
     def type_at(self, element, text, characters_per_minute=280, offset=20, click_type=ClickType.LEFT):
             center = self.get_center(element)
-            self._move(center)
-            self._click(click_type)
-            self.silent_type(text, characters_per_minute, offset)
+            self._click([center['x'], center['y']], click_type=click_type)
+            self._silent_type(text, characters_per_minute, offset)
 
     def scroll_to(self, element):
         asyncio.run(self._get_browser_properties_if_not_found())
@@ -65,14 +63,12 @@ class EmuniumPpeteer(EmuniumBase):
 
     async def click_at(self, element, click_type=ClickType.LEFT):
         center = await self.get_center(element)
-        self._move(center)
-        self._click(click_type)
+        self._click([center['x'], center['y']], click_type=click_type)
 
     async def type_at(self, element, text, characters_per_minute=280, offset=20, click_type=ClickType.LEFT):
         center = await self.get_center(element)
-        self._move(center)
-        self._click(click_type)
-        self.silent_type(text, characters_per_minute, offset)
+        self._click([center['x'], center['y']], click_type=click_type)
+        self._silent_type(text, characters_per_minute, offset)
 
     async def scroll_to(self, element):
         await self._get_browser_properties_if_not_found()
@@ -116,14 +112,12 @@ class EmuniumPlaywright(EmuniumBase):
 
     async def click_at(self, element, click_type=ClickType.LEFT):
         center = await self.get_center(element)
-        self._move(center)
-        self._click(click_type)
+        self._click([center['x'], center['y']], click_type=click_type)
 
     async def type_at(self, element, text, characters_per_minute=280, offset=20, click_type=ClickType.LEFT):
         center = await self.get_center(element)
-        self._move(center)
-        self._click(click_type)
-        self.silent_type(text, characters_per_minute, offset)
+        self._click([center['x'], center['y']], click_type=click_type)
+        self._silent_type(text, characters_per_minute, offset)
 
     async def scroll_to(self, element):
         await self._get_browser_properties_if_not_found()
