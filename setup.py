@@ -5,7 +5,7 @@ with open('README.md', 'r', encoding='utf-8') as f:
 
 setup(
     name='emunium',
-    version='2.1.0',
+    version='2.1.1',
     author='Maehdakvan',
     author_email='visitanimation@google.com',
     description='A Python module for automating interactions to mimic human behavior in standalone apps or browsers when using Selenium, Pyppeteer, or Playwright.',

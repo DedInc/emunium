@@ -103,14 +103,14 @@ class EmuniumBase:
             window_width, window_height = screen_size.width, screen_size.height
 
         scroll_amount = element_rect["y"] - window_height // 2
-        scroll_steps = abs(scroll_amount) // 100
+        scroll_steps = int(abs(scroll_amount) // 100)
         scroll_direction = -1 if scroll_amount > 0 else 1
 
         for _ in range(scroll_steps):
             pyautogui.scroll(scroll_direction * 100)
             time.sleep(random.uniform(0.05, 0.1))
 
-        remaining_scroll = scroll_amount % 100
+        remaining_scroll = int(scroll_amount % 100)
         if remaining_scroll != 0:
             pyautogui.scroll(scroll_direction * remaining_scroll)
             time.sleep(random.uniform(0.05, 0.1))
