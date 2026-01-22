@@ -1,65 +1,55 @@
-# 🤖 Emunium
+# Emunium
 
-Emunium is a Python module that helps you automate interactions in a human-like way. It works with standalone applications or browsers when using Selenium, Pyppeteer, or Playwright. Emunium makes the mouse movements, clicks, typing, and scrolling appear more natural, which can help your tests avoid detection.
+Python library for human-like browser automation. Adds randomized mouse movements, realistic typing patterns, and smooth scrolling to Selenium, Pyppeteer, and Playwright. Also works standalone with image/OCR detection.
 
-![Emunium preview](https://raw.githubusercontent.com/DedInc/emunium/main/preview.gif)
+![Preview](https://raw.githubusercontent.com/DedInc/emunium/main/preview.gif)
 
----
+## Installation
 
-## 🚀 Quickstart (Standalone)
+```bash
+pip install emunium
+```
 
-Below is a basic example that shows how to search for an image on your screen, type some text, and click a button. This example uses standalone mode.
+For OCR support (standalone mode only):
+```bash
+pip install easyocr
+```
+
+## Usage
+
+### Standalone mode
+
+Uses image matching to find and interact with screen elements. Useful for automating desktop applications.
 
 ```python
 from emunium import Emunium, ClickType
 
-# Create an instance of Emunium
 emunium = Emunium()
 
-# Find a text field on the screen using an image of the field
+# Find and type into a text field
 elements = emunium.find_elements('field.png', min_confidence=0.8)
-
-# Type into the first found element
 emunium.type_at(elements[0], 'Automating searches')
 
-# Find the search icon using an image and click it
+# Find and click search button
 elements = emunium.find_elements('search_icon.png', min_confidence=0.8)
 emunium.click_at(elements[0])
 ```
 
----
+### OCR text detection
 
-## 🔍 OCR Text Search (only in Standalone)
-
-Emunium can also search for text on the screen using Optical Character Recognition (OCR). To use this feature, create your Emunium instance with OCR enabled. This uses [EasyOCR](https://github.com/JaidedAI/EasyOCR) under the hood.
-
-### How It Works
-
-The new `find_text_elements()` method scans the screen for text that matches your query. You can adjust the minimum confidence and limit the number of results.
-
-### Example
+Requires `easyocr` to be installed. Finds text on screen instead of using images.
 
 ```python
 from emunium import Emunium
 
-# Create an Emunium instance with OCR enabled.
-emunium = Emunium(ocr=True, use_gpu=True, langs=['en']) # use_gpu is default True, langs is default ['en'], ocr is default False
+emunium = Emunium(ocr=True, use_gpu=True, langs=['en'])
 
-# Search for text that contains the word "Submit"
-text_elements = emunium.find_text_elements('Submit', min_confidence=0.8) # min_confidence is default 0.8
-
-# If the text is found, click on the first occurrence.
+text_elements = emunium.find_text_elements('Submit', min_confidence=0.8)
 if text_elements:
     emunium.click_at(text_elements[0])
 ```
 
-*Note:* Make sure you have EasyOCR installed by running `pip install easyocr` before using the OCR feature.
-
----
-
-Quickstarts for one of more cases. The code below opens DuckDuckGo, types a query, and clicks the search button.
-
-## 🚀 Quickstart (with Selenium)
+### Selenium
 
 ```python
 from selenium import webdriver
@@ -74,20 +64,16 @@ emunium = EmuniumSelenium(driver)
 
 driver.get('https://duckduckgo.com/')
 
-# Wait for the search field to be clickable and type your query
 element = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-state="suggesting"]')))
 emunium.type_at(element, 'Automating searches')
 
-# Find and click the search button
 submit = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, '[aria-label="Search"]')))
 emunium.click_at(submit)
 
 driver.quit()
 ```
 
----
-
-## 🚀 Quickstart (with Pyppeteer)
+### Pyppeteer
 
 ```python
 import asyncio
@@ -112,10 +98,7 @@ async def main():
 asyncio.run(main())
 ```
 
----
-
-## 🚀 Quickstart (with Playwright)
-
+### Playwright
 
 ```python
 import asyncio
@@ -141,60 +124,37 @@ async def main():
 asyncio.run(main())
 ```
 
----
+## API
 
-## 🖱️ Mouse Movements and Clicks
+### Mouse
 
-Emunium simulates natural mouse movements and clicks:
+`move_to(element, offset_x=0, offset_y=0)` - Moves cursor to element with bezier curves and random variations
 
-- **Moving the Mouse:**
-  The `move_to()` method moves the cursor smoothly to the target position. You can add small random offsets for a more human-like behavior.
+`click_at(element, click_type=ClickType.LEFT)` - Clicks element after moving to it. Click types: `LEFT`, `RIGHT`, `MIDDLE`, `DOUBLE`
 
-- **Clicking Elements:**
-  Use `click_at()` to click on an element after moving to it. You can specify the type of click (left, right, middle, or double):
+```python
+from emunium import ClickType
 
-  ```python
-  from emunium import ClickType
+emunium.click_at(element)                    # left click
+emunium.click_at(element, ClickType.RIGHT)   # right click
+emunium.click_at(element, ClickType.MIDDLE)  # middle click
+emunium.click_at(element, ClickType.DOUBLE)  # double click
+```
 
-  emunium.click_at(element)                    # left click
-  emunium.click_at(element, ClickType.RIGHT)   # right click
-  emunium.click_at(element, ClickType.MIDDLE)  # middle click
-  emunium.click_at(element, ClickType.DOUBLE)  # double click
-  ```
+### Keyboard
 
----
+`type_at(element, text, characters_per_minute=280, offset=20)` - Types text with randomized delays between keystrokes
 
-## 🔎 Finding Elements on the Screen (only in Standalone)
+### Scroll
 
-Emunium uses image matching to find elements:
+`scroll_to(element)` - Smoothly scrolls element into view
 
-- **find_elements():**
-  Locate elements on the screen using an image file.
+### Element detection (standalone only)
 
-  ```python
-  elements = emunium.find_elements('search_icon.png', min_confidence=0.8)
-  ```
+`find_elements(image_path, min_confidence=0.8, target_width=None, target_height=None, max_elements=None)` - Finds elements on screen by matching image template
 
-  You can also set target sizes and limit the number of elements found.
+`find_text_elements(text, min_confidence=0.8, max_elements=None)` - Finds text on screen using OCR (requires `ocr=True` in constructor)
 
----
+## License
 
-## ⌨️ Typing Text
-
-The `type_at()` method moves to an element, clicks on it, and types text in a "silent" way. This method mimics human typing by spreading out key presses with small, random delays.
-
-Options include:
-- `characters_per_minute`: Typing speed (default is 280 CPM).
-- `offset`: Random delay (default is 20ms).
-
----
-
-## 📜 Scrolling Pages
-
-The `scroll_to()` method scrolls smoothly to bring an element into view. It uses timeouts and checks to ensure smooth scrolling even when there are minor hiccups.
-
----
-
-## 🏁 Conclusion
-
-Emunium provides a set of easy-to-use tools for automating user interactions. Whether you need to automate clicks, type text, or even search for text on your screen using OCR, Emunium offers flexible solutions for both browser and standalone applications. Its human-like behavior helps make your tests more robust and less likely to be detected as automation.
+[MIT](LICENSE)

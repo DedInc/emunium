@@ -1,119 +1,177 @@
 import asyncio
+from typing import Optional, Dict, Callable, Any
 
 from .base import ClickType, EmuniumBase
 
 
-class EmuniumSelenium(EmuniumBase):
-    """Selenium WebDriver integration for human-like automation."""
+class BrowserEmuniumMixin:
+    """Mixin providing common browser automation methods."""
+
+    def _click_at_center(
+        self, center: Optional[Dict[str, int]], click_type: ClickType
+    ) -> None:
+        """Perform click at center if valid."""
+        if center:
+            self._perform_click((center["x"], center["y"]), click_type)
+
+    def _type_at_center(
+        self,
+        center: Optional[Dict[str, int]],
+        text: str,
+        characters_per_minute: int,
+        offset: int,
+        click_type: ClickType,
+    ) -> None:
+        """Click and type at center if valid."""
+        if center:
+            self._perform_click((center["x"], center["y"]), click_type)
+            self._type_text(text, characters_per_minute, offset)
+
+
+class EmuniumSelenium(EmuniumBase, BrowserEmuniumMixin):
+    """Selenium WebDriver integration."""
 
     def __init__(self, driver):
         super().__init__()
         self.driver = driver
+        self._properties_initialized = False
 
-    async def _get_browser_properties_if_not_found(self):
-        await super()._get_browser_properties_if_not_found(self.driver.save_screenshot)
+    def _ensure_properties(self) -> None:
+        """Ensure browser properties are initialized."""
+        if not self._properties_initialized:
+            try:
+                loop = asyncio.get_running_loop()
+                import concurrent.futures
 
-    def get_center(self, element):
-        """Get element center coordinates with browser offset."""
-        asyncio.run(self._get_browser_properties_if_not_found())
-        return self._get_center(element.location, element.size)
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    loop.run_in_executor(
+                        pool,
+                        lambda: asyncio.run(
+                            self._get_browser_properties_if_not_found(
+                                self.driver.save_screenshot
+                            )
+                        ),
+                    )
+            except RuntimeError:
+                asyncio.run(
+                    self._get_browser_properties_if_not_found(
+                        self.driver.save_screenshot
+                    )
+                )
+            self._properties_initialized = True
 
-    def move_to(self, element, offset_x=None, offset_y=None):
-        """Move cursor to element with optional offset."""
-        center = self.get_center(element)
-        self._move(center, offset_x, offset_y)
+    def get_center(self, element) -> Dict[str, int]:
+        """Get element center with browser offset."""
+        self._ensure_properties()
+        return self._calculate_center(element.location, element.size)
 
-    def click_at(self, element, click_type=ClickType.LEFT):
-        """Click at element center."""
-        center = self.get_center(element)
-        self._click([center["x"], center["y"]], click_type=click_type)
+    def move_to(
+        self,
+        element,
+        offset_x: Optional[float] = None,
+        offset_y: Optional[float] = None,
+    ) -> None:
+        """Move cursor to element."""
+        self._move_to_position(self.get_center(element), offset_x, offset_y)
+
+    def click_at(self, element, click_type: ClickType = ClickType.LEFT) -> None:
+        """Click element."""
+        self._click_at_center(self.get_center(element), click_type)
 
     def type_at(
         self,
         element,
-        text,
-        characters_per_minute=280,
-        offset=20,
-        click_type=ClickType.LEFT,
-    ):
-        """Click element and type text with human-like timing."""
-        center = self.get_center(element)
-        self._click([center["x"], center["y"]], click_type=click_type)
-        self._silent_type(text, characters_per_minute, offset)
+        text: str,
+        characters_per_minute: int = 280,
+        offset: int = 20,
+        click_type: ClickType = ClickType.LEFT,
+    ) -> None:
+        """Click element and type text."""
+        self._type_at_center(
+            self.get_center(element), text, characters_per_minute, offset, click_type
+        )
 
-    def scroll_to(self, element):
-        """Scroll to bring element into view."""
-        asyncio.run(self._get_browser_properties_if_not_found())
-        self._scroll_smoothly_to_element(element.rect)
+    def scroll_to(self, element) -> None:
+        """Scroll to element."""
+        self._ensure_properties()
+        self._scroll_to_element(element.rect)
 
 
-class EmuniumPpeteer(EmuniumBase):
-    """Pyppeteer integration for human-like automation."""
+class AsyncBrowserEmunium(EmuniumBase, BrowserEmuniumMixin):
+    """Base class for async browser integrations."""
 
     def __init__(self, page):
         super().__init__()
         self.page = page
 
-    async def _get_browser_properties_if_not_found(self):
-        async def screenshot_func(path):
-            await self.page.screenshot(path=path)
-
+    async def _init_properties(self, screenshot_func: Callable) -> None:
+        """Initialize browser properties with screenshot function."""
         await super()._get_browser_properties_if_not_found(screenshot_func)
 
-    async def get_center(self, element):
-        """Get element center coordinates with browser offset."""
-        await self._get_browser_properties_if_not_found()
+    async def _get_element_rect(self, element) -> Optional[Dict[str, Any]]:
+        """Get element bounding box. Override in subclasses."""
+        raise NotImplementedError
 
-        rect = await element.boundingBox()
-        if rect is None:
-            return None
+    async def get_center(self, element) -> Optional[Dict[str, int]]:
+        """Get element center with browser offset."""
+        rect = await self._get_element_rect(element)
+        return self._calculate_center(rect, rect) if rect else None
 
-        return self._get_center(rect, rect)
-
-    async def move_to(self, element, offset_x=None, offset_y=None):
-        """Move cursor to element with optional offset."""
+    async def move_to(
+        self,
+        element,
+        offset_x: Optional[float] = None,
+        offset_y: Optional[float] = None,
+    ) -> None:
+        """Move cursor to element."""
         center = await self.get_center(element)
         if center:
-            self._move(center, offset_x, offset_y)
+            self._move_to_position(center, offset_x, offset_y)
 
-    async def click_at(self, element, click_type=ClickType.LEFT):
-        """Click at element center."""
-        center = await self.get_center(element)
-        if center:
-            self._click([center["x"], center["y"]], click_type=click_type)
+    async def click_at(self, element, click_type: ClickType = ClickType.LEFT) -> None:
+        """Click element."""
+        self._click_at_center(await self.get_center(element), click_type)
 
     async def type_at(
         self,
         element,
-        text,
-        characters_per_minute=280,
-        offset=20,
-        click_type=ClickType.LEFT,
-    ):
-        """Click element and type text with human-like timing."""
-        center = await self.get_center(element)
-        if center:
-            self._click([center["x"], center["y"]], click_type=click_type)
-            self._silent_type(text, characters_per_minute, offset)
+        text: str,
+        characters_per_minute: int = 280,
+        offset: int = 20,
+        click_type: ClickType = ClickType.LEFT,
+    ) -> None:
+        """Click element and type text."""
+        self._type_at_center(
+            await self.get_center(element),
+            text,
+            characters_per_minute,
+            offset,
+            click_type,
+        )
 
-    async def scroll_to(self, element):
-        """Scroll to bring element into view."""
-        await self._get_browser_properties_if_not_found()
-
-        element_rect = await element.boundingBox()
+    async def scroll_to(self, element) -> None:
+        """Scroll to element."""
+        element_rect = await self._get_element_rect(element)
         if element_rect:
-            self._scroll_smoothly_to_element(element_rect)
+            self._scroll_to_element(element_rect)
 
 
-class EmuniumPlaywright(EmuniumBase):
-    """Playwright integration for human-like automation."""
+class EmuniumPpeteer(AsyncBrowserEmunium):
+    """Pyppeteer integration. All methods are async."""
 
-    def __init__(self, page):
-        super().__init__()
-        self.page = page
+    async def _get_browser_properties_if_not_found(self) -> None:
+        await self._init_properties(lambda path: self.page.screenshot(path=path))
 
-    async def _get_browser_properties_if_not_found(self):
-        async def screenshot_func(path):
+    async def _get_element_rect(self, element) -> Optional[Dict[str, Any]]:
+        await self._get_browser_properties_if_not_found()
+        return await element.boundingBox()
+
+
+class EmuniumPlaywright(AsyncBrowserEmunium):
+    """Playwright integration. All methods are async."""
+
+    async def _get_browser_properties_if_not_found(self) -> None:
+        async def screenshot_func(path: str) -> None:
             viewport_size = self.page.viewport_size
             clip = {
                 "x": 0,
@@ -123,48 +181,8 @@ class EmuniumPlaywright(EmuniumBase):
             }
             await self.page.screenshot(path=path, clip=clip)
 
-        await super()._get_browser_properties_if_not_found(screenshot_func)
+        await self._init_properties(screenshot_func)
 
-    async def get_center(self, element):
-        """Get element center coordinates with browser offset."""
+    async def _get_element_rect(self, element) -> Optional[Dict[str, Any]]:
         await self._get_browser_properties_if_not_found()
-
-        rect = await element.bounding_box()
-        if rect is None:
-            return None
-
-        return self._get_center(rect, rect)
-
-    async def move_to(self, element, offset_x=None, offset_y=None):
-        """Move cursor to element with optional offset."""
-        center = await self.get_center(element)
-        if center:
-            self._move(center, offset_x, offset_y)
-
-    async def click_at(self, element, click_type=ClickType.LEFT):
-        """Click at element center."""
-        center = await self.get_center(element)
-        if center:
-            self._click([center["x"], center["y"]], click_type=click_type)
-
-    async def type_at(
-        self,
-        element,
-        text,
-        characters_per_minute=280,
-        offset=20,
-        click_type=ClickType.LEFT,
-    ):
-        """Click element and type text with human-like timing."""
-        center = await self.get_center(element)
-        if center:
-            self._click([center["x"], center["y"]], click_type=click_type)
-            self._silent_type(text, characters_per_minute, offset)
-
-    async def scroll_to(self, element):
-        """Scroll to bring element into view."""
-        await self._get_browser_properties_if_not_found()
-
-        element_rect = await element.bounding_box()
-        if element_rect:
-            self._scroll_smoothly_to_element(element_rect)
+        return await element.bounding_box()
