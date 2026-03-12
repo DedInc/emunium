@@ -6,7 +6,8 @@ build-backend = "hatchling.build"
 name = "emunium"
 version = "3.0.0"
 description = "Human-like, undetectable browser automation. Bypasses CDP/WebDriver via custom bridge and native OS inputs."
-license = "MIT"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
 authors = [
     { name = "Maehdakvan", email = "visitanimation@google.com" },
@@ -47,3 +48,4 @@ Homepage = "https://github.com/DedInc/emunium"
 
 [tool.hatch.build.targets.wheel]
 packages = ["emunium"]
+include = ["LICENSE"]
