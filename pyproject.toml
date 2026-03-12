@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "emunium"
+version = "3.0.0"
+description = "Human-like, undetectable browser automation. Bypasses CDP/WebDriver via custom bridge and native OS inputs."
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    { name = "Maehdakvan", email = "visitanimation@google.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "websockets>=12.0",
+    "pyautogui>=0.9.54",
+    "HumanCursor>=1.1",
+    "pyperclip>=1.8",
+]
+
+[project.optional-dependencies]
+parsing = [
+    "selectolax>=0.3.17",
+]
+keyboard = [
+    "keyboard>=0.13",
+]
+standalone = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+]
+ocr = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "easyocr>=1.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/DedInc/emunium"
+"Bug Tracker" = "https://github.com/DedInc/emunium/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["emunium"]

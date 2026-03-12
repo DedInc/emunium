@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Emunium Bridge",
+  "version": "1.0.0",
+  "description": "Emunium browser automation bridge",
+  "permissions": ["activeTab", "scripting", "tabs", "webNavigation", "webRequest"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "content_shared.js",
+        "content_queries.js",
+        "content_conditions.js",
+        "content_wait.js",
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}
