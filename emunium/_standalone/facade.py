@@ -13,12 +13,12 @@ from emunium._standalone.config import ClickType, Config, StandaloneConfig
 class Emunium:
     def __init__(
         self,
-        ocr: bool = False,
+        ocr_enabled: bool = False,
         use_gpu: bool = True,
         langs: list[str] | None = None,
     ) -> None:
         self.cursor = SystemCursor()
-        self.ocr = ocr
+        self.ocr = ocr_enabled
         self.ocr_reader = None
         self.monitor_region: tuple[int, int, int, int] | None = None
 
