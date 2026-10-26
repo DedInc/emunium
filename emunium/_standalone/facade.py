@@ -12,16 +12,17 @@ from __future__ import annotations
 import math
 import random
 import time
-from typing import Callable, Sequence, Tuple
+from collections.abc import Callable, Sequence
 
 from emunium import _screen
 from emunium._element_interactor import ElementInteractor
+from emunium._motion import MotionPlanner
 from emunium._screen import NATIVE_INPUT_LOCK
 from emunium._standalone import ocr as _ocr
 from emunium._standalone import vision
 from emunium._standalone.config import ClickType, Config, StandaloneConfig
 
-Region = Tuple[int, int, int, int]
+Region = tuple[int, int, int, int]
 
 # ``input_backend().scroll`` takes wheel NOTCHES on every platform (the Windows
 # backend multiplies by WHEEL_DELTA itself; pyautogui on macOS scrolls lines).
@@ -94,14 +95,19 @@ class Emunium:
         langs: list[str] | None = None,
         *,
         ocr: bool | None = None,
+        motion: MotionPlanner | str | None = None,
     ) -> None:
+        """``motion``: human pointer planner, a preset name (``natural``,
+        ``careful``, ``brisk``), a ``MotionPlanner`` or None (``natural``);
+        resolved like ``Browser(motion=)``.
+        """
         if ocr is not None and ocr_enabled and not ocr:
             raise ValueError("conflicting arguments: ocr_enabled=True and ocr=False")
         enabled = bool(ocr_enabled or ocr)
         self.ocr = enabled
         self.ocr_reader: _ocr.OcrReader | None = None
         self.monitor_region: tuple[int, int, int, int] | None = None
-        self.interactor = ElementInteractor()
+        self.interactor = ElementInteractor(motion=motion)
         self._cursor: SystemCursor | None = None
 
         if enabled:

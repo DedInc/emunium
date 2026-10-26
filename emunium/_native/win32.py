@@ -839,10 +839,22 @@ class Win32Backend:
     UIPI preflight before any button, wheel or key input. Releases and the raw
     key-down of ``platformModule`` skip both.
     ``_pause`` is accepted for compatibility and never sleeps.
+
+    ``monitors`` reads the monitor layout; by default ``Win32Windows`` when
+    the real user32 is used, none (an unknown layout) with an injected one.
     """
 
-    def __init__(self, user32: User32Api | None = None) -> None:
-        self._user32: User32Api = user32 if user32 is not None else User32()
+    def __init__(
+        self, user32: User32Api | None = None, monitors: MonitorApi | None = None
+    ) -> None:
+        self._user32: User32Api
+        self._monitor_api: MonitorApi | None = monitors
+        if user32 is None:
+            self._user32 = User32()
+            if monitors is None:
+                self._monitor_api = Win32Windows()
+        else:
+            self._user32 = user32
         self._sender = InputSender(self._user32)
         self._scan_codes: dict[int, int] = {}
         self.platformModule = RawReleases(self)
@@ -868,6 +880,16 @@ class Win32Backend:
             metric(SM_CXVIRTUALSCREEN),
             metric(SM_CYVIRTUALSCREEN),
         )
+
+    def monitors(self) -> list[MonitorRect]:
+        """Each monitor's full rectangle; empty when the layout is unknown.
+
+        The virtual screen is their bounding box and may hold dead zones
+        that belong to no monitor.
+        """
+        if self._monitor_api is None:
+            return []
+        return self._monitor_api.monitors()
 
     # -- mouse --------------------------------------------------------------
 
@@ -1062,6 +1084,32 @@ class RECT(ctypes.Structure):
     _fields_ = [("left", LONG), ("top", LONG), ("right", LONG), ("bottom", LONG)]
 
 
+class MONITORINFO(ctypes.Structure):
+    """40 bytes on every host; ``cbSize`` must be set before use."""
+
+    _fields_ = [
+        ("cbSize", DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", DWORD),
+    ]
+
+
+class MonitorRect(NamedTuple):
+    """One display monitor's full rectangle (taskbar included) in physical px."""
+
+    left: int
+    top: int
+    width: int
+    height: int
+
+
+class MonitorApi(Protocol):
+    """Reads the monitor layout (``Win32Windows`` or a fake in tests)."""
+
+    def monitors(self) -> list[MonitorRect]: ...
+
+
 class PROCESSENTRY32W(ctypes.Structure):
     """568 bytes on x64, 556 on x86; ``dwSize`` must be set before use."""
 
@@ -1142,6 +1190,7 @@ if TYPE_CHECKING:
         | ctypes.c_wchar_p
         | ctypes._CFunctionType
         | ctypes._Pointer[RECT]
+        | ctypes._Pointer[MONITORINFO]
         | ctypes._Pointer[PROCESSENTRY32W]
     )
 
@@ -1163,6 +1212,10 @@ class Win32Windows:
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         # WNDENUMPROC: BOOL CALLBACK (HWND, LPARAM).
         self._enum_proc = ctypes.WINFUNCTYPE(BOOL, HANDLE, LPARAM)
+        # MONITORENUMPROC: BOOL CALLBACK (HMONITOR, HDC, LPRECT, LPARAM).
+        self._monitor_proc = ctypes.WINFUNCTYPE(
+            BOOL, HANDLE, HANDLE, ctypes.POINTER(RECT), LPARAM
+        )
 
     @staticmethod
     def _function(
@@ -1275,6 +1328,44 @@ class Win32Windows:
             return pairs
         finally:
             self._kernel("CloseHandle", BOOL, [HANDLE])(snapshot)
+
+    def monitors(self) -> list[MonitorRect]:
+        """Every display monitor's ``rcMonitor``, in enumeration order.
+
+        The full monitor rectangle, not the work area: the cursor can enter
+        the taskbar. Empty or unreadable monitors are skipped.
+        """
+        handles: list[int] = []
+
+        def collect(
+            hmonitor: int | None, _hdc: int | None, _rect: object, _lparam: int
+        ) -> bool:
+            if hmonitor:
+                handles.append(hmonitor)
+            return True
+
+        callback = self._monitor_proc(collect)
+        enum_display_monitors = self._user32(
+            "EnumDisplayMonitors",
+            BOOL,
+            [HANDLE, ctypes.POINTER(RECT), self._monitor_proc, LPARAM],
+        )
+        if not enum_display_monitors(None, None, callback, 0):
+            raise NativeInputError(f"EnumDisplayMonitors failed (error {last_error()})")
+        get_monitor_info = self._user32(
+            "GetMonitorInfoW", BOOL, [HANDLE, ctypes.POINTER(MONITORINFO)]
+        )
+        found: list[MonitorRect] = []
+        for handle in handles:
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if not get_monitor_info(handle, ctypes.byref(info)):
+                continue
+            rect = info.rcMonitor
+            width, height = int(rect.right - rect.left), int(rect.bottom - rect.top)
+            if width > 0 and height > 0:
+                found.append(MonitorRect(int(rect.left), int(rect.top), width, height))
+        return found
 
     def foreground_window(self) -> int:
         return int(self._user32("GetForegroundWindow", HANDLE, [])() or 0)

@@ -12,6 +12,7 @@ import contextlib
 import ctypes
 import functools
 import importlib
+import math
 import os
 import random
 import sys
@@ -148,6 +149,29 @@ def _off_corner(point: tuple[int, int], box: tuple[int, int] | None) -> tuple[in
     if x in (0, width - 1) and y in (0, height - 1):
         return (1 if x == 0 else width - 2), y
     return point
+
+
+def _onto_monitor(
+    point: tuple[int, int], monitors: Sequence[tuple[int, int, int, int]]
+) -> tuple[int, int]:
+    """Clamp ``point`` into the nearest ``(left, top, width, height)`` monitor.
+
+    A point already on a monitor is returned as is; otherwise the monitor at
+    the smallest Euclidean distance wins (the first one on a tie).
+    """
+    x, y = point
+
+    def distance(monitor: tuple[int, int, int, int]) -> float:
+        left, top, width, height = monitor
+        dx = max(left - x, 0, x - (left + width - 1))
+        dy = max(top - y, 0, y - (top + height - 1))
+        return math.hypot(dx, dy)
+
+    left, top, width, height = min(monitors, key=distance)
+    return (
+        min(max(x, left), left + width - 1),
+        min(max(y, top), top + height - 1),
+    )
 
 
 def _load_winmm() -> Any:
@@ -471,17 +495,54 @@ class ElementInteractor:
             primary = None
         return ScreenBounds(*virtual, primary=primary).covering(start, end)
 
+    def _monitor_rects(self) -> list[tuple[int, int, int, int]]:
+        """``(left, top, width, height)`` of every real monitor; [] when unknown."""
+        monitors = getattr(self._gui(), "monitors", None)
+        if not callable(monitors):
+            return []
+        try:
+            rects = [
+                (int(left), int(top), int(width), int(height))
+                for left, top, width, height in monitors()
+            ]
+        except (OSError, RuntimeError, TypeError, ValueError, ctypes.ArgumentError):
+            return []
+        return [rect for rect in rects if rect[2] >= 1 and rect[3] >= 1]
+
+    def _onto_monitors(
+        self, steps: Sequence[MotionStep], bounds: ScreenBounds | None
+    ) -> list[MotionStep]:
+        """Every intermediate step onto its nearest monitor, then off the corners.
+
+        The virtual screen is the monitors' bounding box; on a mixed layout a
+        planned point can fall in a dead zone that belongs to no monitor, and
+        ``SetCursorPos`` would clip it somewhere unplanned (possibly a
+        fail-safe corner). The corner rule (``ScreenBounds.settle``) runs
+        after the clamp, so a clamped point never rests on a corner. The last
+        step, the target itself, is never altered.
+        """
+        monitors = self._monitor_rects()
+        if not monitors:
+            return list(steps)
+        fitted: list[MotionStep] = []
+        for step in steps[:-1]:
+            point = _onto_monitor((step.x, step.y), monitors)
+            if bounds is not None:
+                point = bounds.settle(point)
+            moved = point != (step.x, step.y)
+            fitted.append(MotionStep(point[0], point[1], step.dt) if moved else step)
+        fitted.extend(steps[-1:])
+        return fitted
+
     def _human_move(self, target: tuple[int, int], target_size: float) -> None:
         """Walk the planner's steps; the caller lands on ``target``."""
         gui = self._gui()
         start = self.position()
+        bounds = self._motion_bounds(start, target)
         steps = self._motion.plan(
-            start,
-            target,
-            target_size=target_size,
-            rng=self._rng,
-            bounds=self._motion_bounds(start, target),
+            start, target, target_size=target_size, rng=self._rng, bounds=bounds
         )
+        steps = self._onto_monitors(steps, bounds)
         with _fine_timer(self._platform):
             self._play(gui, steps)
 

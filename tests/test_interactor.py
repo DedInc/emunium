@@ -11,10 +11,13 @@ import math
 import random
 import sys
 import threading
+from typing import cast
 
 import pytest
 
 from emunium import _element_interactor as ei
+from emunium._bridge.facade import Bridge
+from emunium._browser.context import BrowserContext, DragInteractor
 from emunium._element_interactor import (
     KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE,
@@ -24,9 +27,19 @@ from emunium._element_interactor import (
     WindowsKeyboardSender,
     keyboard_events,
 )
-from emunium._screen import NATIVE_INPUT_LOCK
+from emunium._motion import (
+    DEFAULT_TARGET_SIZE,
+    MotionStep,
+    ScreenBounds,
+    SigmaDriftPlanner,
+)
+from emunium._native import win32
+from emunium._native.win32 import MonitorRect, Win32Backend
+from emunium._screen import NATIVE_INPUT_LOCK, Geometry, input_per_dip
 from emunium._standalone.config import ClickType
-from emunium.errors import NativeInputError
+from emunium.element import Element
+from emunium.errors import InvalidArgumentError, NativeInputError
+from emunium.standalone import Emunium
 
 U = KEYEVENTF_UNICODE
 UP = KEYEVENTF_KEYUP
@@ -78,14 +91,28 @@ class FakeGui:
         self._record(("write", message), _pause)
 
 
+class FakeClock:
+    """The interactor's clock; only ``FakeSleep`` advances it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
 class FakeSleep:
+    """Records each sleep and advances ``clock`` by exactly the seconds asked."""
+
     def __init__(self, log=None):
         self.calls = []
         self.log = log
         self.hook = None
+        self.clock = FakeClock()
 
     def __call__(self, seconds):
         self.calls.append(seconds)
+        self.clock.now += seconds
         if self.log is not None:
             self.log.append(("sleep", seconds))
         if self.hook is not None:
@@ -139,9 +166,10 @@ def make(platform="linux", **kwargs):
         backend=gui,
         platform=platform,
         sleep=sleep,
+        clock=sleep.clock,
         rng=random.Random(7),
         double_click_time=kwargs.pop("double_click_time", 0.5),
-        **kwargs
+        **kwargs,
     )
     return interactor, gui, sleep, log
 
@@ -241,8 +269,12 @@ def test_double_click_total_fits_inside_os_interval():
 
 
 @pytest.mark.parametrize(
-    "click_type, button", [(ClickType.LEFT, "left"), (ClickType.RIGHT, "right"),
-                           (ClickType.MIDDLE, "middle")],
+    "click_type, button",
+    [
+        (ClickType.LEFT, "left"),
+        (ClickType.RIGHT, "right"),
+        (ClickType.MIDDLE, "middle"),
+    ],
 )
 def test_single_clicks(click_type, button):
     interactor, _, _, log = make()
@@ -340,30 +372,37 @@ def test_position_and_legacy_names():
 
 
 def test_unicode_event_sequence():
-    events = keyboard_events("aé\U0001F600\n\t\r\n")
+    events = keyboard_events("aé\U0001f600\n\t\r\n")
     assert events == [
-        (0, 0x61, U), (0, 0x61, U | UP),
-        (0, 0xE9, U), (0, 0xE9, U | UP),
-        (0, 0xD83D, U), (0, 0xD83D, U | UP),
-        (0, 0xDE00, U), (0, 0xDE00, U | UP),
-        (VK_RETURN, 0, 0), (VK_RETURN, 0, UP),
-        (VK_TAB, 0, 0), (VK_TAB, 0, UP),
-        (VK_RETURN, 0, 0), (VK_RETURN, 0, UP),
+        (0, 0x61, U),
+        (0, 0x61, U | UP),
+        (0, 0xE9, U),
+        (0, 0xE9, U | UP),
+        (0, 0xD83D, U),
+        (0, 0xD83D, U | UP),
+        (0, 0xDE00, U),
+        (0, 0xDE00, U | UP),
+        (VK_RETURN, 0, 0),
+        (VK_RETURN, 0, UP),
+        (VK_TAB, 0, 0),
+        (VK_TAB, 0, UP),
+        (VK_RETURN, 0, 0),
+        (VK_RETURN, 0, UP),
     ]
 
 
 def test_windows_typing_uses_sendinput_for_everything():
     sender = FakeSender()
     interactor, gui, sleep, log = make("win32", unicode_sender=sender)
-    interactor.type_text("Hi п\U0001F600\n", human=False)
-    assert sender.batches == [keyboard_events("Hi п\U0001F600\n")]
+    interactor.type_text("Hi п\U0001f600\n", human=False)
+    assert sender.batches == [keyboard_events("Hi п\U0001f600\n")]
     assert sleep.calls == [] and log == []  # no pyautogui keys, no delay
 
 
 def test_windows_human_typing_keeps_rhythm_per_character():
     sender = FakeSender()
     interactor, _, sleep, _ = make("win32", unicode_sender=sender)
-    interactor.type_text("a\U0001F600\r\n", characters_per_minute=600, offset=20)
+    interactor.type_text("a\U0001f600\r\n", characters_per_minute=600, offset=20)
     assert [len(b) for b in sender.batches] == [2, 4, 2]
     assert len(sleep.calls) == 3
     assert all(0.08 <= s <= 0.12 for s in sleep.calls)
@@ -387,15 +426,17 @@ class FakeUser32:
     def __init__(self, deliver=None, held=()):
         self.received = []
         self.deliver = deliver
-        self.held = set(held)
+        self.held: set[int] = set(held)
 
     def GetAsyncKeyState(self, vk):
         return -32768 if vk in self.held else 0  # SHORT with the high bit set
 
     def SendInput(self, count, array, size):
         self.received.append(
-            [(array[i].type, array[i].ki.wVk, array[i].ki.wScan, array[i].ki.dwFlags)
-             for i in range(count)]
+            [
+                (array[i].type, array[i].ki.wVk, array[i].ki.wScan, array[i].ki.dwFlags)
+                for i in range(count)
+            ]
         )
         self.size = size
         return count if self.deliver is None else self.deliver
@@ -404,12 +445,17 @@ class FakeUser32:
 def test_sender_builds_keyboard_inputs():
     user32 = FakeUser32()
     sender = WindowsKeyboardSender(user32=user32)
-    sender.send(keyboard_events("\U0001F600\n"))
-    assert user32.received == [[
-        (1, 0, 0xD83D, U), (1, 0, 0xD83D, U | UP),
-        (1, 0, 0xDE00, U), (1, 0, 0xDE00, U | UP),
-        (1, VK_RETURN, 0, 0), (1, VK_RETURN, 0, UP),
-    ]]
+    sender.send(keyboard_events("\U0001f600\n"))
+    assert user32.received == [
+        [
+            (1, 0, 0xD83D, U),
+            (1, 0, 0xD83D, U | UP),
+            (1, 0, 0xDE00, U),
+            (1, 0, 0xDE00, U | UP),
+            (1, VK_RETURN, 0, 0),
+            (1, VK_RETURN, 0, UP),
+        ]
+    ]
     assert user32.size == ctypes.sizeof(ei._win_input_types()[0])
 
 
@@ -421,7 +467,7 @@ def test_sender_chunks_long_text():
 
 def test_sender_never_splits_a_surrogate_pair():
     user32 = FakeUser32()
-    WindowsKeyboardSender(user32=user32).send(keyboard_events("x" * 31 + "\U0001F600"))
+    WindowsKeyboardSender(user32=user32).send(keyboard_events("x" * 31 + "\U0001f600"))
     assert [len(batch) for batch in user32.received] == [62, 4]
     assert [e[2] for e in user32.received[1]] == [0xD83D, 0xD83D, 0xDE00, 0xDE00]
 
@@ -448,7 +494,9 @@ def test_windows_human_typing_rechecks_modifiers_per_stroke():
 
 def test_windows_typing_proceeds_without_modifiers():
     user32 = FakeUser32()
-    interactor, _, _, _ = make("win32", unicode_sender=WindowsKeyboardSender(user32=user32))
+    interactor, _, _, _ = make(
+        "win32", unicode_sender=WindowsKeyboardSender(user32=user32)
+    )
     interactor.type_text("ab", human=False)
     assert len(user32.received) == 1 and len(user32.received[0]) == 4
 
@@ -479,8 +527,14 @@ def test_posix_ascii_via_pyautogui_and_other_via_paste():
     interactor.type_text("hi\n\tпр!", human=False)
     keys = [e for e in log if e[0] != "sleep"]
     assert keys == [
-        ("write", "h"), ("write", "i"), ("press", "enter"), ("press", "tab"),
-        ("keyDown", "ctrl"), ("keyDown", "v"), ("keyUp", "v"), ("keyUp", "ctrl"),
+        ("write", "h"),
+        ("write", "i"),
+        ("press", "enter"),
+        ("press", "tab"),
+        ("keyDown", "ctrl"),
+        ("keyDown", "v"),
+        ("keyUp", "v"),
+        ("keyUp", "ctrl"),
         ("write", "!"),
     ]
     assert ("copy", "пр") in clipboard.log
@@ -491,12 +545,17 @@ def test_macos_paste_uses_command():
     clipboard = FakeClipboard()
     interactor, _, _, log = make("darwin", clipboard=clipboard, keyboard=None)
     interactor.paste_text("ü")
-    assert [e for e in log if e[0] == "keyDown"] == [("keyDown", "command"), ("keyDown", "v")]
+    assert [e for e in log if e[0] == "keyDown"] == [
+        ("keyDown", "command"),
+        ("keyDown", "v"),
+    ]
 
 
 def test_posix_uses_keyboard_package_when_usable():
     log = []
-    interactor, _, _, ilog = make("linux", keyboard=FakeKeyboard(log), clipboard=FakeClipboard())
+    interactor, _, _, ilog = make(
+        "linux", keyboard=FakeKeyboard(log), clipboard=FakeClipboard()
+    )
     interactor.type_text("aéü", human=False)
     assert log == [("kb", "é"), ("kb", "ü")]
     assert ("write", "a") in ilog
@@ -589,8 +648,12 @@ def test_hotkey_releases_in_reverse_order():
     interactor, _, _, log = make()
     interactor.hotkey("ctrl", "shift", "t")
     assert log == [
-        ("keyDown", "ctrl"), ("keyDown", "shift"), ("keyDown", "t"),
-        ("keyUp", "t"), ("keyUp", "shift"), ("keyUp", "ctrl"),
+        ("keyDown", "ctrl"),
+        ("keyDown", "shift"),
+        ("keyDown", "t"),
+        ("keyUp", "t"),
+        ("keyUp", "shift"),
+        ("keyUp", "ctrl"),
     ]
 
 
@@ -657,7 +720,10 @@ def test_mouse_release_uses_platform_layer_past_failsafe():
     interactor, gui, _, log = make_platform()
     gui.pos = (0, 0)
     interactor.press("right")
-    assert [e for e in log if e[0] != "sleep"] == [("down", "right"), ("raw_up", 0, 0, "right")]
+    assert [e for e in log if e[0] != "sleep"] == [
+        ("down", "right"),
+        ("raw_up", 0, 0, "right"),
+    ]
 
 
 def test_drag_release_uses_platform_layer():
@@ -670,13 +736,18 @@ def test_key_release_uses_platform_layer_past_failsafe():
     interactor, _, _, log = make_platform()
     interactor.hotkey("Ctrl", "V")
     assert log == [
-        ("keyDown", "Ctrl"), ("keyDown", "V"), ("raw_keyUp", "V"), ("raw_keyUp", "ctrl"),
+        ("keyDown", "Ctrl"),
+        ("keyDown", "V"),
+        ("raw_keyUp", "V"),
+        ("raw_keyUp", "ctrl"),
     ]
 
 
 def test_paste_release_uses_platform_layer():
     clipboard = FakeClipboard("previous")
-    interactor, gui, _, log = make(platform="linux", gui=CornerGui(), clipboard=clipboard)
+    interactor, gui, _, log = make(
+        platform="linux", gui=CornerGui(), clipboard=clipboard
+    )
     gui.platformModule = FakePlatform(gui)
     interactor.paste_text("new")
     assert ("raw_keyUp", "ctrl") in log and ("raw_keyUp", "v") in log
@@ -688,7 +759,9 @@ def test_keyboard_interrupt_mid_release_still_releases_every_key():
     with pytest.raises(KeyboardInterrupt):
         interactor.hotkey("ctrl", "shift", "t")
     assert [e for e in log if e[0] == "raw_keyUp"] == [
-        ("raw_keyUp", "t"), ("raw_keyUp", "shift"), ("raw_keyUp", "ctrl"),
+        ("raw_keyUp", "t"),
+        ("raw_keyUp", "shift"),
+        ("raw_keyUp", "ctrl"),
     ]
 
 
@@ -704,7 +777,10 @@ def test_keyboard_interrupt_during_key_down_releases_pressed_keys():
     with pytest.raises(KeyboardInterrupt):
         interactor.hotkey("ctrl", "alt", "del")
     assert log == [
-        ("keyDown", "ctrl"), ("keyDown", "alt"), ("raw_keyUp", "alt"), ("raw_keyUp", "ctrl"),
+        ("keyDown", "ctrl"),
+        ("keyDown", "alt"),
+        ("raw_keyUp", "alt"),
+        ("raw_keyUp", "ctrl"),
     ]
 
 
@@ -726,7 +802,8 @@ def test_keyboard_interrupt_during_drag_releases_button():
     with pytest.raises(KeyboardInterrupt):
         interactor.drag((10, 10), (300, 300), human=True)
     assert [e for e in log if e[0] in ("down", "raw_up")] == [
-        ("down", "left"), ("raw_up", 10, 10, "left"),
+        ("down", "left"),
+        ("raw_up", 10, 10, "left"),
     ]
 
 
@@ -763,3 +840,231 @@ def test_human_path_never_stops_on_a_corner_but_keeps_corner_target():
         corners = {(0, 0), (799, 0), (0, 599), (799, 599)}
         assert path[-1] == (799, 599)  # a corner target is never altered
         assert not corners & {p for p in path if p != (799, 599)}
+
+
+# -- playback clock --------------------------------------------------------------
+
+
+def test_fake_sleep_drives_an_explicit_clock():
+    interactor, _, sleep, _ = make()
+    assert interactor._clock is sleep.clock
+    interactor.move(1700, 900)
+    assert sleep.clock.now == pytest.approx(sum(sleep.calls))
+    assert 0.12 <= sleep.clock.now <= 1.2 + 1e-9
+
+
+# -- real monitors: no planned point in a dead zone ------------------------------
+
+PRIMARY = MonitorRect(0, 0, 1920, 1080)
+# Shorter right-hand monitor: x >= 1920, y >= 720 belongs to no monitor.
+SIDE = MonitorRect(1920, 0, 1280, 720)
+
+
+class MonitorGui(FakeGui):
+    def __init__(self, position=(1800, 1000), monitors=(PRIMARY, SIDE)):
+        super().__init__(position=position, size=(1920, 1080))
+        self.layout = list(monitors)
+
+    def virtual_screen(self):
+        return (0, 0, 3200, 1080)
+
+    def monitors(self):
+        return self.layout
+
+
+class ScriptedPlanner:
+    """Returns fixed steps and records each call's arguments."""
+
+    def __init__(self, steps):
+        self.steps = steps
+        self.calls = []
+
+    def plan(self, start, end, *, target_size, rng, bounds=None):
+        self.calls.append((start, end, target_size, bounds))
+        return list(self.steps)
+
+
+def on_a_monitor(point, monitors=(PRIMARY, SIDE)):
+    return any(
+        m.left <= point[0] < m.left + m.width and m.top <= point[1] < m.top + m.height
+        for m in monitors
+    )
+
+
+def test_onto_monitor_picks_the_nearest_rectangle():
+    monitors = [tuple(PRIMARY), tuple(SIDE)]
+    assert ei._onto_monitor((500, 500), monitors) == (500, 500)
+    assert ei._onto_monitor((2000, 900), monitors) == (1919, 900)  # 81 px vs 180
+    assert ei._onto_monitor((2600, 1000), monitors) == (2600, 719)
+    assert ei._onto_monitor((3300, -40), monitors) == (3199, 0)
+
+
+def test_dead_zone_steps_are_clamped_onto_a_monitor_before_the_corner_rule():
+    planner = ScriptedPlanner(
+        [
+            MotionStep(2000, 900, 0.01),  # dead zone, nearest: primary
+            MotionStep(2600, 1000, 0.01),  # dead zone, nearest: side monitor
+            MotionStep(1950, 1079, 0.01),  # clamps onto the primary's corner
+            MotionStep(2500, 300, 0.01),
+        ]
+    )
+    interactor, _, sleep, log = make(gui=MonitorGui(), motion=planner)
+    interactor.move(2500, 300, target_size=40)
+    assert moves(log) == [(1919, 900), (2600, 719), (1919, 1078), (2500, 300)]
+    assert sleep.calls == pytest.approx([0.01] * 4)
+    ((_, _, size, bounds),) = planner.calls
+    assert size == 40
+    assert bounds == ScreenBounds(0, 0, 3200, 1080, primary=(1920, 1080))
+
+
+def test_real_planner_path_never_enters_a_dead_zone():
+    for seed in range(30):
+        interactor, _, _, log = make(gui=MonitorGui(position=(1700, 1050)))
+        interactor._rng = random.Random(seed)
+        interactor.move(2900, 650)
+        path = moves(log)
+        assert path[-1] == (2900, 650)
+        assert all(on_a_monitor(p) for p in path)
+        corners = {(0, 0), (1919, 0), (0, 1079), (1919, 1079)}
+        assert not corners & set(path)
+
+
+def test_unknown_or_failing_monitor_layout_leaves_the_plan_alone():
+    steps = [MotionStep(2000, 900, 0.01), MotionStep(2500, 300, 0.01)]
+
+    class FailingGui(MonitorGui):
+        def monitors(self):
+            raise NativeInputError("EnumDisplayMonitors failed (error 5)")
+
+    for gui in (MonitorGui(monitors=()), FailingGui()):
+        interactor, _, _, log = make(gui=gui, motion=ScriptedPlanner(steps))
+        interactor.move(2500, 300)
+        assert moves(log) == [(2000, 900), (2500, 300)]
+
+
+class FakeMonitorApi:
+    def __init__(self, layout):
+        self.layout = layout
+        self.calls = 0
+
+    def monitors(self):
+        self.calls += 1
+        return list(self.layout)
+
+
+def test_win32_backend_reports_monitors_from_its_monitor_api():
+    user32 = cast(win32.User32Api, object())  # never called here
+    api = FakeMonitorApi([PRIMARY, SIDE])
+    assert Win32Backend(user32=user32, monitors=api).monitors() == [PRIMARY, SIDE]
+    assert api.calls == 1
+    # An injected user32 without a monitor API: the layout is unknown.
+    assert Win32Backend(user32=user32).monitors() == []
+
+
+def test_monitorinfo_layout():
+    assert ctypes.sizeof(win32.MONITORINFO) == 40
+    assert win32.MONITORINFO.rcMonitor.offset == 4
+    assert win32.MONITORINFO.rcWork.offset == 20
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="EnumDisplayMonitors is Windows")
+def test_real_monitor_enumeration_is_read_only_and_sane():
+    found = win32.Win32Windows().monitors()
+    assert found and all(m.width > 0 and m.height > 0 for m in found)
+    # Some monitor holds the primary's origin.
+    assert on_a_monitor((0, 0), found)
+
+
+# -- Fitts' target size from the element --------------------------------------
+
+ELEMENT_GEOMETRY = {
+    "screenX": 0,
+    "screenY": 0,
+    "outerWidth": 1000,
+    "outerHeight": 800,
+    "innerWidth": 1000,
+    "innerHeight": 700,
+    "devicePixelRatio": 1.5,
+}
+
+
+class PageBridge(Bridge):
+    """Answers the two calls a hover without verification makes."""
+
+    def __init__(self, rect):
+        super().__init__(transport=object())
+        self.rect = rect
+
+    def activate_tab(self, timeout=10.0, *, tab_id=None):
+        return {}
+
+    def scroll_into_view(self, element_id, timeout=10.0, *, tab_id=None):
+        return {
+            "elementId": element_id,
+            "rect": dict(self.rect),
+            "geometry": dict(ELEMENT_GEOMETRY),
+            "tabId": 7,
+        }
+
+
+class AimRecorder(DragInteractor):
+    def __init__(self):
+        super().__init__(backend=FakeGui())
+        self.aims = []
+        self.at = (0, 0)
+
+    def move(self, x, y, *, human=True, target_size=DEFAULT_TARGET_SIZE):
+        self.aims.append((human, target_size))
+        self.at = (round(x), round(y))
+
+    def position(self):
+        return self.at
+
+
+def hover(rect, *, human=True):
+    recorder = AimRecorder()
+    ctx = BrowserContext(PageBridge(rect), verify_input=False, interactor=recorder)
+    element = Element(ctx, "e1", rect=rect, tab_id=7, geometry=ELEMENT_GEOMETRY)
+    element.hover(human=human)
+    return recorder.aims
+
+
+def per_css_px():
+    geometry = Geometry.from_payload(dict(ELEMENT_GEOMETRY), 1.0)
+    return input_per_dip(geometry) * geometry.zoom
+
+
+def test_element_aims_with_its_smaller_visible_side_in_input_px():
+    aims = hover({"x": 100, "y": 50, "width": 200, "height": 30})
+    assert aims == [(True, pytest.approx(30 * per_css_px()))]
+
+
+def test_element_target_size_uses_only_the_visible_part():
+    # 100 CSS px tall but cut by the viewport (4 px margin): 76 px visible.
+    aims = hover({"x": 100, "y": -20, "width": 200, "height": 100})
+    assert aims == [(True, pytest.approx(76 * per_css_px()))]
+
+
+def test_element_target_size_is_at_least_one_input_px():
+    aims = hover({"x": 100, "y": 50, "width": 0.25, "height": 0.25})
+    assert aims == [(True, 1.0)]
+
+
+def test_instant_element_move_passes_no_target_size():
+    assert hover({"x": 100, "y": 50, "width": 200, "height": 30}, human=False) == [
+        (False, DEFAULT_TARGET_SIZE)
+    ]
+
+
+# -- standalone motion -----------------------------------------------------------
+
+
+def test_standalone_motion_keyword():
+    assert Emunium().interactor.motion == SigmaDriftPlanner.preset("natural")
+    assert Emunium(motion="brisk").interactor.motion == SigmaDriftPlanner.preset(
+        "brisk"
+    )
+    planner = ScriptedPlanner([MotionStep(1, 1, 0.0)])
+    assert Emunium(motion=planner).interactor.motion is planner
+    with pytest.raises(InvalidArgumentError, match="motion"):
+        Emunium(motion="warp")
