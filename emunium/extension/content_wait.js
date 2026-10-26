@@ -3,79 +3,99 @@
 
   const scope = globalThis.EmuniumContent;
 
-  function buildFinder(selector, type) {
-    if (type === "xpath") {
-      return () =>
-        document.evaluate(
-          selector,
-          document,
-          null,
-          XPathResult.FIRST_ORDERED_NODE_TYPE,
-          null
-        ).singleNodeValue;
+  const DEFAULT_TIMEOUT_MS = 10000;
+  const DEFAULT_STABLE_MS = 300;
+  const POLL_INTERVAL_MS = 50;
+  // Without DOM mutations the page is still re-checked this often (stable windows,
+  // layout/style-only changes, custom_js reading non-DOM state).
+  const IDLE_RECHECK_MS = 250;
+  const MAX_TIMEOUT_MS = 2147483647;
+  const SELECTOR_TYPES = new Set(["css", "xpath", "text"]);
+  const STATES = new Set(["presence", "visible", "clickable", "stable", "unobscured"]);
+
+  function codedError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  // Coded errors keep their code; an invalid selector/XPath is the caller's mistake.
+  function toWaitError(error) {
+    if (error && typeof error.code === "string") {
+      return error;
     }
-    if (type === "text") {
-      return () => scope.findElementsByText(selector)[0] || null;
+    const message = String((error && error.message) || error);
+    if (error && error.name === "SyntaxError") {
+      return codedError("invalid_argument", message);
     }
-    return () => document.querySelector(selector);
+    return codedError("internal", `waitForSelector failed: ${message}`);
   }
 
   function buildAllFinder(selector, type) {
     if (type === "xpath") {
       return () => {
-        const result = document.evaluate(
-          selector,
-          document,
-          null,
-          XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
-          null
-        );
+        let result;
+        try {
+          result = document.evaluate(
+            selector,
+            document,
+            null,
+            XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+            null
+          );
+        } catch (error) {
+          // TypeError: the expression is not a node-set (e.g. count(//a)); SyntaxError /
+          // NamespaceError: malformed expression. Both are the caller's argument.
+          const name = error && error.name;
+          if (name === "TypeError" || name === "SyntaxError" || name === "NamespaceError") {
+            throw codedError("invalid_argument", `invalid XPath for waitForSelector: ${error.message}`);
+          }
+          throw error;
+        }
         const nodes = [];
         for (let i = 0; i < result.snapshotLength; i += 1) {
-          nodes.push(result.snapshotItem(i));
+          const node = result.snapshotItem(i);
+          if (node && node.nodeType === 1) {
+            nodes.push(node);
+          }
         }
         return nodes;
       };
     }
     if (type === "text") {
-      return () => scope.findElementsByText(selector);
+      // Looked up at call time: content_shared.js may be replaced after this file loads.
+      return () => Array.from(scope.findElementsByText(selector, false) || []);
     }
     return () => Array.from(document.querySelectorAll(selector));
   }
 
-  function hasDetachedCondition(conditions) {
-    if (!Array.isArray(conditions)) return false;
-    return conditions.some((c) => {
-      if (c.type === "detached") return true;
-      if (c.type === "any_of" || c.type === "all_of") {
-        return c.conditions.some((group) => hasDetachedCondition(group));
-      }
-      if (c.type === "not") return hasDetachedCondition(c.condition);
-      return false;
-    });
-  }
-
   function needsStableState(state, conditions) {
-    return (
-      state === "stable" || conditions?.some((c) => c.type === "stable")
-    );
+    return state === "stable" || scope.hasConditionType(conditions, "stable");
   }
 
+  // Longest requested duration anywhere in the tree; 300 ms when none is given.
   function getStableDuration(conditions) {
-    const stable = conditions?.find(
-      (c) => c.type === "stable" && c.duration
-    );
-    return stable ? stable.duration : 300;
+    let duration = null;
+    scope.walkLeaves(conditions, (c) => {
+      if (c.type === "stable" && typeof c.duration === "number") {
+        duration = duration === null ? c.duration : Math.max(duration, c.duration);
+      }
+    });
+    return duration === null ? DEFAULT_STABLE_MS : duration;
   }
 
+  // textContent, not innerText: innerText forces layout and builds the rendered text of a
+  // whole container on every tick. Length + prefix detects changes cheaply.
   function fingerprint(element) {
     const rect = element.getBoundingClientRect();
+    const text = element.textContent || "";
     return JSON.stringify({
       x: rect.x,
       y: rect.y,
       w: rect.width,
       h: rect.height,
-      text: scope.getElementText(element, 200),
+      textLength: text.length,
+      text: text.slice(0, 200),
       href: element.href || null,
       value: element.value !== undefined ? element.value : null,
       connected: element.isConnected,
@@ -83,163 +103,180 @@
     });
   }
 
-  function createWaitTracker(resolve, findElement, findAllElements, options) {
-    let lastFingerprint = null;
-    let stableSince = 0;
-    let resolved = false;
-
-    function cleanup(observer, intervalId, timeoutId) {
-      if (observer) observer.disconnect();
-      if (intervalId) clearInterval(intervalId);
-      if (timeoutId) clearTimeout(timeoutId);
+  function normalizeParams(params) {
+    const { selector, type, timeoutMs, state, conditions } = params || {};
+    if (typeof selector !== "string" || selector === "") {
+      throw codedError("invalid_argument", "'selector' must be a non-empty string");
     }
-
-    function resolveDetached(observer, intervalId, timeoutId) {
-      resolved = true;
-      cleanup(observer, intervalId, timeoutId);
-      resolve({ detached: true, selector: options.selector });
+    const selectorType = type == null ? "css" : type;
+    if (!SELECTOR_TYPES.has(selectorType)) {
+      throw codedError("invalid_argument", `'type' must be css, xpath or text, got ${JSON.stringify(type)}`);
     }
-
-    function tryDetached(observer, intervalId, timeoutId) {
-      if (!hasDetachedCondition(options.conditions)) return false;
-      const ok = scope.checkElementConditions(
-        null, options.state, options.conditions, []
-      );
-      if (ok) {
-        resolveDetached(observer, intervalId, timeoutId);
-        return true;
-      }
-      return false;
+    const waitState = state == null ? "presence" : state;
+    if (!STATES.has(waitState)) {
+      throw codedError("invalid_argument", `unknown wait state ${JSON.stringify(state)}`);
     }
-
-    function maybeResolve(observer, intervalId, timeoutId) {
-      if (resolved) return;
-      const element = findElement();
-      if (!element) {
-        tryDetached(observer, intervalId, timeoutId);
-        return;
-      }
-      const allEls = findAllElements();
-      if (!scope.checkElementConditions(
-        element, options.state, options.conditions, allEls
-      )) {
-        return;
-      }
-      if (options.needsStable) {
-        const fp = fingerprint(element);
-        if (fp !== lastFingerprint) {
-          lastFingerprint = fp;
-          stableSince = Date.now();
-          return;
-        }
-        if (Date.now() - stableSince < options.stableDuration) return;
-      }
-      resolved = true;
-      cleanup(observer, intervalId, timeoutId);
-      resolve(scope.serializeElement(element));
+    const requested = timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (typeof requested !== "number" || Number.isNaN(requested) || requested < 0) {
+      throw codedError("invalid_argument", "'timeoutMs' must be a number >= 0");
     }
-
-    function seed() {
-      const element = findElement();
-      if (!element) {
-        if (
-          hasDetachedCondition(options.conditions) &&
-          scope.checkElementConditions(null, options.state, options.conditions, [])
-        ) {
-          resolved = true;
-          resolve({ detached: true, selector: options.selector });
-          return true;
-        }
-        return false;
-      }
-      const allEls = findAllElements();
-      if (!scope.checkElementConditions(
-        element, options.state, options.conditions, allEls
-      )) {
-        return false;
-      }
-      if (!options.needsStable) {
-        resolved = true;
-        resolve(scope.serializeElement(element));
-        return true;
-      }
-      lastFingerprint = fingerprint(element);
-      stableSince = Date.now();
-      return false;
-    }
-
-    function finish(observer, intervalId) {
-      if (resolved) return;
-      resolved = true;
-      cleanup(observer, intervalId, null);
-      const element = findElement();
-      if (!element) {
-        if (
-          hasDetachedCondition(options.conditions) &&
-          scope.checkElementConditions(null, options.state, options.conditions, [])
-        ) {
-          resolve({ detached: true, selector: options.selector });
-          return;
-        }
-      } else {
-        const allEls = findAllElements();
-        if (
-          scope.checkElementConditions(
-            element, options.state, options.conditions, allEls
-          ) &&
-          !options.needsStable
-        ) {
-          resolve(scope.serializeElement(element));
-          return;
-        }
-      }
-      resolve({
-        error: "Timeout",
-        selector: options.selector,
-        url: location.href,
-        title: document.title,
-      });
-    }
-
-    return { finish, maybeResolve, seed };
+    // setTimeout fires at once above 2^31-1 ms; clamp to ~24.8 days ("effectively forever").
+    const timeout = Math.min(requested, MAX_TIMEOUT_MS);
+    const validated = scope.validateConditions(conditions);
+    return {
+      conditions: validated,
+      needsStable: needsStableState(waitState, validated),
+      selector,
+      selectorType,
+      stableDuration: getStableDuration(validated),
+      state: waitState,
+      timeoutMs: timeout,
+    };
   }
 
-  function waitForSelector({ selector, type, timeout, state, conditions }) {
-    const options = {
-      conditions,
-      needsStable: needsStableState(state, conditions),
-      selector,
-      stableDuration: getStableDuration(conditions),
-      state,
-    };
-    const selectorType = type || "css";
-    const findElement = buildFinder(selector, selectorType);
-    const findAllElements = buildAllFinder(selector, selectorType);
-    const timeoutMs = timeout || 10000;
+  function isOwnRecord(record) {
+    return Boolean(scope.ownNodes && record && scope.ownNodes.has(record.target));
+  }
 
-    return new Promise((resolve) => {
-      const tracker = createWaitTracker(
-        resolve, findElement, findAllElements, options
-      );
-      if (tracker.seed()) return;
+  function waitForSelector(params) {
+    let options;
+    try {
+      options = normalizeParams(params);
+    } catch (error) {
+      return Promise.reject(toWaitError(error));
+    }
+    const findAll = buildAllFinder(options.selector, options.selectorType);
 
-      let observer;
-      let intervalId;
-      let timeoutId;
-      observer = new MutationObserver(() => {
-        tracker.maybeResolve(observer, intervalId, timeoutId);
-      });
-      observer.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-      });
-      intervalId = setInterval(() => {
-        tracker.maybeResolve(observer, intervalId, timeoutId);
-      }, 50);
-      timeoutId = setTimeout(() => {
-        tracker.finish(observer, intervalId);
-      }, timeoutMs);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let ticking = false;
+      let observer = null;
+      let intervalId = null;
+      let timeoutId = null;
+      let stableElement = null;
+      let lastFingerprint = null;
+      let stableSince = 0;
+      let dirty = false;
+      let lastTickAt = 0;
+
+      function cleanup() {
+        if (observer) observer.disconnect();
+        if (intervalId !== null) clearInterval(intervalId);
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        observer = null;
+        intervalId = null;
+        timeoutId = null;
+      }
+
+      function settle(fn, value) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn(value);
+      }
+
+      function resetStable() {
+        stableElement = null;
+        lastFingerprint = null;
+      }
+
+      // One evaluation of the page; returns the resolution value or undefined.
+      function check() {
+        const all = findAll();
+        const element = all.length ? all[0] : null;
+        if (!scope.checkElementConditions(element, options.state, options.conditions, all)) {
+          resetStable();
+          return undefined;
+        }
+        if (element === null) {
+          return { element: null, matched: true, count: all.length };
+        }
+        if (options.needsStable) {
+          const fp = fingerprint(element);
+          if (element !== stableElement || fp !== lastFingerprint) {
+            stableElement = element;
+            lastFingerprint = fp;
+            stableSince = Date.now();
+            if (options.stableDuration > 0) return undefined;
+          }
+          if (Date.now() - stableSince < options.stableDuration) return undefined;
+        }
+        return scope.serializeElement(element);
+      }
+
+      // Every entry point (seed, poll, timeout) goes through here: an
+      // exception rejects the wait instead of leaving it pending.
+      function tick() {
+        if (settled || ticking) return;
+        ticking = true;
+        dirty = false;
+        lastTickAt = Date.now();
+        try {
+          const value = check();
+          if (value !== undefined) settle(resolve, value);
+        } catch (error) {
+          settle(reject, toWaitError(error));
+        } finally {
+          ticking = false;
+          // Mutations queued by our own evaluation (custom_js, serialization) must not
+          // schedule another tick.
+          if (observer) observer.takeRecords();
+        }
+      }
+
+      function timedOut() {
+        settle(
+          reject,
+          codedError(
+            "wait_timeout",
+            `waitForSelector timed out after ${options.timeoutMs} ms waiting for ` +
+              `${options.selectorType} ${JSON.stringify(options.selector)} ` +
+              `(url: ${location.href}, title: ${JSON.stringify(document.title)})`
+          )
+        );
+      }
+
+      // The observer only marks the page dirty; evaluation happens here, at most once per
+      // interval, when dirty, when a stability window is due, or after IDLE_RECHECK_MS.
+      function poll() {
+        if (settled) return;
+        const now = Date.now();
+        const stableDue = stableElement !== null && now - stableSince >= options.stableDuration;
+        if (dirty || stableDue || now - lastTickAt >= IDLE_RECHECK_MS) {
+          tick();
+        }
+      }
+
+      function finish() {
+        if (settled) return;
+        tick();
+        if (!settled) timedOut();
+      }
+
+      tick();
+      if (settled) return;
+      if (options.timeoutMs === 0) {
+        timedOut(); // 0 = single check
+        return;
+      }
+
+      try {
+        observer = new MutationObserver((records) => {
+          if (ticking) return;
+          if (Array.isArray(records) && records.length > 0 && records.every(isOwnRecord)) return;
+          dirty = true;
+        });
+        observer.observe(document.documentElement || document, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true,
+        });
+        intervalId = setInterval(poll, POLL_INTERVAL_MS);
+        timeoutId = setTimeout(finish, options.timeoutMs);
+      } catch (error) {
+        settle(reject, toWaitError(error));
+      }
     });
   }
 
