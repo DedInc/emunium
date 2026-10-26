@@ -11,6 +11,15 @@
   const LOOPBACK = "127.0.0.1";
   const CLAIM_NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
   const MAX_SEEN_NONCES = 256;
+  // attach-mode.md section 3: the claim queue holds at most 16 nonces (oldest dropped).
+  const MAX_PENDING_CLAIMS = 16;
+  // Close code for a failed attach handshake (no/bad challenge, bad serverProof).
+  const CLOSE_AUTH = 4005;
+  const NONCE_BYTES = 32;
+  const MAC_BYTES = 32;
+  // Frames that arrive while a welcome's serverProof is being verified are replayed after it.
+  const MAX_EARLY_FRAMES = 64;
+  const HUB_URL_RE = /^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/?$/;
 
   // Mutable so tests can shorten waits; read at use time.
   const timing = scope.timing || {
@@ -23,6 +32,8 @@
     claimTtlMs: 5 * 60 * 1000,
     keepAliveMs: 20000,
     welcomeTimeoutMs: 10000,
+    // Attach mode: the server's challenge must be the first frame, within 5 s of open.
+    challengeTimeoutMs: 5000,
     timeoutGraceMs: 1000,
     defaultGuardMs: 60000,
     injectionGuardMs: 15000,
@@ -38,6 +49,7 @@
     reconnectTimer: null,
     keepAliveTimer: null,
     welcomeTimer: null,
+    challengeTimer: null,
     backoffMs: timing.backoffMinMs,
     // tabId -> documentId of the top-frame document whose content script said ready
     // (true when Chrome gave no documentId).
@@ -117,30 +129,30 @@
     return { url: `ws://127.0.0.1:${port}`, token: data.token, protocol: PROTOCOL };
   }
 
-  // hubUrl must be exactly ws://127.0.0.1[:port][/]; returns the numeric port or null.
+  // hubUrl must be exactly ws://127.0.0.1:<port>[/] with an explicit port; returns the port or null.
+  // Matched on the raw string: URL parsing would hide a missing port (and drop an explicit :80).
   function hubPortOf(hubUrl) {
-    if (typeof hubUrl !== "string") {
+    const match = typeof hubUrl === "string" ? HUB_URL_RE.exec(hubUrl) : null;
+    if (!match) {
       return null;
     }
-    let parsed;
+    const port = Number(match[1]);
+    return port <= 65535 ? port : null;
+  }
+
+  let lastConfigWarning = null;
+
+  // Logs an invalid packaged config once per distinct message (the retry loop runs every second).
+  function warnConfig(message) {
+    if (message === lastConfigWarning) {
+      return;
+    }
+    lastConfigWarning = message;
     try {
-      parsed = new URL(hubUrl);
+      console.warn("emunium: " + message);
     } catch {
-      return null;
+      // no console
     }
-    if (
-      parsed.protocol !== "ws:" ||
-      parsed.hostname !== LOOPBACK ||
-      parsed.username ||
-      parsed.password ||
-      parsed.pathname !== "/" ||
-      parsed.search ||
-      parsed.hash
-    ) {
-      return null;
-    }
-    const port = parsed.port === "" ? 80 : Number(parsed.port);
-    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
   }
 
   // attach.json without the per-profile identity: {mode, url, hubPort, enrollment, protocol}.
@@ -162,7 +174,14 @@
       return launchConfigFrom(session.data);
     }
     const attach = await readPackagedJson("attach.json");
-    return attach.present ? attachFileConfigFrom(attach.data) : null;
+    if (!attach.present) {
+      return null;
+    }
+    const config = attachFileConfigFrom(attach.data);
+    if (!config) {
+      warnConfig("attach.json is invalid (protocol 2, mode attach, hubUrl ws://127.0.0.1:<port>, enrollment); retrying");
+    }
+    return config;
   }
 
   let identityCreation = null;
@@ -220,6 +239,91 @@
     }
   }
 
+  // ── attach handshake crypto (attach-mode.md section 3) ──────────────────
+  // HMAC-SHA-256 via Web Crypto; strings are UTF-8; nonces and MACs are base64url without padding.
+
+  function base64UrlEncode(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += 1) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  // Uint8Array, or null when the text is not unpadded base64url.
+  function base64UrlDecode(text) {
+    if (typeof text !== "string" || !/^[A-Za-z0-9_-]*$/.test(text) || text.length % 4 === 1) {
+      return null;
+    }
+    let binary;
+    try {
+      binary = atob(text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4));
+    } catch {
+      return null;
+    }
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function randomNonce() {
+    const bytes = new Uint8Array(NONCE_BYTES);
+    crypto.getRandomValues(bytes);
+    return base64UrlEncode(bytes);
+  }
+
+  async function hmacSha256(secret, message) {
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [
+      "sign",
+    ]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(message)));
+  }
+
+  // Compares every byte (XOR accumulation, no early exit); lengths are fixed and public.
+  function constantTimeEqual(a, b) {
+    const length = Math.max(a.length, b.length);
+    let diff = a.length ^ b.length;
+    for (let i = 0; i < length; i += 1) {
+      diff |= (a[i] | 0) ^ (b[i] | 0);
+    }
+    return diff === 0;
+  }
+
+  // The attach hello: proves the enrollment secret (and token) without sending either.
+  async function buildAttachHello(config, serverNonce, clientNonce) {
+    const proof = await hmacSha256(
+      config.enrollment,
+      `emunium-client|${serverNonce}|${clientNonce}|${config.installId}`
+    );
+    const tokenProof = config.token
+      ? base64UrlEncode(await hmacSha256(config.token, `emunium-token|${serverNonce}|${clientNonce}`))
+      : null;
+    return {
+      type: "hello",
+      protocol: config.protocol,
+      mode: "attach",
+      installId: config.installId,
+      clientNonce,
+      proof: base64UrlEncode(proof),
+      tokenProof,
+    };
+  }
+
+  async function verifyServerProof(config, serverNonce, clientNonce, serverProof) {
+    const received = base64UrlDecode(serverProof);
+    if (!received || received.length !== MAC_BYTES) {
+      return false;
+    }
+    const expected = await hmacSha256(
+      config.enrollment,
+      `emunium-server|${serverNonce}|${clientNonce}|${config.installId}`
+    );
+    return constantTimeEqual(received, expected);
+  }
+
   function clearReconnect() {
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
@@ -258,6 +362,10 @@
     if (state.welcomeTimer) {
       clearTimeout(state.welcomeTimer);
       state.welcomeTimer = null;
+    }
+    if (state.challengeTimer) {
+      clearTimeout(state.challengeTimer);
+      state.challengeTimer = null;
     }
   }
 
@@ -316,38 +424,176 @@
     connect();
   }
 
+  // Adds extensionVersion/userAgent, sends the hello and arms the welcome timeout.
+  function sendHello(socket, hello) {
+    const manifest = chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
+    hello.extensionVersion = (manifest && manifest.version) || "";
+    hello.userAgent = typeof navigator !== "undefined" && navigator ? String(navigator.userAgent || "") : "";
+    try {
+      socket.send(JSON.stringify(hello));
+    } catch {
+      closeSocket(socket, 1000, "hello failed");
+      return false;
+    }
+    state.welcomeTimer = setTimeout(() => {
+      state.welcomeTimer = null;
+      if (socket === state.ws && !state.welcomed) {
+        closeSocket(socket, 1000, "no welcome");
+      }
+    }, timing.welcomeTimeoutMs);
+    return true;
+  }
+
+  function handleWelcomedFrame(socket, frame) {
+    if (frame.type === "request" && typeof scope.handleRequest === "function") {
+      scope.handleRequest(socket, frame);
+    }
+  }
+
+  // Per-socket attach handshake (attach-mode.md section 3):
+  // idle -> challenge -> proving -> welcome -> verifying -> done | failed.
+  // Nothing but the hello is sent, and nothing is stored or executed, before `done`.
+  function attachHandshake(socket, config) {
+    let phase = "idle";
+    let serverNonce = null;
+    let clientNonce = null;
+    let early = [];
+
+    const current = () => socket === state.ws && socket.readyState === WS_OPEN && !state.welcomed;
+
+    function fail(reason) {
+      phase = "failed";
+      early = [];
+      if (socket === state.ws) {
+        stopTimers();
+      }
+      closeSocket(socket, CLOSE_AUTH, reason);
+    }
+
+    function open() {
+      phase = "challenge";
+      state.challengeTimer = setTimeout(() => {
+        state.challengeTimer = null;
+        if (phase === "challenge" && socket === state.ws) {
+          fail("no challenge");
+        }
+      }, timing.challengeTimeoutMs);
+    }
+
+    function onChallenge(frame) {
+      if (state.challengeTimer) {
+        clearTimeout(state.challengeTimer);
+        state.challengeTimer = null;
+      }
+      const isChallenge = !!frame && frame.type === "challenge" && frame.protocol === PROTOCOL;
+      const nonceBytes = isChallenge ? base64UrlDecode(frame.serverNonce) : null;
+      if (!nonceBytes || nonceBytes.length !== NONCE_BYTES) {
+        fail("bad challenge");
+        return;
+      }
+      serverNonce = frame.serverNonce;
+      phase = "proving";
+      (async () => {
+        clientNonce = randomNonce();
+        return buildAttachHello(config, serverNonce, clientNonce);
+      })().then(
+        (hello) => {
+          if (phase !== "proving" || !current()) {
+            return;
+          }
+          phase = "welcome";
+          sendHello(socket, hello);
+        },
+        () => {
+          if (phase === "proving" && socket === state.ws) {
+            fail("handshake failed");
+          }
+        }
+      );
+    }
+
+    function onWelcomeFrame(frame) {
+      if (frame.protocol !== PROTOCOL) {
+        phase = "failed";
+        closeSocket(socket, 4000, "protocol mismatch");
+        return;
+      }
+      if (frame.installId !== undefined && frame.installId !== config.installId) {
+        fail("installId mismatch");
+        return;
+      }
+      phase = "verifying";
+      verifyServerProof(config, serverNonce, clientNonce, frame.serverProof).then(
+        (ok) => {
+          if (phase !== "verifying" || !current()) {
+            return;
+          }
+          if (!ok) {
+            fail("bad server proof");
+            return;
+          }
+          phase = "done";
+          const replay = early;
+          early = [];
+          // A token is stored only from a welcome whose serverProof verified.
+          if (typeof frame.token === "string" && frame.token) {
+            storeToken(frame.token);
+          }
+          onWelcome(socket);
+          for (const queued of replay) {
+            if (socket !== state.ws || !state.welcomed) {
+              break;
+            }
+            handleWelcomedFrame(socket, queued);
+          }
+        },
+        () => {
+          if (phase === "verifying" && socket === state.ws) {
+            fail("handshake failed");
+          }
+        }
+      );
+    }
+
+    function onFrame(frame) {
+      switch (phase) {
+        case "challenge":
+          onChallenge(frame);
+          return;
+        case "proving":
+          fail("frame before hello"); // a genuine hub waits for the hello
+          return;
+        case "welcome":
+          if (frame && frame.type === "welcome") {
+            onWelcomeFrame(frame);
+          }
+          return; // anything else before the welcome is ignored
+        case "verifying":
+          // Requests the hub sends right after its welcome run once the proof checks out.
+          if (frame && early.length < MAX_EARLY_FRAMES) {
+            early.push(frame);
+          }
+          return;
+        default:
+          return;
+      }
+    }
+
+    return { open, onFrame, done: () => phase === "done" };
+  }
+
   function attachSocket(socket, config) {
+    const handshake = config.mode === "attach" ? attachHandshake(socket, config) : null;
+
     socket.onopen = () => {
       if (socket !== state.ws) {
         return;
       }
-      const manifest = chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
-      const userAgent = typeof navigator !== "undefined" && navigator ? String(navigator.userAgent || "") : "";
-      const hello =
-        config.mode === "attach"
-          ? {
-              type: "hello",
-              protocol: config.protocol,
-              mode: "attach",
-              installId: config.installId,
-              enrollment: config.enrollment,
-              token: config.token || null,
-            }
-          : { type: "hello", protocol: config.protocol, token: config.token };
-      hello.extensionVersion = (manifest && manifest.version) || "";
-      hello.userAgent = userAgent;
-      try {
-        socket.send(JSON.stringify(hello));
-      } catch {
-        closeSocket(socket, 1000, "hello failed");
+      if (handshake) {
+        handshake.open(); // the server speaks first
         return;
       }
-      state.welcomeTimer = setTimeout(() => {
-        state.welcomeTimer = null;
-        if (socket === state.ws && !state.welcomed) {
-          closeSocket(socket, 1000, "no welcome");
-        }
-      }, timing.welcomeTimeoutMs);
+      sendHello(socket, { type: "hello", protocol: config.protocol, token: config.token });
     };
 
     socket.onmessage = (event) => {
@@ -358,9 +604,16 @@
       try {
         frame = JSON.parse(event.data);
       } catch {
-        return;
+        frame = null;
       }
       if (!frame || typeof frame !== "object") {
+        frame = null;
+      }
+      if (handshake && !handshake.done()) {
+        handshake.onFrame(frame);
+        return;
+      }
+      if (!frame) {
         return;
       }
       if (!state.welcomed) {
@@ -371,15 +624,10 @@
           closeSocket(socket, 4000, "protocol mismatch");
           return;
         }
-        if (config.mode === "attach" && typeof frame.token === "string" && frame.token) {
-          storeToken(frame.token);
-        }
         onWelcome(socket);
         return;
       }
-      if (frame.type === "request" && typeof scope.handleRequest === "function") {
-        scope.handleRequest(socket, frame);
-      }
+      handleWelcomedFrame(socket, frame);
     };
 
     socket.onerror = () => {};
@@ -464,6 +712,9 @@
     }
     rememberNonce(nonce);
     state.pendingClaims.push({ nonce, hubPort, at: Date.now() });
+    while (state.pendingClaims.length > MAX_PENDING_CLAIMS) {
+      state.pendingClaims.shift(); // a page can mint claim URLs; keep only the newest
+    }
     flushClaims();
     if (Number.isInteger(tabId)) {
       try {

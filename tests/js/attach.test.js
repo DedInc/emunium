@@ -4,6 +4,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const nodeCrypto = require("node:crypto");
 const h = require("./harness");
 
 const SESSION = { protocol: 2, port: 4321, token: "tok-abc" };
@@ -11,9 +12,18 @@ const ATTACH = { protocol: 2, mode: "attach", hubUrl: "ws://127.0.0.1:47800", en
 const NONCE = "Ab3_-xYz0123456789_nonce";
 const CLAIM_URL = `http://127.0.0.1:47800/pair#n=${NONCE}`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NONCE_RE = /^[A-Za-z0-9_-]{43}$/;
+const INSTALL_ID = "0f8fad5b-d9cb-469f-a165-70867728950e";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const plain = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
+
+// Expected values are computed independently with Node's crypto (HMAC-SHA-256, UTF-8, base64url unpadded).
+const mac = (key, message) =>
+  nodeCrypto.createHmac("sha256", Buffer.from(key, "utf8")).update(Buffer.from(message, "utf8")).digest("base64url");
+const newNonce = () => nodeCrypto.randomBytes(32).toString("base64url");
+const serverProofFor = (hello, serverNonce, enrollment = ATTACH.enrollment) =>
+  mac(enrollment, `emunium-server|${serverNonce}|${hello.clientNonce}|${hello.installId}`);
 
 async function until(predicate, ms = 1500) {
   const end = Date.now() + ms;
@@ -42,7 +52,15 @@ function makeWorker(t, { files, storage, before } = {}) {
   if (before) {
     before(chrome);
   }
-  const globals = { chrome, WebSocket: h.FakeWebSocket, navigator: { userAgent: "test-agent/1.0" } };
+  const warnings = [];
+  const quietConsole = Object.assign(Object.create(console), { warn: (...args) => warnings.push(args.join(" ")) });
+  // The harness crypto lacks subtle; the worker uses Web Crypto as in a MV3 service worker.
+  const crypto = {
+    randomUUID: () => nodeCrypto.randomUUID(),
+    getRandomValues: (array) => nodeCrypto.webcrypto.getRandomValues(array),
+    subtle: nodeCrypto.webcrypto.subtle,
+  };
+  const globals = { chrome, crypto, console: quietConsole, WebSocket: h.FakeWebSocket, navigator: { userAgent: "test-agent/1.0" } };
   const ctx = h.loadScripts(["background.js"], globals);
   const bg = ctx.EmuniumBackground;
   bg.waitForResponse = h.spy(async () => null);
@@ -53,12 +71,36 @@ function makeWorker(t, { files, storage, before } = {}) {
     ctx.setInterval = () => 0;
     ctx.__harness.dispose();
   });
-  return { chrome, ctx, bg };
+  return { chrome, ctx, bg, warnings };
 }
 
 const claims = (ws) => ws.sent.filter((f) => f && f.type === "event" && f.event === "claim");
 const blanked = (chrome) => chrome.tabs.update.calls.filter(([, props]) => props && props.url === "about:blank");
 const commit = (chrome, details) => chrome.webNavigation.onCommitted.emit(Object.assign({ frameId: 0, tabId: 1 }, details));
+const closeCodes = (ws) => ws.closeCalls.map((c) => c.code);
+
+// Genuine hub, step 1: open, send the challenge, wait for the hello.
+async function challenge(ws) {
+  ws.open();
+  const serverNonce = newNonce();
+  ws.serverSend({ type: "challenge", protocol: 2, serverNonce });
+  const hello = await until(() => ws.sent.find((f) => f && f.type === "hello"));
+  return { hello, serverNonce };
+}
+
+// Genuine hub, step 2: a welcome with a valid serverProof; waits until the worker is connected.
+async function welcome(w, ws, { hello, serverNonce }, extra = {}) {
+  ws.serverSend(
+    Object.assign({ type: "welcome", protocol: 2, installId: hello.installId, serverProof: serverProofFor(hello, serverNonce) }, extra)
+  );
+  await until(() => w.bg.isConnected() && w.bg.state.ws === ws);
+}
+
+async function handshake(w, ws, extra) {
+  const hs = await challenge(ws);
+  await welcome(w, ws, hs, extra);
+  return hs;
+}
 
 // ── config selection ─────────────────────────────────────────────────────
 
@@ -79,6 +121,8 @@ test("loadConfig: session.json wins, else attach.json, else null (retried)", asy
     Object.assign({}, ATTACH, { hubUrl: "wss://127.0.0.1:47800" }),
     Object.assign({}, ATTACH, { hubUrl: "ws://127.0.0.1:47800/x" }),
     Object.assign({}, ATTACH, { hubUrl: "ws://u@127.0.0.1:47800" }),
+    Object.assign({}, ATTACH, { hubUrl: "ws://127.0.0.1" }),
+    Object.assign({}, ATTACH, { hubUrl: "ws://127.0.0.1/" }),
     Object.assign({}, ATTACH, { hubUrl: 47800 }),
   ];
   for (const data of invalid) {
@@ -105,25 +149,64 @@ test("loadConfig: session.json wins, else attach.json, else null (retried)", asy
   assert.equal((await until(() => h.FakeWebSocket.last())).url, "ws://127.0.0.1:47800", "the retry loop picks it up");
 });
 
+test("hubUrl needs an explicit port: a port-less URL is invalid config (logged, retried, never port 80)", async (t) => {
+  const w = makeWorker(t, { files: { "attach.json": Object.assign({}, ATTACH, { hubUrl: "ws://127.0.0.1" }) } });
+  w.bg.timing.configRetryMs = 10;
+  const { bg } = w;
+  assert.equal(bg.hubPortOf("ws://127.0.0.1:47800"), 47800);
+  assert.equal(bg.hubPortOf("ws://127.0.0.1:47800/"), 47800);
+  assert.equal(bg.hubPortOf("ws://127.0.0.1:80"), 80, "an explicit :80 is still explicit");
+  assert.equal(bg.hubPortOf("ws://127.0.0.1:65535"), 65535);
+  for (const url of [
+    "ws://127.0.0.1",
+    "ws://127.0.0.1/",
+    "ws://127.0.0.1:",
+    "ws://127.0.0.1:0",
+    "ws://127.0.0.1:047800",
+    "ws://127.0.0.1:65536",
+    "ws://127.0.0.1:47800?x",
+    "ws://127.0.0.1:47800#x",
+    " ws://127.0.0.1:47800",
+    null,
+  ]) {
+    assert.equal(bg.hubPortOf(url), null, String(url));
+  }
+  await sleep(60);
+  assert.equal(h.FakeWebSocket.instances.length, 0, "no socket to port 80");
+  assert.equal(w.warnings.length, 1, "logged once across retries");
+  assert.match(w.warnings[0], /attach\.json is invalid/);
+  w.chrome.__state.files["attach.json"] = ATTACH;
+  assert.equal((await until(() => h.FakeWebSocket.last())).url, "ws://127.0.0.1:47800", "retried");
+});
+
 // ── identity and handshake ───────────────────────────────────────────────
 
-test("installId is created once, kept in chrome.storage.local, and sent in the attach hello", async (t) => {
+test("attach hello: sent only after the challenge; proof/tokenProof are HMACs; no secret on the wire", async (t) => {
   const storage = {};
   const w = makeWorker(t, { storage });
   const ws = await until(() => h.FakeWebSocket.last());
   ws.open();
-  const [hello] = ws.sent;
+  await sleep(20);
+  assert.deepEqual(ws.sent, [], "the server speaks first");
+
+  const serverNonce = newNonce();
+  ws.serverSend({ type: "challenge", protocol: 2, serverNonce });
+  const hello = await until(() => ws.sent[0]);
   assert.match(hello.installId, UUID_RE);
+  assert.match(hello.clientNonce, NONCE_RE);
+  assert.equal(Buffer.from(hello.clientNonce, "base64url").length, 32);
   assert.deepEqual(hello, {
     type: "hello",
     protocol: 2,
     mode: "attach",
     installId: hello.installId,
-    enrollment: "enr-secret",
-    token: null,
+    clientNonce: hello.clientNonce,
+    proof: mac("enr-secret", `emunium-client|${serverNonce}|${hello.clientNonce}|${hello.installId}`),
+    tokenProof: null,
     extensionVersion: "3.1.0",
     userAgent: "test-agent/1.0",
   });
+  assert.ok(!ws.rawSent.join("\n").includes("enr-secret"));
   assert.equal(w.chrome.__state.storage.local.installId, hello.installId);
 
   const [a, b] = await Promise.all([w.bg.loadConfig(), w.bg.loadConfig()]);
@@ -133,8 +216,9 @@ test("installId is created once, kept in chrome.storage.local, and sent in the a
   // A restarted worker in the same profile reuses the stored id.
   const again = makeWorker(t, { storage: w.chrome.__state.storage.local });
   const ws2 = await until(() => h.FakeWebSocket.last());
-  ws2.open();
-  assert.equal(ws2.sent[0].installId, hello.installId);
+  const { hello: hello2 } = await challenge(ws2);
+  assert.equal(hello2.installId, hello.installId);
+  assert.notEqual(hello2.clientNonce, hello.clientNonce, "fresh nonce per connection");
   assert.equal(again.chrome.storage.local.set.calls.length, 0, "no new id minted");
 
   // Concurrent first runs mint exactly one id.
@@ -147,30 +231,163 @@ test("installId is created once, kept in chrome.storage.local, and sent in the a
   assert.equal(fresh.chrome.__state.storage.local.installId, ids[0]);
 });
 
-test("a welcome carrying a token stores it; the next hello sends it; a token-less welcome keeps it", async (t) => {
+test("a verified welcome's token is stored; the next hello proves it (tokenProof) without sending it", async (t) => {
   const w = makeWorker(t);
   w.bg.timing.backoffMinMs = 5;
   const ws = await until(() => h.FakeWebSocket.last());
-  ws.open();
-  ws.serverSend({ type: "welcome", protocol: 2, installId: ws.sent[0].installId, token: "tok-new" });
-  assert.equal(w.bg.isConnected(), true);
+  const { hello } = await handshake(w, ws, { token: "tok-new" });
   await until(() => w.chrome.__state.storage.local.token === "tok-new");
 
   ws.serverClose(1006);
   const ws2 = await until(() => h.FakeWebSocket.instances[1]);
-  ws2.open();
-  assert.equal(ws2.sent[0].token, "tok-new");
-  assert.equal(ws2.sent[0].installId, ws.sent[0].installId);
-  ws2.serverSend({ type: "welcome", protocol: 2, installId: ws.sent[0].installId });
+  const hs2 = await challenge(ws2);
+  assert.equal(hs2.hello.installId, hello.installId);
+  assert.equal(hs2.hello.tokenProof, mac("tok-new", `emunium-token|${hs2.serverNonce}|${hs2.hello.clientNonce}`));
+  assert.ok(!("token" in hs2.hello) && !("enrollment" in hs2.hello));
+  assert.ok(!ws2.rawSent.join("\n").includes("tok-new"));
+  await welcome(w, ws2, hs2);
   await h.tick();
-  assert.equal(w.chrome.__state.storage.local.token, "tok-new");
+  assert.equal(w.chrome.__state.storage.local.token, "tok-new", "a token-less welcome keeps it");
 
   const launch = makeWorker(t, { files: { "session.json": SESSION } });
   const ws3 = await until(() => h.FakeWebSocket.last());
   ws3.open();
+  assert.deepEqual(ws3.sent[0], { type: "hello", protocol: 2, token: "tok-abc", extensionVersion: "3.1.0", userAgent: "test-agent/1.0" });
   ws3.serverSend({ type: "welcome", protocol: 2, token: "ignored" });
+  assert.equal(launch.bg.isConnected(), true, "launch mode: plain token hello, sync welcome");
   await h.tick();
   assert.equal(launch.chrome.storage.local.set.calls.length, 0, "launch mode stores nothing");
+});
+
+test("squatter without the secret: nothing secret leaves, no request runs, token unchanged, 4005 + backoff", async (t) => {
+  const w = makeWorker(t, { storage: { installId: INSTALL_ID, token: "tok-old" } });
+  w.bg.timing.keepAliveMs = 5;
+  const handled = h.spy(() => {});
+  w.bg.handleRequest = handled;
+  commit(w.chrome, { url: CLAIM_URL });
+  await until(() => w.bg.state.pendingClaims.length === 1);
+
+  const ws = await until(() => h.FakeWebSocket.last());
+  const { hello, serverNonce } = await challenge(ws);
+  w.bg.state.backoffMs = 4000;
+  // The squatter cannot compute the proof; reflecting the client's own proof must not work either.
+  ws.serverSend({ type: "welcome", protocol: 2, installId: hello.installId, serverProof: hello.proof, token: "tok-evil" });
+  ws.serverSend({ type: "request", id: 1, method: "evaluate", params: { expression: "1" } });
+  await until(() => ws.closeCalls.length);
+  await sleep(30);
+  assert.deepEqual(closeCodes(ws), [4005]);
+  assert.equal(handled.calls.length, 0, "no request executed");
+  assert.equal(w.bg.isConnected(), false);
+  assert.deepEqual(ws.sent.map((f) => f.type), ["hello"], "no claim, reply or ping");
+  assert.equal(w.bg.state.pendingClaims.length, 1, "claim kept for the real hub");
+  assert.equal(w.chrome.__state.storage.local.token, "tok-old");
+  assert.ok(!w.chrome.storage.local.set.calls.some(([items]) => items && "token" in items), "no token written");
+  const raw = ws.rawSent.join("\n");
+  assert.ok(!raw.includes("enr-secret") && !raw.includes("tok-old"));
+  assert.equal(hello.tokenProof, mac("tok-old", `emunium-token|${serverNonce}|${hello.clientNonce}`));
+  assert.ok(w.bg.state.reconnectTimer, "reconnect scheduled");
+  assert.equal(w.bg.state.backoffMs, 8000, "backed off");
+
+  // An old-style squatter that never challenges and just welcomes gets nothing at all.
+  const w2 = makeWorker(t, { storage: { installId: INSTALL_ID, token: "tok-old" } });
+  const ws2 = await until(() => h.FakeWebSocket.last());
+  ws2.open();
+  ws2.serverSend({ type: "welcome", protocol: 2, token: "tok-evil" });
+  assert.deepEqual(closeCodes(ws2), [4005]);
+  assert.deepEqual(ws2.rawSent, []);
+  assert.equal(w2.chrome.__state.storage.local.token, "tok-old");
+});
+
+test("wrong or missing serverProof closes 4005; only the verified welcome stores a token", async (t) => {
+  const w = makeWorker(t);
+  w.bg.timing.backoffMinMs = 5;
+  w.bg.timing.attachBackoffMaxMs = 10;
+  const bad = [
+    () => undefined,
+    () => "",
+    () => 42,
+    (hello, sN) => serverProofFor(hello, sN, "wrong-secret"),
+    (hello, sN) => serverProofFor(Object.assign({}, hello, { clientNonce: newNonce() }), sN),
+    (hello, sN) => serverProofFor(hello, newNonce()),
+    (hello, sN) => mac("enr-secret", `emunium-client|${sN}|${hello.clientNonce}|${hello.installId}`),
+    (hello, sN) => {
+      const bytes = Buffer.from(serverProofFor(hello, sN), "base64url");
+      bytes[31] ^= 1; // differs only in the last byte
+      return bytes.toString("base64url");
+    },
+    (hello, sN) => Buffer.from(serverProofFor(hello, sN), "base64url").subarray(0, 31).toString("base64url"),
+    (hello, sN) => Buffer.from(serverProofFor(hello, sN), "base64url").toString("base64"), // padded, not base64url
+    (hello, sN) => serverProofFor(hello, sN) + "AA",
+  ];
+  for (let i = 0; i < bad.length; i += 1) {
+    const ws = await until(() => h.FakeWebSocket.instances[i]);
+    const { hello, serverNonce } = await challenge(ws);
+    ws.serverSend({ type: "welcome", protocol: 2, installId: hello.installId, serverProof: bad[i](hello, serverNonce), token: "tok-evil" });
+    await until(() => ws.closeCalls.length, 1500);
+    assert.deepEqual(closeCodes(ws), [4005], `variant ${i}`);
+    assert.equal(w.bg.isConnected(), false);
+  }
+  assert.equal(w.chrome.__state.storage.local.token, undefined, "no token from an unverified welcome");
+
+  // A welcome for another installId is rejected even with a proof over it.
+  const wsX = await until(() => h.FakeWebSocket.instances[bad.length]);
+  const hsX = await challenge(wsX);
+  const other = Object.assign({}, hsX.hello, { installId: INSTALL_ID });
+  wsX.serverSend({ type: "welcome", protocol: 2, installId: INSTALL_ID, serverProof: serverProofFor(other, hsX.serverNonce), token: "tok-evil" });
+  await until(() => wsX.closeCalls.length);
+  assert.deepEqual(closeCodes(wsX), [4005]);
+
+  const ws = await until(() => h.FakeWebSocket.instances[bad.length + 1]);
+  await handshake(w, ws, { token: "tok-good" });
+  await until(() => w.chrome.__state.storage.local.token === "tok-good");
+  assert.ok(!w.chrome.storage.local.set.calls.some(([items]) => items && items.token === "tok-evil"));
+  assert.equal(w.bg.state.backoffMs, w.bg.timing.backoffMinMs, "a verified welcome resets the backoff");
+});
+
+test("challenge: missing (5 s timeout) or malformed first frame closes 4005 before anything is sent", async (t) => {
+  const w = makeWorker(t);
+  assert.equal(w.bg.timing.challengeTimeoutMs, 5000, "default 5 s");
+  w.bg.timing.challengeTimeoutMs = 30;
+  w.bg.timing.backoffMinMs = 5;
+  w.bg.timing.attachBackoffMaxMs = 10;
+  const firstFrames = [
+    null, // no frame at all: timeout
+    "not json",
+    { type: "welcome", protocol: 2 },
+    { type: "challenge", protocol: 1, serverNonce: newNonce() },
+    { type: "challenge", protocol: 2 },
+    { type: "challenge", protocol: 2, serverNonce: "short" },
+    { type: "challenge", protocol: 2, serverNonce: newNonce() + "=" },
+    { type: "challenge", protocol: 2, serverNonce: nodeCrypto.randomBytes(33).toString("base64url") },
+  ];
+  for (let i = 0; i < firstFrames.length; i += 1) {
+    // Each failure backs off (5-10 ms here) and the worker reconnects on a new socket.
+    const ws = await until(() => h.FakeWebSocket.instances[i]);
+    ws.open();
+    if (firstFrames[i] !== null) {
+      ws.serverSend(firstFrames[i]);
+    }
+    await until(() => ws.closeCalls.length, 1000);
+    assert.deepEqual(closeCodes(ws), [4005], `case ${i}`);
+    assert.deepEqual(ws.rawSent, [], `case ${i}: nothing sent`);
+    assert.equal(w.bg.isConnected(), false);
+  }
+});
+
+test("requests sent right after a verified welcome run once verified, in order", async (t) => {
+  const w = makeWorker(t);
+  const handled = h.spy(() => {});
+  w.bg.handleRequest = handled;
+  const ws = await until(() => h.FakeWebSocket.last());
+  const hs = await challenge(ws);
+  ws.serverSend({ type: "welcome", protocol: 2, installId: hs.hello.installId, serverProof: serverProofFor(hs.hello, hs.serverNonce) });
+  ws.serverSend({ type: "request", id: 1, method: "a" });
+  ws.serverSend({ type: "request", id: 2, method: "b" });
+  assert.equal(handled.calls.length, 0, "nothing runs before verification");
+  await until(() => handled.calls.length === 2);
+  assert.deepEqual(handled.calls.map(([, frame]) => frame.id), [1, 2]);
+  ws.serverSend({ type: "request", id: 3, method: "c" });
+  assert.equal(handled.calls.length, 3);
 });
 
 test("reconnect backoff: attach doubles 1 s -> 30 s, launch keeps 1 s -> 5 s", async (t) => {
@@ -236,10 +453,10 @@ test("parseClaimUrl accepts only http://127.0.0.1:<hubPort>/pair#n=<nonce>", (t)
   assert.equal(bg.parseClaimUrl(CLAIM_URL, null), null);
   assert.equal(bg.parseClaimUrl(null, 47800), null);
   assert.equal(bg.hubPortOf("ws://127.0.0.1:47800/"), 47800);
-  assert.equal(bg.hubPortOf("ws://127.0.0.1"), 80);
+  assert.equal(bg.hubPortOf("ws://127.0.0.1"), null, "no implicit port 80");
 });
 
-test("claim: a commit before the welcome is queued, sent only after the welcome, tab blanked", async (t) => {
+test("claim: a commit before the welcome is queued, sent only after the verified welcome, tab blanked", async (t) => {
   const w = makeWorker(t);
   // Fired before loadConfig resolved: the worker reads the files itself.
   commit(w.chrome, { url: CLAIM_URL });
@@ -247,14 +464,14 @@ test("claim: a commit before the welcome is queued, sent only after the welcome,
   assert.deepEqual(plain(blanked(w.chrome)[0]), [1, { url: "about:blank" }]);
 
   const ws = await until(() => h.FakeWebSocket.last());
-  ws.open();
+  const hs = await challenge(ws);
   await sleep(20);
   assert.deepEqual(
     ws.sent.map((f) => f.type),
     ["hello"],
     "nothing but hello on a socket that is not welcomed"
   );
-  ws.serverSend({ type: "welcome", protocol: 2, token: "tok" });
+  await welcome(w, ws, hs, { token: "tok" });
   assert.deepEqual(claims(ws), [{ type: "event", event: "claim", nonce: NONCE }]);
   assert.equal(w.bg.state.pendingClaims.length, 0);
 
@@ -265,12 +482,26 @@ test("claim: a commit before the welcome is queued, sent only after the welcome,
   assert.equal(blanked(w.chrome).length, 1);
 });
 
+test("claim queue holds at most 16 nonces; the oldest are dropped", async (t) => {
+  const w = makeWorker(t);
+  const nonces = Array.from({ length: 20 }, (_, i) => `cap${String(i).padStart(2, "0")}`.padEnd(20, "x"));
+  for (let i = 0; i < nonces.length; i += 1) {
+    commit(w.chrome, { url: `http://127.0.0.1:47800/pair#n=${nonces[i]}` });
+    await until(() => blanked(w.chrome).length === i + 1);
+  }
+  assert.deepEqual(plain(w.bg.state.pendingClaims.map((c) => c.nonce)), nonces.slice(4));
+
+  const ws = await until(() => h.FakeWebSocket.last());
+  await handshake(w, ws);
+  assert.deepEqual(claims(ws).map((c) => c.nonce), nonces.slice(4));
+  assert.equal(w.bg.state.pendingClaims.length, 0);
+});
+
 test("claim: sent at once when welcomed; queued across a reconnect; never on the unwelcomed socket", async (t) => {
   const w = makeWorker(t);
   w.bg.timing.backoffMinMs = 5;
   const ws = await until(() => h.FakeWebSocket.last());
-  ws.open();
-  ws.serverSend({ type: "welcome", protocol: 2 });
+  await handshake(w, ws);
   commit(w.chrome, { url: CLAIM_URL });
   await until(() => claims(ws).length === 1);
 
@@ -279,11 +510,11 @@ test("claim: sent at once when welcomed; queued across a reconnect; never on the
   commit(w.chrome, { url: second });
   await until(() => blanked(w.chrome).length === 2);
   const ws2 = await until(() => h.FakeWebSocket.instances[1]);
-  ws2.open();
+  const hs2 = await challenge(ws2);
   await sleep(10);
   assert.equal(claims(ws2).length, 0);
   assert.equal(ws.droppedSent.length, 0);
-  ws2.serverSend({ type: "welcome", protocol: 2 });
+  await welcome(w, ws2, hs2);
   assert.deepEqual(claims(ws2), [{ type: "event", event: "claim", nonce: "q".repeat(40) }]);
   assert.equal(claims(ws).length, 1);
 });
@@ -295,8 +526,7 @@ test("claim: dropped after claimTtlMs; sub-frames, other ports and launch mode a
   commit(w.chrome, { url: CLAIM_URL });
   await until(() => w.bg.state.pendingClaims.length === 1);
   await sleep(60);
-  ws.open();
-  ws.serverSend({ type: "welcome", protocol: 2 });
+  await handshake(w, ws);
   assert.equal(claims(ws).length, 0, "expired claim is not sent");
   assert.equal(w.bg.state.pendingClaims.length, 0);
 
@@ -331,10 +561,10 @@ test("claim: a claim tab open before the worker loaded is queued at start, blank
   assert.equal(w.bg.state.pendingClaims.length, 1);
 
   const ws = await until(() => h.FakeWebSocket.last());
-  ws.open();
+  const hs = await challenge(ws);
   await sleep(10);
   assert.equal(claims(ws).length, 0, "never on the unwelcomed socket");
-  ws.serverSend({ type: "welcome", protocol: 2 });
+  await welcome(w, ws, hs);
   assert.deepEqual(claims(ws), [{ type: "event", event: "claim", nonce: NONCE }]);
 
   // The welcome rescan and a late commit of the same nonce add nothing.
@@ -348,8 +578,7 @@ test("claim: every attach welcome rescans open tabs; launch mode never scans", a
   const w = makeWorker(t);
   w.bg.timing.backoffMinMs = 5;
   const ws = await until(() => h.FakeWebSocket.last());
-  ws.open();
-  ws.serverSend({ type: "welcome", protocol: 2 });
+  await handshake(w, ws);
   await sleep(10);
   assert.equal(claims(ws).length, 0);
 
@@ -358,8 +587,7 @@ test("claim: every attach welcome rescans open tabs; launch mode never scans", a
   w.chrome.__state.tabs.get(1).url = `http://127.0.0.1:47800/pair#n=${late}`;
   ws.serverClose(1006);
   const ws2 = await until(() => h.FakeWebSocket.instances[1]);
-  ws2.open();
-  ws2.serverSend({ type: "welcome", protocol: 2 });
+  await handshake(w, ws2);
   await until(() => claims(ws2).length === 1);
   assert.deepEqual(claims(ws2), [{ type: "event", event: "claim", nonce: late }]);
   assert.deepEqual(plain(blanked(w.chrome)), [[1, { url: "about:blank" }]]);
