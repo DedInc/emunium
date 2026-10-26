@@ -12,14 +12,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 # xclip: pyperclip's clipboard on X11, which the interactor pastes non-ASCII
-# text through on Linux. libtk8.6: pyautogui imports mouseinfo, which needs
-# tkinter (the safety-net tests import pyautogui). Noto CJK and colour emoji
-# render the typed text.
+# text through on Linux. Noto CJK and colour emoji render the typed text.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         xvfb xauth openbox chromium \
         fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji \
-        libx11-6 libxtst6 libtk8.6 procps xclip \
+        libx11-6 libxtst6 procps xclip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --shell /bin/bash tester

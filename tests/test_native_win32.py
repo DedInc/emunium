@@ -892,9 +892,8 @@ def test_interactor_releases_in_failsafe_corner() -> None:
 # -- selection -------------------------------------------------------------------
 
 
-def test_native_backend_none_off_windows_without_a_display() -> None:
-    # An explicit empty environment: the runner's DISPLAY would pick X11.
-    assert _native.native_backend("linux", {}) is None
+def test_native_backend_none_on_macos() -> None:
+    # Linux without a display raises (tests/test_native_x11.py); macOS uses pyautogui.
     assert _native.native_backend("darwin", {}) is None
 
 

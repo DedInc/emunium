@@ -1126,7 +1126,11 @@ def test_native_backend_refuses_pure_wayland() -> None:
 
 
 def test_native_backend_without_any_display_or_off_linux() -> None:
-    assert _native.native_backend("linux", {}) is None
+    with pytest.raises(NativeInputError, match="no X display") as raised:
+        _native.native_backend("linux", {})
+    message = str(raised.value)
+    for hint in ("DISPLAY", "xvfb-run -a", "headless=True"):
+        assert hint in message
     assert _native.native_backend("darwin", {"DISPLAY": ":0"}) is None
 
 

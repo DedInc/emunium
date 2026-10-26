@@ -120,6 +120,13 @@ WAYLAND_MESSAGE = (
     "client inject input into other windows; run under X11 or enable XWayland"
 )
 
+NO_DISPLAY_MESSAGE = (
+    "native input needs an X display and there is no X display (neither "
+    "DISPLAY nor WAYLAND_DISPLAY is set): set DISPLAY to a running X server, run under Xvfb (e.g. "
+    "`xvfb-run -a python script.py`), or launch with headless=True for "
+    "DOM-only work"
+)
+
 
 def native_backend(
     platform: str | None = None, environ: Mapping[str, str] | None = None
@@ -127,8 +134,8 @@ def native_backend(
     """The native backend for ``platform``, or ``None`` to use pyautogui.
 
     Windows: ``win32``. Linux with ``DISPLAY`` set (X11 or XWayland): ``x11``.
-    Linux with only ``WAYLAND_DISPLAY``: ``NativeInputError``. Anything else
-    (macOS, Linux without any display): ``None``.
+    Linux with only ``WAYLAND_DISPLAY`` or with neither: ``NativeInputError``.
+    Anything else (macOS): ``None``.
     """
     name = platform or sys.platform
     if name == "win32":
@@ -143,4 +150,5 @@ def native_backend(
             return X11Backend()
         if env.get("WAYLAND_DISPLAY"):
             raise NativeInputError(WAYLAND_MESSAGE)
+        raise NativeInputError(NO_DISPLAY_MESSAGE)
     return None

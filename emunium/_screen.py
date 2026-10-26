@@ -115,7 +115,8 @@ def input_backend() -> InputBackend:
     Windows: ``emunium._native.win32`` (ctypes, pyautogui is never imported).
     Linux with ``DISPLAY`` (X11 or XWayland): ``emunium._native.x11`` (ctypes
     over libX11/libXtst, pyautogui is never imported); Wayland without
-    XWayland raises ``NativeInputError``. macOS: pyautogui, imported lazily.
+    XWayland, or no display at all, raises ``NativeInputError``. macOS:
+    pyautogui, imported lazily.
     DPI awareness is chosen first.
     """
     global _BACKEND
@@ -133,8 +134,8 @@ def input_backend() -> InputBackend:
 def pyautogui() -> Any:
     """Import pyautogui lazily, after DPI awareness has been chosen.
 
-    Only standalone mode still calls this (screenshots, HumanCursor, wheel
-    amounts in pyautogui units); input paths use ``input_backend``.
+    Two callers: ``input_backend`` on macOS, where pyautogui is the backend
+    (``native_backend`` returns ``None``), and ``screenshot_scale``.
     """
     global _PYAUTOGUI
     if _PYAUTOGUI is not None:
