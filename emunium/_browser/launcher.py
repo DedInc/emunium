@@ -1,19 +1,55 @@
+"""Chrome process lifecycle for one ``Browser``.
+
+Contract: ``docs/architecture/bridge-protocol.md`` section 1 (session bootstrap).
+
+``launch()`` is transactional: every resource it creates (bridge, session
+directory, Chrome process tree) is released by ``close()`` before the error
+propagates. The packaged ``emunium/extension/`` directory is only ever read.
+"""
+
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Any, List, Optional
 
-from emunium.bridge import Bridge
-from emunium.chrome_installer import ensure_chrome
+from emunium.chrome_installer import CHROME_PATH_ENV, ensure_chrome
+from emunium.errors import EmuniumError, LaunchError
 
 logger = logging.getLogger("emunium.browser")
 
-EXTENSION_DIR = str(Path(__file__).resolve().parent.parent / "extension")
+# Read-only source; each session gets its own copy.
+EXTENSION_SOURCE_DIR = str(Path(__file__).resolve().parent.parent / "extension")
+
+PROTOCOL_VERSION = 2
+SESSION_DIR_PREFIX = "emunium-"
+EXTENSION_COPY_IGNORE = ("port.json", "session.json", "__pycache__")
+CONNECT_POLL_SECONDS = 0.25
+TERMINATE_GRACE_SECONDS = 5.0
+TASKKILL_TIMEOUT_SECONDS = 10.0
+RMTREE_ATTEMPTS = 10
+RMTREE_RETRY_DELAY = 0.3
+LOG_TAIL_LINES = 20
+
+_IS_WINDOWS = os.name == "nt"
+_SIGKILL = getattr(signal, "SIGKILL", 9)
+
+CHROME_FLAGS = (
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-popup-blocking",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--hide-crash-restore-bubble",
+)
 
 
 class BrowserSession:
@@ -22,91 +58,526 @@ class BrowserSession:
         "process",
         "headless",
         "user_data_dir",
-        "tmp_data_dir",
         "chrome_path",
+        "extra_args",
+        "session_dir",
+        "extension_dir",
+        "profile_dir",
+        "log_path",
+        "executable_path",
+        "_bridge_started",
+        "_job",
     )
 
     def __init__(self) -> None:
-        self.bridge: Bridge | None = None
-        self.process: subprocess.Popen | None = None
+        self.bridge: Any = None
+        self.process: Optional[subprocess.Popen] = None
         self.headless: bool = False
-        self.user_data_dir: str | None = None
-        self.tmp_data_dir: str | None = None
-        self.chrome_path: str = ""
+        self.user_data_dir: Optional[str] = None
+        # Explicit Chrome binary; None -> EMUNIUM_CHROME_PATH -> Chrome for Testing.
+        self.chrome_path: Optional[str] = None
+        self.extra_args: List[str] = []
+        self.session_dir: Optional[str] = None
+        self.extension_dir: Optional[str] = None
+        self.profile_dir: Optional[str] = None
+        self.log_path: Optional[str] = None
+        # Binary actually started by the last launch().
+        self.executable_path: Optional[str] = None
+        self._bridge_started: bool = False
+        # Windows Job Object handle owning the Chrome process tree, if any.
+        self._job: Optional[int] = None
 
 
 def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
-    session.chrome_path = ensure_chrome()
+    if session.bridge is None:
+        raise LaunchError("BrowserSession.bridge is not set")
+    try:
+        _launch(session, float(bridge_timeout))
+    except Exception as exc:
+        try:
+            close(session)
+        except Exception:
+            logger.exception("Cleanup after a failed launch raised")
+        if isinstance(exc, EmuniumError):
+            raise
+        raise LaunchError("Chrome launch failed: %s" % (exc,)) from exc
+    except BaseException:
+        # KeyboardInterrupt / SystemExit: still release everything, never wrap.
+        try:
+            close(session)
+        except Exception:
+            logger.exception("Cleanup after an interrupted launch raised")
+        raise
+
+
+def _launch(session: BrowserSession, bridge_timeout: float) -> None:
+    executable = _resolve_executable(session)
+    extra_args = _validated_extra_args(session.extra_args)
+
+    session._bridge_started = True
     session.bridge.start()
     port = session.bridge.actual_port
+    token = session.bridge.token
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 < port <= 65535:
+        raise LaunchError("Bridge reported an invalid port: %r" % (port,))
+    if not isinstance(token, str) or not token:
+        raise LaunchError("Bridge reported no session token")
     logger.info("Bridge started on port %d", port)
 
+    session.session_dir = tempfile.mkdtemp(prefix=SESSION_DIR_PREFIX)
+    session_dir = Path(session.session_dir)
+
+    extension_dir = session_dir / "extension"
+    shutil.copytree(
+        EXTENSION_SOURCE_DIR,
+        str(extension_dir),
+        ignore=shutil.ignore_patterns(*EXTENSION_COPY_IGNORE),
+    )
+    session.extension_dir = str(extension_dir)
+    _write_session_file(extension_dir, port, token)
+
     if session.user_data_dir:
-        data_dir = str(Path(session.user_data_dir).resolve())
+        profile_dir = Path(session.user_data_dir).expanduser().resolve()
+        profile_dir.mkdir(parents=True, exist_ok=True)
     else:
-        session.tmp_data_dir = tempfile.mkdtemp(prefix="emun_profile_")
-        data_dir = session.tmp_data_dir
-        logger.info("Created temp profile: %s", data_dir)
+        profile_dir = session_dir / "profile"
+        profile_dir.mkdir()
+    session.profile_dir = str(profile_dir)
+    _seed_profile(str(profile_dir))
 
-    _write_master_preferences(session.chrome_path)
-    _seed_profile(data_dir)
-    _patch_extension_port(port)
+    session.log_path = str(session_dir / "chrome.log")
+    args = build_args(
+        executable,
+        session.profile_dir,
+        session.extension_dir,
+        headless=session.headless,
+        extra_args=extra_args,
+    )
+    session.process = _spawn(args, session.log_path)
+    if _IS_WINDOWS:
+        session._job = _attach_job(session.process)
+    logger.info("Chrome started (pid %s), session dir %s", session.process.pid, session_dir)
 
-    args = [
-        session.chrome_path,
-        f"--user-data-dir={data_dir}",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-popup-blocking",
-        f"--load-extension={EXTENSION_DIR}",
-    ]
-    if session.headless:
-        args.append("--headless=new")
-
-    session.process = subprocess.Popen(args)
-    time.sleep(2)
-
-    connected = session.bridge.wait_for_connection(timeout=bridge_timeout)
-    if not connected:
-        raise RuntimeError("Extension did not connect within timeout")
+    _await_connection(session, bridge_timeout)
     logger.info("Extension connected to bridge")
 
 
+def build_args(
+    executable: str,
+    profile_dir: str,
+    extension_dir: str,
+    *,
+    headless: bool = False,
+    extra_args: Optional[List[str]] = None,
+) -> List[str]:
+    args = [executable, "--user-data-dir=%s" % profile_dir]
+    args.extend(CHROME_FLAGS)
+    args.append("--disable-extensions-except=%s" % extension_dir)
+    args.append("--load-extension=%s" % extension_dir)
+    if headless:
+        args.append("--headless=new")
+    args.extend(extra_args or ())
+    return args
+
+
 def close(session: BrowserSession) -> None:
-    if session.process:
-        session.process.terminate()
+    """Release everything ``launch()`` created. Safe to call repeatedly."""
+    process, session.process = session.process, None
+    job, session._job = session._job, None
+    if process is not None:
+        _stop_process_tree(process, job, headless=session.headless)
+    elif job is not None:
+        _close_job(job, terminate=True)
+
+    if session._bridge_started:
+        session._bridge_started = False
+        if session.bridge is not None:
+            try:
+                session.bridge.shutdown()
+            except Exception:
+                logger.exception("Bridge shutdown raised")
+
+    session_dir, session.session_dir = session.session_dir, None
+    session.extension_dir = None
+    session.log_path = None
+    session.profile_dir = None  # a user_data_dir profile is left in place
+    if session_dir is not None:
+        _remove_tree(session_dir)
+    if process is not None:
+        logger.info("Browser closed")
+
+
+def _resolve_executable(session: BrowserSession) -> str:
+    override = session.chrome_path or os.environ.get(CHROME_PATH_ENV)
+    if override:
+        if not os.path.isfile(override):
+            raise LaunchError("Chrome executable not found: %s" % override)
+        executable = override
+    else:
+        executable = ensure_chrome()
+    session.executable_path = executable
+    return executable
+
+
+def _validated_extra_args(extra_args: Any) -> List[str]:
+    if extra_args is None:
+        return []
+    if isinstance(extra_args, str):
+        raise LaunchError("extra_args must be a list of strings, not a string")
+    args = list(extra_args)
+    for arg in args:
+        if not isinstance(arg, str):
+            raise LaunchError("extra_args must contain only strings, got %r" % (arg,))
+    return args
+
+
+def _write_session_file(extension_dir: Path, port: int, token: str) -> None:
+    payload = {"protocol": PROTOCOL_VERSION, "port": port, "token": token}
+    (extension_dir / "session.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _spawn(args: List[str], log_path: str) -> subprocess.Popen:
+    kwargs = {}
+    if not _IS_WINDOWS:
+        # Own process group, so close() can signal the whole tree with killpg.
+        kwargs["start_new_session"] = True
+    # The child keeps its own handle to the log; ours can close right away.
+    with open(log_path, "wb") as log_file:
+        return subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            **kwargs
+        )
+
+
+def _await_connection(session: BrowserSession, bridge_timeout: float) -> None:
+    deadline = time.monotonic() + bridge_timeout
+    while True:
+        if session.bridge.wait_for_connection(CONNECT_POLL_SECONDS):
+            return
+        code = session.process.poll()
+        if code is not None:
+            raise LaunchError(_early_exit_message(session, code))
+        if time.monotonic() >= deadline:
+            raise LaunchError(
+                "The emunium extension did not connect within %.1f s.%s"
+                % (bridge_timeout, _log_tail_suffix(session.log_path))
+            )
+
+
+def _early_exit_message(session: BrowserSession, code: int) -> str:
+    message = "Chrome exited during startup (exit code %s)." % code
+    if session.user_data_dir:
+        # Chrome hands the command line to the instance owning the profile and exits.
+        message += (
+            " The profile %s is probably already in use by another Chrome"
+            " instance; close that browser or use a different user_data_dir."
+            % session.profile_dir
+        )
+    return message + _log_tail_suffix(session.log_path)
+
+
+def _log_tail_suffix(log_path: Optional[str]) -> str:
+    lines = _read_log_tail(log_path)
+    if not lines:
+        return ""
+    return "\nLast %d line(s) of %s:\n%s" % (len(lines), log_path, "\n".join(lines))
+
+
+def _read_log_tail(log_path: Optional[str], count: int = LOG_TAIL_LINES) -> List[str]:
+    if not log_path:
+        return []
+    try:
+        with open(log_path, "rb") as fh:
+            text = fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-count:]
+
+
+def _stop_process_tree(
+    process: subprocess.Popen, job: Optional[int] = None, headless: bool = False
+) -> None:
+    pid = process.pid
+    if _IS_WINDOWS:
+        if not headless:
+            # Graceful request to every window in the tree. The exit code is
+            # meaningless: windowless renderer/GPU processes always make it
+            # non-zero. Popen.wait returns as soon as the parent exits.
+            _run_taskkill(pid, force=False)
+            _wait_quietly(process, TERMINATE_GRACE_SECONDS)
+        # Headless Chrome has no window to close, so it goes straight to the kill.
+        # Unconditional: kills every process left in the tree, orphans included.
+        job_killed = job is not None and _close_job(job, terminate=True)
+        if not job_killed:
+            if process.poll() is None:
+                if not _run_taskkill(pid, force=True):
+                    _kill_quietly(process)
+            else:
+                logger.warning(
+                    "Chrome (pid %s) exited before its process tree could be killed;"
+                    " child processes may remain",
+                    pid,
+                )
+    else:
+        if not _signal_group(pid, signal.SIGTERM):
+            _terminate_quietly(process)
+        _wait_quietly(process, TERMINATE_GRACE_SECONDS)
+        # Children may outlive the parent; the group outlives both.
+        if not _signal_group(pid, _SIGKILL) and process.poll() is None:
+            _kill_quietly(process)
+    _wait_quietly(process, TERMINATE_GRACE_SECONDS)
+
+
+# -- Windows Job Object ----------------------------------------------------------
+#
+# Chrome is assigned to a job right after Popen returns. Children inherit the
+# job, so TerminateJobObject reaches renderers even after the browser process
+# has exited. KILL_ON_JOB_CLOSE is deliberate: if Python dies abruptly, the OS
+# closes our handle and takes Chrome down with it instead of leaking it.
+# Race: a child Chrome spawns before AssignProcessToJobObject runs is not in the
+# job. Chrome only spawns children after its own startup, so the window is a few
+# microseconds and is accepted rather than starting Chrome with CREATE_SUSPENDED.
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+
+
+class _Kernel32Jobs:
+    """Thin ctypes wrapper; failures raise OSError carrying GetLastError."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k32.TerminateJobObject.restype = wintypes.BOOL
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.CloseHandle.restype = wintypes.BOOL
+        self._k32 = k32
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "ReadOperationCount",
+                    "WriteOperationCount",
+                    "OtherOperationCount",
+                    "ReadTransferCount",
+                    "WriteTransferCount",
+                    "OtherTransferCount",
+                )
+            ]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+
+    def _fail(self, what: str) -> OSError:
+        err = self._ctypes.get_last_error()
+        return OSError(err, "%s failed (winerror %d)" % (what, err))
+
+    def create_kill_on_close_job(self) -> int:
+        job = self._k32.CreateJobObjectW(None, None)
+        if not job:
+            raise self._fail("CreateJobObjectW")
+        info = self._limit_info()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = self._k32.SetInformationJobObject(
+            job,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            self._ctypes.byref(info),
+            self._ctypes.sizeof(info),
+        )
+        if not ok:
+            error = self._fail("SetInformationJobObject")
+            self._k32.CloseHandle(job)
+            raise error
+        return int(job)
+
+    def assign(self, job: int, process: subprocess.Popen) -> None:
+        handle = getattr(process, "_handle", None)
+        opened = None
+        if handle is None:
+            opened = self._k32.OpenProcess(
+                _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, process.pid
+            )
+            if not opened:
+                raise self._fail("OpenProcess")
+            handle = opened
         try:
-            session.process.wait(timeout=5)
-        except Exception:
-            session.process.kill()
-        session.process = None
-    session.bridge.shutdown()
-    _restore_extension()
-    if session.tmp_data_dir:
+            if not self._k32.AssignProcessToJobObject(job, int(handle)):
+                raise self._fail("AssignProcessToJobObject")
+        finally:
+            if opened:
+                self._k32.CloseHandle(opened)
+
+    def terminate(self, job: int, exit_code: int) -> None:
+        if not self._k32.TerminateJobObject(job, exit_code):
+            raise self._fail("TerminateJobObject")
+
+    def close(self, handle: int) -> None:
+        self._k32.CloseHandle(handle)
+
+
+_JOB_API: Any = None
+
+
+def _job_api() -> Any:
+    """Process-wide kernel32 wrapper; tests replace this function."""
+    global _JOB_API
+    if _JOB_API is None:
+        _JOB_API = _Kernel32Jobs()
+    return _JOB_API
+
+
+def _attach_job(process: subprocess.Popen) -> Optional[int]:
+    try:
+        api = _job_api()
+        job = api.create_kill_on_close_job()
+    except Exception as exc:
+        logger.debug("Job Object unavailable, falling back to taskkill: %s", exc)
+        return None
+    try:
+        api.assign(job, process)
+    except Exception as exc:
+        # e.g. already inside a job that forbids nesting (pre-Windows 8 hosts).
+        logger.debug("AssignProcessToJobObject failed, falling back to taskkill: %s", exc)
+        _close_job(job, terminate=False)
+        return None
+    return job
+
+
+def _close_job(job: int, terminate: bool) -> bool:
+    """Terminate (optionally) and close *job*; True when termination succeeded."""
+    try:
+        api = _job_api()
+    except Exception as exc:
+        logger.debug("Job Object API unavailable: %s", exc)
+        return False
+    terminated = False
+    if terminate:
         try:
-            shutil.rmtree(session.tmp_data_dir, ignore_errors=True)
-        except Exception:
-            pass
-        session.tmp_data_dir = None
-    logger.info("Browser closed")
+            api.terminate(job, 1)
+            terminated = True
+        except Exception as exc:
+            logger.debug("TerminateJobObject failed: %s", exc)
+    try:
+        api.close(job)
+    except Exception as exc:
+        logger.debug("CloseHandle(job) failed: %s", exc)
+    return terminated
 
 
-def _patch_extension_port(port: int) -> None:
-    port_file = Path(EXTENSION_DIR) / "port.json"
-    port_file.write_text(json.dumps({"port": port}), encoding="utf-8")
+def _run_taskkill(pid: int, force: bool) -> bool:
+    cmd = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        cmd.append("/F")
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=TASKKILL_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("taskkill for pid %s failed: %s", pid, exc)
+        return False
+    return result.returncode == 0
 
 
-def _restore_extension() -> None:
-    port_file = Path(EXTENSION_DIR) / "port.json"
-    if port_file.exists():
-        port_file.unlink(missing_ok=True)
+def _signal_group(pid: int, sig: int) -> bool:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return False
+    try:
+        killpg(pid, sig)
+    except ProcessLookupError:
+        return True  # group already gone
+    except OSError as exc:
+        logger.debug("killpg(%s, %s) failed: %s", pid, sig, exc)
+        return False
+    return True
 
 
-def _write_master_preferences(chrome_path: str) -> None:
-    master = Path(chrome_path).parent / "master_preferences"
-    payload = {"extensions": {"ui": {"developer_mode": True}}}
-    master.write_text(json.dumps(payload), encoding="utf-8")
+def _terminate_quietly(process: subprocess.Popen) -> None:
+    try:
+        process.terminate()
+    except OSError:
+        pass
+
+
+def _kill_quietly(process: subprocess.Popen) -> None:
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+def _wait_quietly(process: subprocess.Popen, timeout: float) -> None:
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _remove_tree(path: str) -> None:
+    # Windows Chrome keeps profile files open for a moment after exit.
+    for attempt in range(RMTREE_ATTEMPTS):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if attempt + 1 < RMTREE_ATTEMPTS:
+                time.sleep(RMTREE_RETRY_DELAY)
+            else:
+                logger.debug("rmtree(%s) failed: %s", path, exc)
+    if os.path.exists(path):
+        logger.warning("Could not remove session directory %s", path)
 
 
 def _seed_profile(data_dir: str) -> None:
@@ -117,6 +588,8 @@ def _seed_profile(data_dir: str) -> None:
         try:
             prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
         except Exception:
+            prefs = {}
+        if not isinstance(prefs, dict):
             prefs = {}
         prefs.setdefault("extensions", {}).setdefault("ui", {})["developer_mode"] = True
         prefs.setdefault("profile", {})["exited_cleanly"] = True
