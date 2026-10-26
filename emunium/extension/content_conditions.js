@@ -3,12 +3,12 @@
 
   const scope = globalThis.EmuniumContent;
 
-  // Event types shared with content_main.js (MAIN world). Elements cross worlds, JS
-  // objects do not, so every exchange carries nodes (relatedTarget) and attributes on
-  // detached nodes only.
-  const MAIN_HELLO = "__emunium_main_hello";
-  const MAIN_READY = "__emunium_main_ready";
-  const MAIN_EVAL = "__emunium_main_eval";
+  // custom_js in the MAIN world: per wait, the worker injects an evaluator
+  // (background_handlers.js mainWorldEvaluator) listening on `document` for event types
+  // derived from a random channel it passes as params.__mainChannel. Elements and DOM
+  // event state (defaultPrevented) cross worlds; JS objects do not.
+  const CHANNEL_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const RAW_WAIT = Symbol.for("emunium.content.rawWaitForSelector");
 
   const MAX_DEPTH = 32;
   const COMPILE_CACHE_LIMIT = 64;
@@ -32,10 +32,13 @@
   ]);
   const GROUP_TYPES = new Set(["any_of", "all_of"]);
 
-  // Nodes created by emunium (channel nodes); the wait observer ignores their records.
+  // Nodes created by emunium; the wait observer ignores their records.
   const ownNodes = scope.ownNodes || new WeakSet();
-  // Survives re-injection into the same isolated world: the MAIN handshake is one-shot.
-  const channel = scope.mainChannel || { port: null, inbox: null, isolatedBlocked: false };
+  // Survives re-injection into the same isolated world.
+  const customJsState = scope.customJsState || { isolatedBlocked: false };
+  // conditions array of a running wait -> { channel, indexOf: Map(leaf -> index) | null,
+  // alive }. Shared across re-injection: a running wait keeps its channel.
+  const mainChannels = scope.mainChannels || new WeakMap();
   const isolatedCompiled = new Map();
 
   function codedError(code, message) {
@@ -162,6 +165,16 @@
     }
   }
 
+  // The custom_js leaves in walkLeaves order; leaf i is evaluated through
+  // `${channel}:${i}`. background_handlers.js customJsCodes mirrors this order.
+  function customJsLeaves(conditions) {
+    const leaves = [];
+    walkLeaves(conditions, (c) => {
+      if (c.type === "custom_js") leaves.push(c);
+    });
+    return leaves;
+  }
+
   function hasConditionType(conditions, type) {
     let found = false;
     walkLeaves(conditions, (c) => {
@@ -247,7 +260,7 @@
   // (always the case in MV3 isolated worlds). Tried once per world: a blocked attempt
   // is not repeated on every tick.
   function compileIsolated(code) {
-    if (channel.isolatedBlocked) {
+    if (customJsState.isolatedBlocked) {
       return null;
     }
     const cached = isolatedCompiled.get(code);
@@ -259,7 +272,7 @@
       fn = new Function("el", code);
     } catch (error) {
       if (isCodegenBlocked(error)) {
-        channel.isolatedBlocked = true;
+        customJsState.isolatedBlocked = true;
         return null;
       }
       if (error && error.name === "SyntaxError") {
@@ -271,74 +284,82 @@
     return fn;
   }
 
-  function isChannelNode(node) {
-    return isElement(node) && !node.isConnected;
+  function isMainChannel(value) {
+    return typeof value === "string" && CHANNEL_PATTERN.test(value);
   }
 
-  // Synchronous handshake: the MAIN script answers a hello dispatched with our detached
-  // inbox as relatedTarget by dispatching "ready" on the inbox with its detached port.
-  function connectMainWorld() {
-    if (isChannelNode(channel.port)) {
-      return channel.port;
+  // Binds a wait's conditions array to its channel; returns false for an invalid channel.
+  function openMainChannel(conditions, channel) {
+    if (!Array.isArray(conditions) || !isMainChannel(channel)) {
+      return false;
     }
-    channel.port = null;
-    const inbox = channel.inbox || document.createElement("div");
-    channel.inbox = inbox;
-    ownNodes.add(inbox);
-    let port = null;
-    const onReady = (event) => {
-      if (isChannelNode(event.relatedTarget)) {
-        port = event.relatedTarget;
+    mainChannels.set(conditions, { channel, indexOf: null, alive: false });
+    return true;
+  }
+
+  // Wait end: the MAIN evaluator removes all of its listeners.
+  function closeMainChannel(conditions) {
+    const binding = Array.isArray(conditions) ? mainChannels.get(conditions) : undefined;
+    if (!binding) {
+      return;
+    }
+    mainChannels.delete(conditions);
+    document.dispatchEvent(new Event(`${binding.channel}:close`));
+  }
+
+  // Indexes are computed after validation (first evaluation), never on a rejected tree.
+  function bindingFor(conditions) {
+    const binding = Array.isArray(conditions) ? mainChannels.get(conditions) : undefined;
+    if (!binding) {
+      return null;
+    }
+    if (!binding.indexOf) {
+      binding.indexOf = new Map();
+      customJsLeaves(conditions).forEach((leaf, index) => {
+        if (!binding.indexOf.has(leaf)) binding.indexOf.set(leaf, index);
+      });
+    }
+    return binding;
+  }
+
+  // A connected element is the dispatch target (composed: also inside shadow roots); no
+  // element (or one outside the document, which the document listener cannot see) is a
+  // dispatch on the document itself, which the evaluator passes as null.
+  function evaluateInMainWorld(el, condition, binding) {
+    const index = binding ? binding.indexOf.get(condition) : undefined;
+    if (index === undefined) {
+      throw codedError(
+        "content_unavailable",
+        "custom_js needs the MAIN-world evaluator, which the worker installs for each waitForSelector"
+      );
+    }
+    // A missing evaluator would read as false (and not(custom_js) as true): check it is
+    // alive once per evaluation pass.
+    if (!binding.alive) {
+      if (document.dispatchEvent(new Event(`${binding.channel}:ready`, { cancelable: true })) !== false) {
+        throw codedError(
+          "content_unavailable",
+          "the MAIN-world custom_js evaluator for this wait is gone (new document or expired)"
+        );
       }
-    };
-    inbox.addEventListener(MAIN_READY, onReady);
-    try {
-      document.dispatchEvent(new MouseEvent(MAIN_HELLO, { relatedTarget: inbox }));
-    } finally {
-      inbox.removeEventListener(MAIN_READY, onReady);
+      binding.alive = true;
     }
-    channel.port = port;
-    return port;
+    const type = `${binding.channel}:${index}`;
+    const target = isElement(el) && el.isConnected ? el : document;
+    if (target.dispatchEvent(new Event(type, { bubbles: true, cancelable: true, composed: true })) === false) {
+      return true;
+    }
+    if (document.dispatchEvent(new Event(`${type}:async`, { cancelable: true })) === false) {
+      throw asyncResultError();
+    }
+    return false;
   }
 
-  function evaluateInMainWorld(el, code) {
-    const port = connectMainWorld();
-    if (!port) {
-      throw codedError("content_unavailable", "custom_js needs the MAIN-world evaluator (content_main.js), which is not installed");
-    }
-    const request = document.createElement("div");
-    ownNodes.add(request);
-    request.setAttribute("code", code);
-    port.appendChild(request);
-    try {
-      // Bubbles from the request to the port's listener; relatedTarget carries the element.
-      request.dispatchEvent(new MouseEvent(MAIN_EVAL, { bubbles: true, relatedTarget: el || null }));
-    } finally {
-      request.remove();
-    }
-    const status = request.getAttribute("status");
-    const message = request.getAttribute("message") || "";
-    switch (status) {
-      case "true":
-        return true;
-      case "false":
-        return false;
-      case "csp":
-        throw codedError("csp_blocked", `page Content Security Policy blocks custom_js evaluation: ${message}`);
-      case "syntax":
-        throw codedError("script_error", `custom_js: ${message}`);
-      case "async":
-        throw asyncResultError();
-      default:
-        channel.port = null; // the evaluator went away; reconnect on the next call
-        throw codedError("content_unavailable", "the MAIN-world evaluator did not answer");
-    }
-  }
-
-  function runCustomJs(el, code) {
+  function runCustomJs(el, condition, binding) {
+    const code = condition.code;
     const fn = compileIsolated(code);
     if (!fn) {
-      return evaluateInMainWorld(el, code);
+      return evaluateInMainWorld(el, condition, binding);
     }
     let result;
     try {
@@ -389,32 +410,36 @@
     detached: (el) => !isElement(el) || !el.isConnected,
     count_gt: (el, cond, all) => all.length > cond.value,
     count_eq: (el, cond, all) => all.length === cond.value,
-    custom_js: (el, cond) => runCustomJs(isElement(el) ? el : null, cond.code),
+    custom_js: (el, cond, all, binding) => runCustomJs(isElement(el) ? el : null, cond, binding),
   };
 
-  function evaluate(el, condition, allElements) {
-    const all = Array.isArray(allElements) ? allElements : [];
+  // `binding` is the running wait's MAIN channel (null outside a wait).
+  function evaluateWith(el, condition, all, binding) {
     const element = isElement(el) ? el : null;
     const type = condition && condition.type;
     if (type === "any_of") {
-      return condition.conditions.some((group) => group.every((c) => evaluate(element, c, all)));
+      return condition.conditions.some((group) => group.every((c) => evaluateWith(element, c, all, binding)));
     }
     if (type === "all_of") {
-      return condition.conditions.every((group) => group.every((c) => evaluate(element, c, all)));
+      return condition.conditions.every((group) => group.every((c) => evaluateWith(element, c, all, binding)));
     }
     if (type === "not") {
       // With no element, element-specific conditions are false, so not(...) of them holds:
       // e.g. not(has_class "x") is satisfied by a missing element and the wait can resolve
       // the element-less match {element: null, matched: true, count: 0}.
-      return !condition.condition.every((c) => evaluate(element, c, all));
+      return !condition.condition.every((c) => evaluateWith(element, c, all, binding));
     }
     if (Object.prototype.hasOwnProperty.call(AnyEvaluators, type)) {
-      return AnyEvaluators[type](element, condition, all);
+      return AnyEvaluators[type](element, condition, all, binding);
     }
     if (Object.prototype.hasOwnProperty.call(ElementEvaluators, type)) {
       return element !== null && ElementEvaluators[type](element, condition, all);
     }
     throw codedError("unknown_condition", `unknown condition type ${JSON.stringify(type)}`);
+  }
+
+  function evaluate(el, condition, allElements) {
+    return evaluateWith(el, condition, Array.isArray(allElements) ? allElements : [], null);
   }
 
   function matchesCondition(el, condition, allElements) {
@@ -429,12 +454,14 @@
   function checkElementConditions(element, state, conditions, allElements) {
     const all = Array.isArray(allElements) ? allElements : [];
     const list = Array.isArray(conditions) ? conditions : [];
+    const binding = bindingFor(conditions);
+    if (binding) binding.alive = false; // one liveness check per tick
     if (!isElement(element)) {
       // No match: succeed only when there is something to satisfy and all of it holds for null.
       if (stateNeedsElement(state) || list.length === 0) {
         return false;
       }
-      return list.every((c) => evaluate(null, c, all));
+      return list.every((c) => evaluateWith(null, c, all, binding));
     }
     if (state === "visible" && !isVisible(element)) {
       return false;
@@ -445,19 +472,71 @@
     if (state === "unobscured" && (!isVisible(element) || !isUnobscured(element))) {
       return false;
     }
-    return list.every((c) => evaluate(element, c, all));
+    return list.every((c) => evaluateWith(element, c, all, binding));
   }
+
+  // ── wait hook ───────────────────────────────────────────────────────────
+
+  // content_wait.js only sees `conditions`; the channel is in params. Each wait gets its
+  // own conditions array (so concurrent waits never share a binding), and the channel is
+  // closed whichever way the wait ends.
+  function withMainChannel(rawWait) {
+    const wrapped = function waitForSelector(params) {
+      const channel = params && params.__mainChannel;
+      if (!isMainChannel(channel) || !Array.isArray(params.conditions)) {
+        return rawWait(params);
+      }
+      const conditions = params.conditions.slice();
+      openMainChannel(conditions, channel);
+      let pending;
+      try {
+        pending = rawWait(Object.assign({}, params, { conditions }));
+      } catch (error) {
+        closeMainChannel(conditions);
+        throw error;
+      }
+      return Promise.resolve(pending).finally(() => closeMainChannel(conditions));
+    };
+    wrapped[RAW_WAIT] = rawWait;
+    return wrapped;
+  }
+
+  // content_wait.js publishes scope.waitForSelector with Object.assign after this file
+  // runs (and again on re-injection); the setter wraps whatever it publishes.
+  function installWaitHook() {
+    const existing = Object.getOwnPropertyDescriptor(scope, "waitForSelector");
+    let published;
+    const publish = (value) => {
+      const raw = typeof value === "function" && typeof value[RAW_WAIT] === "function" ? value[RAW_WAIT] : value;
+      published = typeof raw === "function" ? withMainChannel(raw) : raw;
+    };
+    if (existing) {
+      publish(existing.get ? existing.get.call(scope) : existing.value);
+    }
+    Object.defineProperty(scope, "waitForSelector", {
+      configurable: true,
+      enumerable: true,
+      get: () => published,
+      set: publish,
+    });
+  }
+
+  installWaitHook();
 
   Object.assign(scope, {
     checkElementConditions,
+    closeMainChannel,
+    customJsLeaves,
+    customJsState,
     evaluate,
     hasConditionType,
     hasDetachedCondition,
     isClickable,
     isUnobscured,
     isVisible,
-    mainChannel: channel,
+    mainChannels,
     matchesCondition,
+    openMainChannel,
     ownNodes,
     validateConditions,
     walkLeaves,

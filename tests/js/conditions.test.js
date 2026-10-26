@@ -1,8 +1,8 @@
 "use strict";
-// tests/js/conditions.test.js - content_conditions.js, content_wait.js and content_main.js:
-// validation, null-safe evaluators, element-less matches, nested stable, tick errors,
-// timeouts, custom_js (isolated and MAIN world) and the manifest
-// (docs/architecture/bridge-protocol.md sections 6-7).
+// tests/js/conditions.test.js - content_conditions.js and content_wait.js: validation,
+// null-safe evaluators, element-less matches, nested stable, tick errors, timeouts,
+// custom_js (isolated world, and MAIN world through the worker's per-wait channel
+// evaluator) and the manifest (docs/architecture/bridge-protocol.md sections 6-7).
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -33,8 +33,14 @@ function makeIsolated(t, { document, blockEval = false, url = "https://example.t
   return { ctx, win, doc, scope: ctx.EmuniumContent, serialized };
 }
 
-// MAIN world: content_main.js in its own context over the same document.
-function loadMain(t, doc, { csp = false } = {}) {
+// The worker's MAIN-world evaluator and its tree walk (background_handlers.js).
+const worker = h.loadScripts(["background_handlers.js"], {
+  EmuniumBackground: { codedError: (code, message) => Object.assign(new Error(message), { code }), errorMessage: String, timing: {} },
+}).EmuniumBackground;
+
+// MAIN world: its own context over the same document; `install` runs the evaluator the way
+// chrome.scripting does (serialized func + args) and returns its result as a plain object.
+function mainWorld(t, doc, { csp = false } = {}) {
   const isolatedView = doc.defaultView;
   const win = h.createWindow(doc);
   doc.defaultView = isolatedView;
@@ -43,16 +49,33 @@ function loadMain(t, doc, { csp = false } = {}) {
       throw new EvalError("Refused to evaluate a string as JavaScript because 'unsafe-eval' is not allowed");
     };
   }
-  const ctx = h.loadScripts(["content_main.js"], win);
+  const ctx = h.loadScripts([], win);
   t.after(() => ctx.__harness.dispose());
-  return ctx;
+  const evaluator = ctx.__harness.evaluate("(" + worker.mainWorldEvaluator.toString() + ")");
+  return {
+    ctx,
+    win,
+    install: (channel, codes, ttlMs = 15000) => ({ ...evaluator(channel, codes, ttlMs) }),
+  };
+}
+
+// Worker side of one wait: a fresh channel and the evaluator for the tree's custom_js.
+function openWait(main, conditions, ttlMs) {
+  const channel = require("crypto").randomUUID();
+  const outcome = main.install(channel, worker.customJsCodes(conditions), ttlMs);
+  assert.deepEqual(outcome, { ok: true });
+  return channel;
+}
+
+function channelListeners(doc, channel) {
+  let count = 0;
+  for (const [type, list] of doc.__listeners) {
+    if (type.startsWith(channel)) count += list.length;
+  }
+  return count;
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function listenerCount(target, type) {
-  return target.__listeners && target.__listeners.get(type) ? target.__listeners.get(type).length : 0;
-}
 
 async function rejectsWith(promise, code) {
   const error = await promise.then(
@@ -433,26 +456,54 @@ test("custom_js isolated path: new Function(el, code); runtime errors are false;
   );
 });
 
-test("custom_js falls back to the MAIN world when isolated code generation is blocked", async (t) => {
+test("custom_js falls back to the MAIN world through the wait's channel when isolated code generation is blocked", async (t) => {
   const { scope, doc } = makeIsolated(t, { blockEval: true });
   const button = visibleButton(doc);
-  loadMain(t, doc);
-  assert.equal(listenerCount(doc, "__emunium_main_hello"), 1, "armed for the handshake");
+  const main = mainWorld(t, doc);
+  const windowKeys = Object.keys(main.win).sort();
+  const conditions = [{ type: "custom_js", code: "return el.id === 'go' && typeof window === 'object';" }];
+  const channel = openWait(main, conditions);
+  assert.equal(channelListeners(doc, channel), 4, "eval, async, ready and close listeners on document");
 
-  const result = await scope.waitForSelector({
-    selector: "#go", conditions: [{ type: "custom_js", code: "return el.id === 'go' && typeof window === 'object';" }], timeoutMs: 0,
-  });
+  const result = await scope.waitForSelector({ selector: "#go", conditions, timeoutMs: 0, __mainChannel: channel });
   assert.equal(result.id, "go");
-  assert.equal(listenerCount(doc, "__emunium_main_hello"), 0, "no document listener after the handshake");
-  assert.equal(listenerCount(doc.defaultView, "__emunium_main_hello"), 0);
+  assert.equal(scope.customJsState.isolatedBlocked, true);
+  assert.equal(channelListeners(doc, channel), 0, "the wait end closed the channel");
   assert.deepEqual(button.getAttributeNames(), ["id"], "no attributes on page elements");
-  assert.equal(scope.mainChannel.isolatedBlocked, true);
+  assert.deepEqual(Object.keys(main.win).sort(), windowKeys, "nothing added to the MAIN window");
+});
 
-  assert.equal(scope.evaluate(null, { type: "custom_js", code: "return el === null;" }, []), true);
-  assert.equal(scope.evaluate(button, { type: "custom_js", code: "throw new Error('x');" }, [button]), false);
+test("MAIN-world custom_js results: truthy true, falsy false, exception false, null element, nested trees", async (t) => {
+  const { scope, doc } = makeIsolated(t, { blockEval: true });
+  const button = visibleButton(doc);
+  const main = mainWorld(t, doc);
+  const leaf = (code) => ({ type: "custom_js", code });
+  const check = (conditions, el) => {
+    const channel = openWait(main, conditions);
+    assert.ok(scope.openMainChannel(conditions, channel));
+    try {
+      return scope.checkElementConditions(el, "presence", conditions, el ? [el] : []);
+    } finally {
+      scope.closeMainChannel(conditions);
+      assert.equal(channelListeners(doc, channel), 0);
+    }
+  };
+  assert.equal(check([leaf("return el.id;")], button), true, "truthy");
+  assert.equal(check([leaf("return 0;")], button), false, "falsy");
+  assert.equal(check([leaf("throw new Error('not yet');")], button), false, "exception");
+  assert.equal(check([leaf("return el === null;")], null), true, "no element: dispatched on document, el is null");
+  assert.equal(check([leaf("return el === null;")], button), false);
+  // Index mapping across groups: a wrong index would evaluate another leaf's code.
+  const nested = [
+    leaf("return el.id === 'go';"),
+    { type: "all_of", conditions: [[{ type: "not", condition: [leaf("return false;")] }], [leaf("return el.tagName === 'BUTTON';")]] },
+    { type: "not", condition: [{ type: "any_of", conditions: [[leaf("return el.id === 'nope';")]] }] },
+  ];
+  assert.equal(check(nested, button), true);
   assert.throws(
-    () => scope.evaluate(button, { type: "custom_js", code: "return (" }, [button]),
-    (e) => e.code === "script_error"
+    () => scope.checkElementConditions(button, "presence", [leaf("return true;")], [button]),
+    (e) => e.code === "content_unavailable",
+    "an array without a channel cannot reach the MAIN world"
   );
 });
 
@@ -472,22 +523,228 @@ test("custom_js returning a Promise/thenable rejects script_error (isolated and 
 
   const main = makeIsolated(t, { blockEval: true });
   visibleButton(main.doc);
-  loadMain(t, main.doc);
-  const error = await rejectsWith(
-    main.scope.waitForSelector({ selector: "#go", conditions: [{ type: "custom_js", code: "return Promise.resolve(true);" }], timeoutMs: 200 }),
-    "script_error"
-  );
-  assert.match(error.message, /synchronously/);
+  const world = mainWorld(t, main.doc);
+  for (const code of ["return Promise.resolve(true);", "return { then() {} };"]) {
+    const conditions = [{ type: "custom_js", code }];
+    const channel = openWait(world, conditions);
+    const error = await rejectsWith(
+      main.scope.waitForSelector({ selector: "#go", conditions, timeoutMs: 200, __mainChannel: channel }),
+      "script_error"
+    );
+    assert.match(error.message, /synchronously/);
+    assert.equal(channelListeners(main.doc, channel), 0, "a rejected wait closes its channel too");
+  }
 });
 
-test("content_main.js installs once: a second run re-arms the same port", (t) => {
+test("MAIN evaluator compiles every code up front: csp_blocked / script_error, and nothing is registered", (t) => {
+  const { doc } = makeIsolated(t, { blockEval: true });
+  const csp = mainWorld(t, doc, { csp: true });
+  const channel = require("crypto").randomUUID();
+  const blocked = csp.install(channel, ["return true;"]);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.code, "csp_blocked");
+  assert.match(blocked.message, /unsafe-eval/);
+  const plainWorld = mainWorld(t, doc);
+  const broken = plainWorld.install(channel, ["return true;", "return ("]);
+  assert.equal(broken.ok, false);
+  assert.equal(broken.code, "script_error");
+  assert.equal(channelListeners(doc, channel), 0);
+  assert.equal(doc.defaultView.__listeners.size, 0);
+});
+
+test("MAIN listeners are removed on the close event and after ttlMs", async (t) => {
   const { scope, doc } = makeIsolated(t, { blockEval: true });
   const button = visibleButton(doc);
-  loadMain(t, doc);
-  loadMain(t, doc);
-  assert.equal(listenerCount(doc, "__emunium_main_hello"), 1);
-  assert.equal(scope.evaluate(button, { type: "custom_js", code: "return true;" }, [button]), true);
-  assert.equal(listenerCount(doc, "__emunium_main_hello"), 0);
+  const main = mainWorld(t, doc);
+  const conditions = [{ type: "custom_js", code: "return el.hasAttribute('data-ready');" }];
+  const channel = openWait(main, conditions);
+  const waiting = scope.waitForSelector({ selector: "#go", conditions, timeoutMs: 2000, __mainChannel: channel });
+  await sleep(60);
+  assert.equal(channelListeners(doc, channel), 4, "open while the wait runs");
+  await rejectsWith(
+    scope.waitForSelector({ selector: "#go", conditions: [{ type: "custom_js", code: "return 1;" }], timeoutMs: 0, __mainChannel: "not-a-uuid" }),
+    "content_unavailable"
+  );
+  assert.equal(channelListeners(doc, channel), 4, "another wait does not close this channel");
+  button.setAttribute("data-ready", "");
+  assert.equal((await waiting).id, "go");
+  assert.equal(channelListeners(doc, channel), 0, "close event at wait end");
+  assert.equal(main.ctx.__harness.timers.timeouts.size, 0, "and its ttl timer is cleared");
+
+  const timedOut = openWait(main, [{ type: "custom_js", code: "return false;" }]);
+  await rejectsWith(
+    scope.waitForSelector({ selector: "#go", conditions: [{ type: "custom_js", code: "return false;" }], timeoutMs: 80, __mainChannel: timedOut }),
+    "wait_timeout"
+  );
+  assert.equal(channelListeners(doc, timedOut), 0, "a timed-out wait closes its channel");
+
+  const expiring = openWait(main, conditions, 40);
+  assert.equal(channelListeners(doc, expiring), 4);
+  await sleep(90);
+  assert.equal(channelListeners(doc, expiring), 0, "ttl removed them without a close event");
+  assert.equal(main.ctx.__harness.timers.timeouts.size, 0);
+});
+
+test("a page that does not know the channel cannot observe, answer or close it", async (t) => {
+  const { scope, doc } = makeIsolated(t, { blockEval: true });
+  const button = visibleButton(doc);
+  const main = mainWorld(t, doc);
+  const seen = [];
+  const guesses = ["__emunium_main_hello", "__emunium_main_ready", "__emunium_main_eval", "0", ":0", "0:async", "close", ":close", "custom_js"];
+  const forged = require("crypto").randomUUID();
+  for (const type of guesses.concat([`${forged}:0`, `${forged}:close`])) {
+    for (const target of [doc, doc.defaultView, main.win, button]) {
+      for (const capture of [true, false]) {
+        target.addEventListener(type, (event) => {
+          seen.push(type);
+          event.preventDefault();
+        }, capture);
+      }
+    }
+  }
+  const conditions = [{ type: "custom_js", code: "return el.hasAttribute('data-ready');" }];
+  const channel = openWait(main, conditions);
+  // The page answers / closes on a channel it made up: no effect on the real one.
+  doc.dispatchEvent(new main.win.Event(`${forged}:close`));
+  assert.equal(channelListeners(doc, channel), 4);
+  seen.length = 0;
+  // A page listener on the element for the real type is never reached: the MAIN capture
+  // listener on document stops propagation.
+  let reachedElement = 0;
+  button.addEventListener(`${channel}:0`, () => (reachedElement += 1));
+  await rejectsWith(
+    scope.waitForSelector({ selector: "#go", conditions, timeoutMs: 120, __mainChannel: channel }),
+    "wait_timeout"
+  );
+  assert.deepEqual(seen, [], "no guessed listener fired");
+  assert.equal(reachedElement, 0);
+  assert.deepEqual(button.getAttributeNames(), ["id"]);
+});
+
+test("two concurrent waits use different channels and do not interfere", async (t) => {
+  const { scope, doc } = makeIsolated(t, { blockEval: true });
+  visibleButton(doc, { id: "a" });
+  visibleButton(doc, { id: "b" });
+  const main = mainWorld(t, doc);
+  main.ctx.counts = { a: 0, b: 0 };
+  const waitA = [{ type: "custom_js", code: "counts.a += 1; return globalThis.readyA === true;" }];
+  const waitB = [{ type: "custom_js", code: "counts.b += 1; return globalThis.readyB === true;" }];
+  const channelA = openWait(main, waitA);
+  const channelB = openWait(main, waitB);
+  assert.notEqual(channelA, channelB);
+  const pendingA = scope.waitForSelector({ selector: "#a", conditions: waitA, timeoutMs: 3000, __mainChannel: channelA });
+  const pendingB = scope.waitForSelector({ selector: "#b", conditions: waitB, timeoutMs: 3000, __mainChannel: channelB });
+  main.ctx.readyB = true;
+  assert.equal((await pendingB).id, "b");
+  assert.equal(channelListeners(doc, channelB), 0, "B closed");
+  assert.equal(channelListeners(doc, channelA), 4, "A still open");
+  const countA = main.ctx.counts.a;
+  assert.ok(countA >= 1);
+  main.ctx.readyA = true;
+  assert.equal((await pendingA).id, "a");
+  assert.equal(channelListeners(doc, channelA), 0);
+  assert.ok(main.ctx.counts.a > countA, "A kept evaluating its own code");
+
+  // The same conditions array in two waits: each wait binds its own copy.
+  const shared = [{ type: "custom_js", code: "return true;" }];
+  const [one, two] = [openWait(main, shared), openWait(main, shared)];
+  const results = await Promise.all([
+    scope.waitForSelector({ selector: "#a", conditions: shared, timeoutMs: 0, __mainChannel: one }),
+    scope.waitForSelector({ selector: "#b", conditions: shared, timeoutMs: 0, __mainChannel: two }),
+  ]);
+  assert.deepEqual(results.map((r) => r.id), ["a", "b"]);
+  assert.equal(channelListeners(doc, one) + channelListeners(doc, two), 0);
+});
+
+test("worker customJsCodes and content customJsLeaves walk a nested tree in the same order", (t) => {
+  const { scope } = makeIsolated(t);
+  const leaf = (code) => ({ type: "custom_js", code });
+  const tree = [
+    leaf("c0"),
+    { type: "visible" },
+    {
+      type: "any_of",
+      conditions: [
+        [leaf("c1"), { type: "not", condition: [leaf("c2"), { type: "all_of", conditions: [[leaf("c3")], [leaf("c4")]] }] }],
+        [{ type: "has_class", value: "x" }, leaf("c5")],
+      ],
+    },
+    { type: "not", condition: [{ type: "any_of", conditions: [[leaf("c6")]] }] },
+    leaf("c7"),
+  ];
+  scope.validateConditions(tree);
+  const expected = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"];
+  assert.deepEqual([...scope.customJsLeaves(tree)].map((c) => c.code), expected);
+  assert.deepEqual([...worker.customJsCodes(tree)], expected);
+  assert.deepEqual([...worker.customJsCodes([{ type: "visible" }])], []);
+  assert.equal(worker.customJsCodes([leaf(42)]), null, "invalid code: the content script rejects it, nothing injected");
+});
+
+test("a running custom_js wait keeps its channel across content-script re-injection", async (t) => {
+  const { ctx, scope, doc } = makeIsolated(t, { blockEval: true });
+  const button = visibleButton(doc);
+  const main = mainWorld(t, doc);
+  const conditions = [{ type: "custom_js", code: "return el.hasAttribute('data-ready');" }];
+  const channel = openWait(main, conditions);
+  const pending = scope.waitForSelector({ selector: "#go", conditions, timeoutMs: 2000, __mainChannel: channel });
+  h.loadScripts(["content_conditions.js", "content_wait.js"], ctx);
+  assert.equal(ctx.EmuniumContent.mainChannels, scope.mainChannels, "the channel map survived");
+  await sleep(60);
+  button.setAttribute("data-ready", "");
+  assert.equal((await pending).id, "go", "the old wait still evaluates through the new scripts");
+  assert.equal(channelListeners(doc, channel), 0);
+});
+
+test("a missing evaluator never reads as false: not(custom_js) rejects content_unavailable", async (t) => {
+  const { scope, doc } = makeIsolated(t, { blockEval: true });
+  visibleButton(doc);
+  const main = mainWorld(t, doc);
+  const notCustom = () => [{ type: "not", condition: [{ type: "custom_js", code: "return false;" }] }];
+  // Other document: a valid channel the page never received an evaluator for.
+  const otherDocument = require("crypto").randomUUID();
+  const error = await rejectsWith(
+    scope.waitForSelector({ selector: "#go", conditions: notCustom(), timeoutMs: 300, __mainChannel: otherDocument }),
+    "content_unavailable"
+  );
+  assert.match(error.message, /evaluator for this wait is gone/);
+  // ttl expired before the wait ran.
+  const expired = openWait(main, notCustom(), 10);
+  await sleep(40);
+  await rejectsWith(
+    scope.waitForSelector({ selector: "#go", conditions: notCustom(), timeoutMs: 300, __mainChannel: expired }),
+    "content_unavailable"
+  );
+  // Expiry in the middle of a wait rejects at the next tick instead of resolving.
+  const custom = [{ type: "custom_js", code: "return false;" }];
+  const midway = openWait(main, custom, 120);
+  const started = Date.now();
+  await rejectsWith(
+    scope.waitForSelector({ selector: "#go", conditions: custom, timeoutMs: 1000, __mainChannel: midway }),
+    "content_unavailable"
+  );
+  assert.ok(Date.now() - started < 900, "rejected at the first tick after expiry, not at the timeout");
+  // Live evaluator: not(false) holds.
+  const live = openWait(main, notCustom());
+  assert.equal((await scope.waitForSelector({ selector: "#go", conditions: notCustom(), timeoutMs: 0, __mainChannel: live })).id, "go");
+});
+
+test("ttl boundary: the evaluator outlives the wait's final tick only with the margin", async (t) => {
+  const { scope, doc } = makeIsolated(t, { blockEval: true });
+  visibleButton(doc);
+  const main = mainWorld(t, doc);
+  const timeoutMs = 150;
+  // No mutations: only the seed (false) and the final tick at timeoutMs (true) evaluate.
+  const run = (ttlMs) => {
+    main.ctx.startedAt = Date.now();
+    const conditions = [{ type: "custom_js", code: "return Date.now() - startedAt >= 140;" }];
+    const channel = openWait(main, conditions, ttlMs);
+    return scope.waitForSelector({ selector: "#go", conditions, timeoutMs, __mainChannel: channel });
+  };
+  await rejectsWith(run(timeoutMs - 50), "content_unavailable"); // expired just before the final tick
+  // The worker's ttl, scaled down: timeoutMs + grace + margin keeps it alive.
+  const scaled = worker.mainEvaluatorTtl(timeoutMs) - 7000 + 80;
+  assert.equal(worker.mainEvaluatorTtl(timeoutMs) - timeoutMs, 7000);
+  assert.equal((await run(scaled)).id, "go", "the final tick still reaches the evaluator");
 });
 
 test("custom_js without the MAIN evaluator rejects content_unavailable", async (t) => {
@@ -499,19 +756,27 @@ test("custom_js without the MAIN evaluator rejects content_unavailable", async (
   );
 });
 
-test("custom_js under a page CSP that forbids eval rejects csp_blocked", async (t) => {
-  const { scope, doc } = makeIsolated(t, { blockEval: true });
-  visibleButton(doc);
-  loadMain(t, doc, { csp: true });
-  await rejectsWith(
-    scope.waitForSelector({ selector: "#go", conditions: [{ type: "custom_js", code: "return true;" }], timeoutMs: 500 }),
-    "csp_blocked"
-  );
+test("the wait hook survives re-injection and wraps the published waitForSelector once", (t) => {
+  const { ctx, scope } = makeIsolated(t);
+  const calls = [];
+  scope.waitForSelector = (params) => {
+    calls.push(params);
+    return Promise.resolve("raw");
+  };
+  h.loadScripts(["content_conditions.js"], ctx);
+  const channel = require("crypto").randomUUID();
+  const conditions = [{ type: "custom_js", code: "return 1" }];
+  return scope.waitForSelector({ selector: "#go", conditions, __mainChannel: channel }).then((value) => {
+    assert.equal(value, "raw");
+    assert.equal(calls.length, 1, "not wrapped twice");
+    assert.notEqual(calls[0].conditions, conditions, "each wait binds its own copy");
+    assert.deepEqual(calls[0].conditions, conditions);
+  });
 });
 
 // ── manifest ─────────────────────────────────────────────────────────────
 
-test("manifest: 2.0.0, Chrome 111+, userScripts and alarms, no web_accessible_resources, content_main.js undeclared", () => {
+test("manifest: 2.0.0, Chrome 111+, userScripts and alarms, no web_accessible_resources, no MAIN-world file", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(h.EXTENSION_DIR, "manifest.json"), "utf8"));
   assert.equal(manifest.version, "2.0.0");
   assert.equal(manifest.minimum_chrome_version, "111");
@@ -527,6 +792,5 @@ test("manifest: 2.0.0, Chrome 111+, userScripts and alarms, no web_accessible_re
     "content_wait.js",
     "content.js",
   ]);
-  assert.ok(!declared.includes("content_main.js"));
-  assert.ok(fs.existsSync(path.join(h.EXTENSION_DIR, "content_main.js")));
+  assert.equal(fs.existsSync(path.join(h.EXTENSION_DIR, "content_main.js")), false, "the evaluator is a worker func");
 });

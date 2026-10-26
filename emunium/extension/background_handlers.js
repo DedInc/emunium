@@ -13,7 +13,6 @@
     "content_wait.js",
     "content.js",
   ];
-  const MAIN_WORLD_FILE = "content_main.js";
   const WAIT_UNTIL = new Set(["commit", "domcontentloaded", "load"]);
   const CONTENT_METHODS = new Set([
     "ping",
@@ -36,6 +35,12 @@
   const DEFAULT_NAVIGATION_TIMEOUT_MS = 30000;
   const DEFAULT_SCRIPT_TIMEOUT_MS = 30000;
   const DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
+  // Mirrors content_wait.js / content_conditions.js: default wait timeout, nesting limit.
+  const DEFAULT_WAIT_TIMEOUT_MS = 10000;
+  const MAX_CONDITION_DEPTH = 32;
+  const MAIN_EVALUATOR_GRACE_MS = 5000;
+  const MAIN_EVALUATOR_MARGIN_MS = 2000;
+  const MAX_TIMER_MS = 2147483647;
 
   // ── parameter helpers ───────────────────────────────────────────────────
 
@@ -716,17 +721,153 @@
 
   // ── content-routed ──────────────────────────────────────────────────────
 
-  function needsMainWorld(value, depth = 0) {
-    if (!value || typeof value !== "object" || depth > 32) {
-      return false;
+  // The custom_js sources of a conditions tree, in the order of content_conditions.js
+  // customJsLeaves (walkLeaves: depth-first, groups in order): code i is evaluated through
+  // event type `${channel}:${i}`. null when the tree is one the content script rejects
+  // anyway (too deep, non-string code), so nothing is injected for it.
+  function customJsCodes(conditions) {
+    const codes = [];
+    let valid = true;
+    const walk = (list, depth) => {
+      if (!Array.isArray(list) || !valid) return;
+      if (depth > MAX_CONDITION_DEPTH) {
+        valid = false;
+        return;
+      }
+      for (const condition of list) {
+        if (!condition) continue;
+        if (condition.type === "any_of" || condition.type === "all_of") {
+          for (const group of Array.isArray(condition.conditions) ? condition.conditions : []) walk(group, depth + 1);
+        } else if (condition.type === "not") {
+          walk(condition.condition, depth + 1);
+        } else if (condition.type === "custom_js") {
+          if (typeof condition.code !== "string") valid = false;
+          codes.push(condition.code);
+        }
+      }
+    };
+    walk(conditions, 0);
+    return valid ? codes : null;
+  }
+
+  // Serialized by chrome.scripting and run in the page MAIN world: must stay self-contained.
+  // One evaluator per wait. The random channel is the only name involved: listeners are
+  // capturing, on `document`, for `${channel}:${i}` (evaluate code i for the event's
+  // target; preventDefault() means true), `${channel}:${i}:async` (preventDefault() means
+  // the last result of code i was a thenable), `${channel}:ready` (preventDefault() means
+  // the evaluator is alive) and `${channel}:close`. Nothing is written to window, attributes
+  // or event details; everything is removed on close or after ttlMs. `precompiled` (one
+  // function per code) is set by the userScripts fallback, which ships the codes as source.
+  function mainWorldEvaluator(channel, codes, ttlMs, precompiled) {
+    "use strict";
+    const describeError = (error) => String((error && error.message) || error);
+    const isCodegenBlocked = (error) =>
+      (typeof EvalError !== "undefined" && error instanceof EvalError) ||
+      Boolean(error && error.name === "EvalError") ||
+      /Content Security Policy|unsafe-eval|TrustedScript|Trusted Type|Code generation from strings/i.test(describeError(error));
+    if (typeof channel !== "string" || channel === "" || !Array.isArray(codes)) {
+      return { ok: false, code: "script_error", message: "invalid custom_js evaluator arguments" };
     }
-    if (Array.isArray(value)) {
-      return value.some((item) => needsMainWorld(item, depth + 1));
+    const count = codes.length;
+    const compiled = [];
+    for (let index = 0; index < count; index += 1) {
+      if (Array.isArray(precompiled)) {
+        if (typeof precompiled[index] !== "function") {
+          return { ok: false, code: "script_error", message: "invalid custom_js evaluator arguments" };
+        }
+        compiled[index] = precompiled[index];
+        continue;
+      }
+      try {
+        compiled[index] = new Function("el", codes[index]);
+      } catch (error) {
+        return { ok: false, code: isCodegenBlocked(error) ? "csp_blocked" : "script_error", message: describeError(error) };
+      }
     }
-    if (value.type === "custom_js") {
-      return true;
+    // Captured at injection, so page patches made AFTER injection do not change the
+    // evaluator, and the channel avoids Array/String/Boolean methods below. This is not
+    // isolation: a page that patched MAIN-world built-ins (addEventListener, Reflect.apply,
+    // Event.prototype...) BEFORE injection can learn the channel and forge results. MV3
+    // isolated worlds refuse string compilation, so custom_js cannot run anywhere safer.
+    const doc = document;
+    const listen = doc.addEventListener;
+    const unlisten = doc.removeEventListener;
+    const EventProto = Event.prototype;
+    const preventDefault = EventProto.preventDefault;
+    const stopImmediatePropagation = EventProto.stopImmediatePropagation;
+    const composedPath = EventProto.composedPath;
+    const apply = Reflect.apply;
+    const PromiseCtor = Promise;
+    const promiseCatch = Promise.prototype.catch;
+    const startTimer = setTimeout;
+    const stopTimer = clearTimeout;
+
+    const registeredTypes = [];
+    const registeredFns = [];
+    let registeredCount = 0;
+    const thenable = [];
+    let ttlTimer = null;
+    const on = (type, fn) => {
+      apply(listen, doc, [type, fn, true]);
+      registeredTypes[registeredCount] = type;
+      registeredFns[registeredCount] = fn;
+      registeredCount += 1;
+    };
+    const close = () => {
+      for (let i = 0; i < registeredCount; i += 1) apply(unlisten, doc, [registeredTypes[i], registeredFns[i], true]);
+      registeredCount = 0;
+      if (ttlTimer !== null) stopTimer(ttlTimer);
+      ttlTimer = null;
+    };
+    // composedPath()[0] is the dispatch target even inside open shadow roots; a dispatch on
+    // the document itself means "no element".
+    const elementOf = (event) => {
+      const path = apply(composedPath, event, []);
+      const node = path && path.length ? path[0] : event.target;
+      return node && node.nodeType === 1 ? node : null;
+    };
+
+    for (let index = 0; index < count; index += 1) {
+      const fn = compiled[index];
+      thenable[index] = false;
+      on(`${channel}:${index}`, (event) => {
+        apply(stopImmediatePropagation, event, []);
+        thenable[index] = false;
+        let truthy = false;
+        try {
+          const result = apply(fn, undefined, [elementOf(event)]);
+          if (
+            result !== null &&
+            (typeof result === "object" || typeof result === "function") &&
+            typeof result.then === "function"
+          ) {
+            if (result instanceof PromiseCtor) apply(promiseCatch, result, [() => {}]);
+            thenable[index] = true; // custom_js must return synchronously
+          } else {
+            truthy = !!result;
+          }
+        } catch {
+          truthy = false; // runtime exceptions mean "not yet"
+        }
+        if (truthy) apply(preventDefault, event, []);
+      });
+      on(`${channel}:${index}:async`, (event) => {
+        apply(stopImmediatePropagation, event, []);
+        if (thenable[index]) apply(preventDefault, event, []);
+      });
     }
-    return Object.keys(value).some((key) => needsMainWorld(value[key], depth + 1));
+    on(`${channel}:ready`, (event) => {
+      apply(stopImmediatePropagation, event, []);
+      apply(preventDefault, event, []);
+    });
+    on(`${channel}:close`, (event) => {
+      apply(stopImmediatePropagation, event, []);
+      close();
+    });
+    // setTimeout fires at once above 2^31-1 ms.
+    const ttl = typeof ttlMs === "number" && ttlMs >= 0 ? (ttlMs > 2147483647 ? 2147483647 : ttlMs) : 15000;
+    ttlTimer = startTimer(close, ttl);
+    return { ok: true };
   }
 
   function isNoReceiver(error) {
@@ -741,32 +882,137 @@
     }
   }
 
-  // Cached per top-frame documentId read at check time; the cache is written only when
-  // the document is unchanged across the injection. Returns true when it injected.
-  async function ensureMainWorld(tabId) {
-    const before = await scope.topDocumentId(tabId);
-    if (before !== null && scope.state.mainWorldTabs.get(tabId) === before) {
-      return false;
+  // The wait starts after the injection; the extra margin keeps the evaluator alive past
+  // the content wait's final tick (at timeoutMs) despite messaging and injection delays.
+  function mainEvaluatorTtl(timeoutMs) {
+    const wait =
+      typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs >= 0 ? timeoutMs : DEFAULT_WAIT_TIMEOUT_MS;
+    return Math.min(wait + MAIN_EVALUATOR_GRACE_MS + MAIN_EVALUATOR_MARGIN_MS, MAX_TIMER_MS);
+  }
+
+  // { outcome, documentId } from frame 0, or null when it produced no evaluator result.
+  function evaluatorOutcome(results) {
+    const first = Array.isArray(results) ? results.find((r) => r && r.frameId === 0) || results[0] : null;
+    const outcome = first ? first.result : undefined;
+    if (!outcome || typeof outcome !== "object" || typeof outcome.ok !== "boolean") {
+      return null;
     }
+    return { outcome, documentId: typeof first.documentId === "string" ? first.documentId : null };
+  }
+
+  function evaluatorError(outcome) {
+    const message = typeof outcome.message === "string" ? outcome.message : "";
+    if (outcome.code === "csp_blocked") {
+      return codedError("csp_blocked", `page Content Security Policy blocks custom_js evaluation: ${message}`);
+    }
+    return codedError("script_error", `custom_js: ${message}`);
+  }
+
+  // The userScripts world is exempt from the page CSP, but `new Function` inside it is not:
+  // the codes travel as function literals, the other arguments as JSON.
+  function mainEvaluatorUserScript(channel, codes, ttlMs) {
+    const functions = codes.map((code) => `function (el) {\n${code}\n}`).join(",\n");
+    return (
+      `(${mainWorldEvaluator.toString()})(` +
+      `${JSON.stringify(channel)}, ${JSON.stringify(codes)}, ${JSON.stringify(ttlMs)}, [${functions}])`
+    );
+  }
+
+  // undefined: userScripts unavailable (report the CSP block); null: no result.
+  async function injectEvaluatorViaUserScripts(tabId, channel, codes, ttlMs) {
+    const api = chrome.userScripts;
+    if (!api || typeof api.execute !== "function") {
+      return undefined;
+    }
+    let results;
+    try {
+      results = await api.execute({
+        target: { tabId, frameIds: [0] },
+        world: "MAIN",
+        injectImmediately: true,
+        js: [{ code: mainEvaluatorUserScript(channel, codes, ttlMs) }],
+      });
+    } catch (error) {
+      if (scope.isMissingTab(error)) {
+        throw codedError("target_closed", `tab ${tabId} no longer exists`);
+      }
+      return undefined; // userScripts not enabled for this profile
+    }
+    return evaluatorOutcome(results);
+  }
+
+  // One injection: { outcome, documentId } on success, null without a frame-0 result;
+  // compile failures throw.
+  async function installMainEvaluator(tabId, channel, codes, ttlMs) {
     let results;
     try {
       results = await chrome.scripting.executeScript({
         target: { tabId, frameIds: [0] },
         world: "MAIN",
-        files: [MAIN_WORLD_FILE],
+        func: mainWorldEvaluator,
+        args: [channel, codes, ttlMs],
       });
     } catch (error) {
       throw scriptingError(error, tabId);
     }
-    const first = Array.isArray(results) ? results[0] : null;
-    const injected = first && typeof first.documentId === "string" ? first.documentId : before;
-    const after = await scope.topDocumentId(tabId);
-    if (after !== null && injected === after && before === after) {
-      scope.state.mainWorldTabs.set(tabId, after);
-    } else {
-      scope.state.mainWorldTabs.delete(tabId); // document changed mid-injection: verify next time
+    const installed = evaluatorOutcome(results);
+    if (installed === null || installed.outcome.ok) {
+      return installed;
     }
-    return true;
+    if (installed.outcome.code !== "csp_blocked") {
+      throw evaluatorError(installed.outcome);
+    }
+    const fallback = await injectEvaluatorViaUserScripts(tabId, channel, codes, ttlMs);
+    if (fallback === undefined) {
+      throw evaluatorError(installed.outcome);
+    }
+    if (fallback === null) {
+      // A syntax error in one code breaks the whole user script.
+      throw codedError("script_error", "custom_js: the evaluator produced no result (syntax error or the page navigated away)");
+    }
+    if (!fallback.outcome.ok) {
+      throw evaluatorError(fallback.outcome);
+    }
+    return fallback;
+  }
+
+  // Installs this wait's evaluator in frame 0. A compile failure is the wait's error, so
+  // the wait is never forwarded. A navigation during the injection (no frame-0 result, or
+  // a new top document) leaves the page without listeners: inject once more.
+  async function injectMainEvaluator(tabId, channel, codes, ttlMs) {
+    for (let attempt = 0; ; attempt += 1) {
+      const installed = await installMainEvaluator(tabId, channel, codes, ttlMs);
+      if (installed === null) {
+        if (attempt >= 1) {
+          throw codedError("content_unavailable", `the custom_js evaluator did not start in tab ${tabId}`);
+        }
+        continue;
+      }
+      const current = installed.documentId === null ? null : await scope.topDocumentId(tabId);
+      if (current === null || current === installed.documentId || attempt >= 1) {
+        return;
+      }
+    }
+  }
+
+  // waitForSelector params as forwarded: a caller-supplied __mainChannel is never trusted;
+  // with custom_js the worker opens a fresh channel and installs its evaluator first.
+  async function prepareWaitParams(ctx, tabId) {
+    const params = Object.assign({}, ctx.params);
+    delete params.__mainChannel;
+    const codes = customJsCodes(params.conditions);
+    if (!codes || codes.length === 0) {
+      return params;
+    }
+    const channel = crypto.randomUUID();
+    ctx.holdGuard();
+    try {
+      await injectMainEvaluator(tabId, channel, codes, mainEvaluatorTtl(params.timeoutMs));
+    } finally {
+      ctx.rearmGuard();
+    }
+    params.__mainChannel = channel;
+    return params;
   }
 
   async function sendToTopFrame(tabId, message) {
@@ -789,15 +1035,9 @@
     ctx.tabId = tabId;
     ctx.wantZoom = true;
     // After any injection the guard restarts, so content waits end in their own wait_timeout.
-    if (ctx.method === "waitForSelector" && needsMainWorld(ctx.params.conditions)) {
-      ctx.holdGuard();
-      try {
-        await ensureMainWorld(tabId);
-      } finally {
-        ctx.rearmGuard();
-      }
-    }
-    const message = { __emunium__: 2, id: ctx.id, method: ctx.method, params: ctx.params };
+    const isWait = ctx.method === "waitForSelector";
+    const params = isWait ? await prepareWaitParams(ctx, tabId) : ctx.params;
+    let message = { __emunium__: 2, id: ctx.id, method: ctx.method, params };
     let response;
     try {
       response = await sendToTopFrame(tabId, message);
@@ -810,6 +1050,11 @@
         await injectContentScripts(tabId);
       } finally {
         ctx.rearmGuard();
+      }
+      // No receiver usually means a new document, which lacks the evaluator injected
+      // above: a fresh channel and evaluator for the re-send.
+      if (isWait && params.__mainChannel !== undefined) {
+        message = { __emunium__: 2, id: ctx.id, method: ctx.method, params: await prepareWaitParams(ctx, tabId) };
       }
       try {
         response = await sendToTopFrame(tabId, message);
@@ -969,10 +1214,11 @@
 
   Object.assign(scope, {
     CONTENT_FILES,
-    MAIN_WORLD_FILE,
+    customJsCodes,
     handleRequest,
     forwardToContent,
-    needsMainWorld,
+    mainEvaluatorTtl,
+    mainWorldEvaluator,
     runPageScript,
     watchNavigation,
   });

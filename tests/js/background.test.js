@@ -622,71 +622,235 @@ test("content-routed: content_unavailable without a ~10 s retry loop", async (t)
   assert.equal(w.chrome.scripting.executeScript.calls.length, 1);
 });
 
-test("waitForSelector with nested custom_js injects content_main.js in MAIN world first, once per document", async (t) => {
+// Runs the MAIN-world evaluator like Chrome: serialized func, page realm with a document.
+function mainWorldExecutor(t, { documentId = () => "doc-1-0" } = {}) {
+  const doc = h.createDocument();
+  const page = h.loadScripts([], h.createWindow(doc));
+  t.after(() => page.__harness.dispose());
+  const executor = h.spy(async (injection) => {
+    if (injection.files) {
+      return [{ frameId: 0, documentId: documentId(), result: undefined }];
+    }
+    const fn = page.__harness.evaluate("(" + injection.func.toString() + ")");
+    return [{ frameId: 0, documentId: documentId(), result: fn(...injection.args) }];
+  });
+  return { doc, executor };
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const listeners = (target, type) => (target.__listeners.get(type) || []).length;
+
+test("waitForSelector with nested custom_js: a fresh channel per wait, evaluator injected with the codes in tree order, then forwarded", async (t) => {
   const w = makeWorker(t);
   const ws = await welcomed();
   const order = [];
-  let currentDoc = "doc-1-0";
-  w.chrome.webNavigation.getFrame = h.makeApi(w.chrome, async () => ({ frameId: 0, documentId: currentDoc }));
+  const { doc, executor } = mainWorldExecutor(t);
   w.chrome.scripting.executeScript = h.spy(async (injection) => {
-    order.push("inject:" + injection.files.join(","));
-    return [{ frameId: 0, documentId: currentDoc, result: undefined }];
+    order.push("inject");
+    return executor(injection);
   });
+  const sent = [];
   w.chrome.tabs.sendMessage = h.spy(async (tabId, message) => {
     order.push("send:" + message.method);
+    sent.push(plain(message.params));
     return { ok: true, result: { element: null, matched: true, count: 1 } };
   });
   const params = {
     selector: "#a",
-    type: "css",
     timeoutMs: 1000,
-    conditions: [{ type: "all", conditions: [{ type: "visible" }, { type: "custom_js", code: "return true" }] }],
+    __mainChannel: "forged-by-caller",
+    conditions: [
+      { type: "custom_js", code: "return 1" },
+      { type: "any_of", conditions: [[{ type: "visible" }, { type: "custom_js", code: "return 2" }], [{ type: "not", condition: [{ type: "custom_js", code: "return 3" }] }]] },
+    ],
   };
   const first = await request(ws, "waitForSelector", params);
   assert.equal(first.ok, true);
-  assert.deepEqual(plain(w.chrome.scripting.executeScript.calls[0][0]), {
-    target: { tabId: 1, frameIds: [0] },
-    world: "MAIN",
-    files: ["content_main.js"],
-  });
+  const injection = w.chrome.scripting.executeScript.calls[0][0];
+  assert.deepEqual(plain(injection.target), { tabId: 1, frameIds: [0] });
+  assert.equal(injection.world, "MAIN");
+  assert.equal(injection.files, undefined, "no file injection path");
+  assert.equal(injection.func, w.bg.mainWorldEvaluator);
+  const [channel, codes, ttlMs] = injection.args;
+  assert.match(channel, UUID);
+  assert.deepEqual(plain(codes), ["return 1", "return 2", "return 3"]);
+  assert.equal(ttlMs, 8000, "timeoutMs + 5 s + 2 s margin");
+  assert.equal(sent[0].__mainChannel, channel, "the forwarded wait carries the worker's channel");
+  for (const type of [`${channel}:0`, `${channel}:2:async`, `${channel}:ready`, `${channel}:close`]) {
+    assert.equal(listeners(doc, type), 1, type);
+  }
+
   await request(ws, "waitForSelector", params);
-  await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "visible" }] });
-  await request(ws, "querySelector", { selector: "#a", conditions: [{ type: "custom_js" }] });
-  assert.deepEqual(order, [
-    "inject:content_main.js",
-    "send:waitForSelector",
-    "send:waitForSelector",
-    "send:waitForSelector",
-    "send:querySelector",
-  ]);
-  currentDoc = "doc-1-1";
-  w.chrome.webNavigation.onCommitted.emit({ tabId: 1, frameId: 0, url: "https://other.test/", documentId: "doc-1-1" });
-  await request(ws, "waitForSelector", params);
-  assert.equal(order.filter((o) => o === "inject:content_main.js").length, 2, "a new document needs it again");
+  const second = w.chrome.scripting.executeScript.calls[1][0].args[0];
+  assert.match(second, UUID);
+  assert.notEqual(second, channel, "every wait has its own channel");
+  assert.equal(sent[1].__mainChannel, second);
+
+  await request(ws, "waitForSelector", { selector: "#a", __mainChannel: "forged", conditions: [{ type: "visible" }] });
+  assert.equal("__mainChannel" in sent[2], false, "no custom_js: nothing injected, caller channel stripped");
+  await request(ws, "querySelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] });
+  assert.deepEqual(order, ["inject", "send:waitForSelector", "inject", "send:waitForSelector", "send:waitForSelector", "send:querySelector"]);
 });
 
-test("custom_js: a commit while content_main.js injection is pending forces re-injection", async (t) => {
+test("custom_js: compile-time csp_blocked / script_error are the reply; the wait is never forwarded", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  w.chrome.tabs.sendMessage = h.spy(async () => ({ ok: true, result: null }));
+  w.chrome.scripting.executeScript = pageExecutor(w.chrome, { csp: true });
+  w.chrome.userScripts = undefined; // no fallback available
+  const blocked = await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] });
+  assert.equal(blocked.error.code, "csp_blocked");
+  assert.match(blocked.error.message, /Content Security Policy blocks custom_js/);
+
+  w.chrome.scripting.executeScript = pageExecutor(w.chrome);
+  const broken = await request(ws, "waitForSelector", {
+    selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }, { type: "custom_js", code: "return (" }],
+  });
+  assert.equal(broken.error.code, "script_error");
+  assert.match(broken.error.message, /^custom_js: /);
+  assert.equal(w.chrome.tabs.sendMessage.calls.length, 0);
+
+  w.chrome.scripting.executeScript = h.spy(async () => [{ frameId: 0, documentId: "doc-1-0", result: undefined }]);
+  const silent = await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] });
+  assert.equal(silent.error.code, "content_unavailable", "no evaluator result: not forwarded");
+  assert.equal(w.chrome.scripting.executeScript.calls.length, 2, "retried once before giving up");
+  assert.equal(w.chrome.tabs.sendMessage.calls.length, 0);
+});
+
+test("custom_js: no frame-0 result (navigation during injection) is retried once on the new document", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  const { doc, executor } = mainWorldExecutor(t);
+  let first = true;
+  w.chrome.scripting.executeScript = h.spy(async (injection) => {
+    if (first) {
+      first = false;
+      return [];
+    }
+    return executor(injection);
+  });
+  const sent = [];
+  w.chrome.tabs.sendMessage = h.spy(async (tabId, message) => {
+    sent.push(plain(message.params));
+    return { ok: true, result: null };
+  });
+  const reply = await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] });
+  assert.equal(reply.ok, true, JSON.stringify(reply));
+  assert.equal(w.chrome.scripting.executeScript.calls.length, 2);
+  assert.equal(listeners(doc, `${sent[0].__mainChannel}:ready`), 1, "the forwarded channel is live");
+});
+
+test("custom_js under CSP: userScripts.execute fallback ships the codes as source with JSON args", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  w.chrome.scripting.executeScript = pageExecutor(w.chrome, { csp: true });
+  const doc = h.createDocument();
+  const page = h.loadScripts([], h.createWindow(doc));
+  t.after(() => page.__harness.dispose());
+  // The user script must work where string compilation is forbidden.
+  page.__harness.evaluate("Function = function () { throw new EvalError('Code generation from strings disallowed'); };");
+  w.chrome.userScripts.execute = h.makeApi(w.chrome, async (injection) => {
+    let result;
+    try {
+      result = page.__harness.evaluate(injection.js[0].code);
+    } catch {
+      result = undefined; // Chrome: a script that does not parse yields no result
+    }
+    return [{ frameId: 0, documentId: "doc-1-0", result }];
+  });
+  const sent = [];
+  w.chrome.tabs.sendMessage = h.spy(async (tabId, message) => {
+    sent.push(plain(message.params));
+    return { ok: true, result: null };
+  });
+  const codes = ["return el && el.id === 'go';", "return \"quote\\\" and </script>\";"];
+  const reply = await request(ws, "waitForSelector", {
+    selector: "#a", timeoutMs: 100, conditions: codes.map((code) => ({ type: "custom_js", code })),
+  });
+  assert.equal(reply.ok, true, JSON.stringify(reply));
+  const injection = plain(w.chrome.userScripts.execute.calls[0][0]);
+  assert.equal(injection.world, "MAIN");
+  assert.deepEqual(injection.target, { tabId: 1, frameIds: [0] });
+  const channel = sent[0].__mainChannel;
+  assert.match(channel, UUID);
+  assert.ok(injection.js[0].code.includes(JSON.stringify(channel)));
+  assert.ok(injection.js[0].code.includes(JSON.stringify(codes)), "codes serialized as JSON");
+  assert.ok(injection.js[0].code.includes(", 7100, ["), "ttl serialized");
+  // The installed evaluator answers through the channel with the shipped functions.
+  const button = h.el(doc, "button", { id: "go" });
+  doc.body.append(button);
+  const answer = new page.Event(`${channel}:0`, { bubbles: true, cancelable: true, composed: true });
+  assert.equal(button.dispatchEvent(answer), false, "code 0 is true for #go");
+  assert.equal(listeners(doc, `${channel}:1`), 1);
+
+  const broken = await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return (" }] });
+  assert.equal(broken.error.code, "script_error", "a syntax error breaks the user script: no result");
+
+  w.chrome.userScripts.execute = h.spy(async () => {
+    throw new Error("userScripts is not enabled");
+  });
+  const disabled = await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] });
+  assert.equal(disabled.error.code, "csp_blocked");
+  assert.equal(sent.length, 1, "failed injections never forward the wait");
+});
+
+test("custom_js: no receiver -> content scripts injected, then a fresh channel and evaluator for the re-send", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  const { doc, executor } = mainWorldExecutor(t);
+  w.chrome.scripting.executeScript = executor;
+  const sent = [];
+  w.chrome.tabs.sendMessage = h.spy(async (tabId, message) => {
+    sent.push(plain(message.params));
+    if (sent.length === 1) throw new Error(NO_RECEIVER);
+    return { ok: true, result: null };
+  });
+  const reply = await request(ws, "waitForSelector", { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] });
+  assert.equal(reply.ok, true, JSON.stringify(reply));
+  const kinds = executor.calls.map((c) => (c[0].files ? "files" : "evaluator"));
+  assert.deepEqual(kinds, ["evaluator", "files", "evaluator"]);
+  assert.notEqual(sent[1].__mainChannel, sent[0].__mainChannel);
+  assert.equal(executor.calls[2][0].args[0], sent[1].__mainChannel);
+  assert.equal(listeners(doc, `${sent[1].__mainChannel}:ready`), 1);
+});
+
+test("custom_js: ttl is timeoutMs + 5 s + 2 s margin, 17 s by default and clamped to 2^31-1", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  const { executor } = mainWorldExecutor(t);
+  w.chrome.scripting.executeScript = executor;
+  w.chrome.tabs.sendMessage = h.spy(async () => ({ ok: true, result: null }));
+  const conditions = [{ type: "custom_js", code: "return 1" }];
+  await request(ws, "waitForSelector", { selector: "#a", conditions });
+  await request(ws, "waitForSelector", { selector: "#a", conditions, timeoutMs: 3e9 });
+  await request(ws, "waitForSelector", { selector: "#a", conditions, timeoutMs: 0 });
+  assert.deepEqual(executor.calls.map((c) => c[0].args[2]), [17000, 2147483647, 7000]);
+  assert.equal(w.bg.mainEvaluatorTtl(1000), 8000);
+});
+
+test("custom_js: a commit during the evaluator injection injects once more into the new document", async (t) => {
   const w = makeWorker(t);
   const ws = await welcomed();
   let currentDoc = "doc-A";
-  let commitDuringInjection = true;
+  let injectedInto = null;
   w.chrome.webNavigation.getFrame = h.makeApi(w.chrome, async () => ({ frameId: 0, documentId: currentDoc }));
-  w.chrome.scripting.executeScript = h.spy(async () => {
-    const injectedInto = currentDoc;
-    if (commitDuringInjection) {
-      commitDuringInjection = false;
+  const { executor } = mainWorldExecutor(t, { documentId: () => injectedInto });
+  w.chrome.scripting.executeScript = h.spy(async (injection) => {
+    injectedInto = currentDoc;
+    if (currentDoc === "doc-A") {
       currentDoc = "doc-B";
       w.chrome.webNavigation.onCommitted.emit({ tabId: 1, frameId: 0, url: "https://b.test/", documentId: "doc-B" });
     }
-    return [{ frameId: 0, documentId: injectedInto, result: undefined }];
+    return executor(injection);
   });
   w.chrome.tabs.sendMessage = h.spy(async () => ({ ok: true, result: null }));
   const params = { selector: "#a", conditions: [{ type: "custom_js", code: "return 1" }] };
   await request(ws, "waitForSelector", params);
+  const calls = w.chrome.scripting.executeScript.calls;
+  assert.equal(calls.length, 2, "doc-B got its evaluator");
+  assert.equal(calls[1][0].args[0], calls[0][0].args[0], "same channel for the same wait");
   await request(ws, "waitForSelector", params);
-  assert.equal(w.chrome.scripting.executeScript.calls.length, 2, "doc-B never got content_main.js");
-  await request(ws, "waitForSelector", params);
-  assert.equal(w.chrome.scripting.executeScript.calls.length, 2, "doc-B is cached once verified");
+  assert.equal(calls.length, 3, "an unchanged document is injected once per wait");
 });
 
 test("content-routed: the guard restarts after injection, so a slow injection still ends in wait_timeout", async (t) => {
