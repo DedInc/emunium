@@ -16,7 +16,9 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+import types
+import weakref
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import pytest
@@ -25,6 +27,8 @@ from emunium import _native, _screen
 from emunium._element_interactor import ElementInteractor
 from emunium._native import FAILSAFE_ENV, x11
 from emunium._native.x11 import (
+    REMAP_QUIET,
+    REMAP_REUSE_AGE,
     REMAP_SETTLE,
     KeyboardMapping,
     X11Backend,
@@ -122,6 +126,22 @@ class FakeLibrary:
 DISPLAY = 0xD15
 
 
+class FakeTimer:
+    """A ``threading.Timer`` stand-in the test fires by hand."""
+
+    def __init__(self, delay: float, callback: Callable[[], None]) -> None:
+        self.delay = delay
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self.callback()
+
+
 class FakeX:
     """X server state behind the fake libraries; ``events`` records input."""
 
@@ -172,12 +192,24 @@ class FakeX:
         self.xtest = True
         self.freed = 0
         self.fail_key: int | None = None
+        self.steal: dict[int, list[int]] = {}
         self.x11 = FakeLibrary(self, self.X11_NAMES)
         self.xtst = FakeLibrary(self, self.XTST_NAMES)
         self._tables: list[Any] = []
+        # Monotonic clock and timers of the backend's remap pool.
+        self.now = 0.0
+        self.timers: list[FakeTimer] = []
 
     def xlib(self) -> Xlib:
         return Xlib(x11=self.x11, xtst=self.xtst)
+
+    def clock(self) -> float:
+        return self.now
+
+    def start_timer(self, delay: float, callback: Callable[[], None]) -> FakeTimer:
+        timer = FakeTimer(delay, callback)
+        self.timers.append(timer)
+        return timer
 
     def input_events(self) -> list[Event]:
         return [e for e in self.events if e[0] in ("motion", "button", "key", "map")]
@@ -245,8 +277,9 @@ class FakeX:
         values = [int(keysyms[index]) for index in range(per * count)]
         for offset in range(count):
             row = values[offset * per : (offset + 1) * per]
-            self.rows[first + offset] = row
             self.events.append(("map", first + offset, row))
+            # Another client rewrites the row right after this request.
+            self.rows[first + offset] = self.steal.pop(first + offset, row)
         return 0
 
     def XFree(self, data: Any) -> int:
@@ -303,7 +336,15 @@ def make(
 ) -> tuple[X11Backend, FakeX, list[float]]:
     server = FakeX(pointer=pointer, **kwargs)
     sleeps: list[float] = []
-    return X11Backend(server.xlib(), sleep=sleeps.append), server, sleeps
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        server.now += seconds
+
+    backend = X11Backend(
+        server.xlib(), sleep=sleep, clock=server.clock, timer=server.start_timer
+    )
+    return backend, server, sleeps
 
 
 def tap(code: int) -> list[Event]:
@@ -571,42 +612,142 @@ def test_write_ascii_through_the_layout() -> None:
     assert sleeps == []
 
 
-def test_write_unicode_on_a_spare_keycode_then_restores_it() -> None:
+ZHE, SMALL_ZHE, YO, WAVE = 0x01000416, 0x01000436, 0x01000401, 0x0101F44B
+
+
+def remap_events(server: FakeX) -> list[Event]:
+    return [e for e in server.events if e[0] in ("map", "key")]
+
+
+def test_write_unicode_on_spare_keycodes_restored_after_the_quiet_period() -> None:
     backend, server, sleeps = make()
     backend.write("ЖaЖ👋")
-    zhe, wave = 0x01000416, 0x0101F44B
     assert [e for e in server.events if e[0] != "flush"] == [
-        ("map", 139, [zhe, zhe]),
+        ("map", 139, [ZHE, ZHE]),
         ("sync",),
         *tap(139),
         *tap(38),
         *tap(139),
-        ("map", 138, [wave, wave]),
+        ("map", 138, [WAVE, WAVE]),
         ("sync",),
         *tap(138),
-        # The client gets REMAP_SETTLE to read the mapping, then it goes back.
-        ("sync",),
-        ("map", 139, [0, 0]),
-        ("map", 138, [0, 0]),
-        ("sync",),
     ]
-    assert sleeps == [REMAP_SETTLE]
+    # REMAP_SETTLE before the first key event of each newly mapped keycode.
+    assert sleeps == [REMAP_SETTLE, REMAP_SETTLE]
+    assert server.rows[139] == [ZHE, ZHE] and server.rows[138] == [WAVE, WAVE]
+    [timer] = server.timers
+    assert timer.delay == REMAP_QUIET
+    server.events.clear()
+    timer.fire()
+    assert server.events == [("map", 139, [0, 0]), ("map", 138, [0, 0]), ("sync",)]
     assert server.rows[138] == server.rows[139] == [0, 0]
 
 
-def test_spare_keycodes_are_recycled_after_a_settle() -> None:
+def test_consecutive_characters_take_distinct_keycodes() -> None:
+    backend, server, _ = make()
+    for character in "ЖжЁ":
+        backend.write(character)
+    assert remap_events(server) == [
+        ("map", 139, [ZHE, ZHE]),
+        *tap(139),
+        ("map", 138, [SMALL_ZHE, SMALL_ZHE]),
+        *tap(138),
+        ("map", 137, [YO, YO]),
+        *tap(137),
+    ]
+
+
+def test_a_mapped_character_reuses_its_keycode_without_remapping() -> None:
+    backend, server, sleeps = make()
+    backend.write("Ж")
+    backend.write("Жa")
+    assert remap_events(server) == [
+        ("map", 139, [ZHE, ZHE]),
+        *tap(139),
+        *tap(139),
+        *tap(38),
+    ]
+    assert sleeps == [REMAP_SETTLE]
+
+
+def test_each_remapped_write_restarts_the_quiet_period() -> None:
+    backend, server, _ = make()
+    backend.write("Ж")
+    backend.write("a")
+    assert len(server.timers) == 1
+    backend.write("Ж")
+    first, second = server.timers
+    assert first.cancelled and not second.cancelled
+    # A stale expiry that raced the reschedule restores nothing.
+    first.callback()
+    assert server.rows[139] == [ZHE, ZHE]
+    second.fire()
+    assert server.rows[139] == [0, 0]
+
+
+@pytest.mark.parametrize("release", [X11Backend.close, X11Backend.release_remaps])
+def test_close_and_release_remaps_restore_at_once(
+    release: Callable[[X11Backend], None],
+) -> None:
+    backend, server, _ = make()
+    backend.write("Ж👋")
+    server.events.clear()
+    release(backend)
+    assert server.events == [("map", 139, [0, 0]), ("map", 138, [0, 0]), ("sync",)]
+    assert server.timers[-1].cancelled
+    # Released keycodes are spare again: the next character maps the highest.
+    backend.write("ж")
+    assert ("map", 139, [SMALL_ZHE, SMALL_ZHE]) in server.events
+
+
+def test_a_full_pool_recycles_the_least_recently_used_keycode() -> None:
+    backend, server, sleeps = make(spares=(139, 138))
+    backend.write("Ж")
+    backend.write("ж")
+    server.now += 1.0
+    backend.write("Ж")  # 138 is now the least recently used
+    sleeps.clear()
+    backend.write("Ё")
+    assert remap_events(server)[-3:] == [("map", 138, [YO, YO]), *tap(138)]
+    assert server.rows[139] == [ZHE, ZHE]
+    assert sleeps == [REMAP_SETTLE]
+
+
+def test_the_pool_holds_at_most_remap_pool_size_keycodes() -> None:
+    spares = tuple(range(114, 133))  # 19 spare keycodes
+    backend, server, _ = make(spares=spares)
+    letters = "абвгдежзийклмнопр"
+    assert len(letters) == x11.REMAP_POOL_SIZE + 1
+    for letter in letters:
+        server.now += 1.0
+        backend.write(letter)
+    mapped = [e[1] for e in server.events if e[0] == "map"]
+    # 16 keycodes, highest first; the 17th letter recycles the oldest one.
+    assert mapped == [*range(132, 116, -1), 132]
+    assert server.rows[132] == [char_keysym("р")] * 2
+
+
+def test_a_recently_used_keycode_is_recycled_only_once_old_enough() -> None:
     backend, server, sleeps = make(spares=(139,))
     backend.write("Жж")
-    zhe, small_zhe = 0x01000416, 0x01000436
-    assert [e for e in server.events if e[0] in ("map", "key")] == [
-        ("map", 139, [zhe, zhe]),
+    assert remap_events(server) == [
+        ("map", 139, [ZHE, ZHE]),
         *tap(139),
-        ("map", 139, [0, 0]),
-        ("map", 139, [small_zhe, small_zhe]),
+        ("map", 139, [SMALL_ZHE, SMALL_ZHE]),
         *tap(139),
-        ("map", 139, [0, 0]),
     ]
-    assert sleeps == [REMAP_SETTLE, REMAP_SETTLE]
+    # Ж was tapped REMAP_SETTLE ago: the remap waits for the rest of the age.
+    assert sleeps == pytest.approx(
+        [REMAP_SETTLE, REMAP_REUSE_AGE - REMAP_SETTLE, REMAP_SETTLE]
+    )
+
+
+def test_pooled_keycodes_are_not_keys_to_hold() -> None:
+    backend, server, _ = make()
+    backend.write("Ж")
+    with pytest.raises(NativeInputError, match="no key carries"):
+        backend.keyDown("Ж")
+    assert remap_events(server) == [("map", 139, [ZHE, ZHE]), *tap(139)]
 
 
 def test_no_spare_keycode_raises_before_any_input() -> None:
@@ -621,8 +762,219 @@ def test_mapping_is_restored_when_a_key_event_fails() -> None:
     server.fail_key = 139
     with pytest.raises(OSError):
         backend.write("Ж")
+    assert server.rows[139] == [ZHE, ZHE]
+    server.timers[-1].fire()
     assert server.rows[139] == [0, 0]
     assert server.events[-2:] == [("map", 139, [0, 0]), ("sync",)]
+
+
+def test_exit_hook_is_registered_once_and_restores_every_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered: list[Callable[[], None]] = []
+    monkeypatch.setattr(x11, "_EXIT_HOOK_REGISTERED", False)
+    monkeypatch.setattr(x11, "_EXIT_POOLS", weakref.WeakSet())
+    monkeypatch.setattr(x11.atexit, "register", registered.append)
+    first, first_server, _ = make()
+    second, second_server, _ = make()
+    first.write("a")
+    assert registered == []
+    first.write("Ж")
+    second.write("Ж")
+    first.write("ж")
+    assert registered == [x11.release_all_remaps]
+    x11.release_all_remaps()
+    assert first_server.rows[139] == first_server.rows[138] == [0, 0]
+    assert second_server.rows[139] == [0, 0]
+
+
+def test_exit_hook_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(x11, "_EXIT_HOOK_REGISTERED", True)
+    monkeypatch.setattr(x11, "_EXIT_POOLS", weakref.WeakSet())
+    server = FakeX()
+    xlib = server.xlib()
+    backend = X11Backend(
+        xlib, sleep=lambda s: None, clock=server.clock, timer=server.start_timer
+    )
+    backend.write("Ж")
+
+    def broken(keycode: int, keysyms: Sequence[int]) -> None:
+        raise OSError("the display went away")
+
+    monkeypatch.setattr(xlib, "change_mapping", broken)
+    x11.release_all_remaps()
+    assert server.rows[139] == [ZHE, ZHE]
+
+
+def test_exit_hook_gives_up_on_a_busy_display(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(x11, "_EXIT_HOOK_REGISTERED", True)
+    monkeypatch.setattr(x11, "_EXIT_POOLS", weakref.WeakSet())
+    monkeypatch.setattr(x11, "_EXIT_LOCK_TIMEOUT", 0.05)
+    server = FakeX()
+    xlib = server.xlib()
+    backend = X11Backend(
+        xlib, sleep=lambda s: None, clock=server.clock, timer=server.start_timer
+    )
+    backend.write("Ж")
+    held, done = threading.Event(), threading.Event()
+
+    def hold_the_display() -> None:
+        with xlib.lock:
+            held.set()
+            done.wait(5.0)
+
+    holder = threading.Thread(target=hold_the_display)
+    holder.start()
+    try:
+        assert held.wait(5.0)
+        with caplog.at_level("WARNING", logger=x11.__name__):
+            x11.release_all_remaps()
+    finally:
+        done.set()
+        holder.join()
+    assert "display stayed busy" in caplog.text
+    assert server.rows[139] == [ZHE, ZHE]
+
+
+FOREIGN = 0x1008FF01
+
+
+def test_a_pooled_keycode_changed_by_someone_else_is_left_to_them() -> None:
+    backend, server, _ = make()
+    backend.write("Ж")
+    server.rows[139] = [FOREIGN, 0]  # xmodmap / setxkbmap / another client
+    backend.write("Ж")
+    assert remap_events(server) == [
+        ("map", 139, [ZHE, ZHE]),
+        *tap(139),
+        ("map", 138, [ZHE, ZHE]),
+        *tap(138),
+    ]
+    backend.release_remaps()
+    assert server.rows[139] == [FOREIGN, 0]
+    assert server.rows[138] == [0, 0]
+
+
+def test_release_restores_only_rows_still_holding_the_pooled_keysym() -> None:
+    backend, server, _ = make()
+    backend.write("Ж👋")
+    server.rows[139] = [FOREIGN, 0]
+    server.events.clear()
+    server.timers[-1].fire()
+    assert server.events == [("map", 138, [0, 0]), ("sync",)]
+    assert server.rows[139] == [FOREIGN, 0]
+
+
+def test_a_keycode_taken_during_the_remap_moves_on_to_the_next_spare() -> None:
+    backend, server, _ = make()
+    server.steal = {139: [FOREIGN, FOREIGN]}
+    backend.write("Ж")
+    assert remap_events(server) == [
+        ("map", 139, [ZHE, ZHE]),
+        ("map", 138, [ZHE, ZHE]),
+        *tap(138),
+    ]
+    backend.release_remaps()
+    assert server.rows[139] == [FOREIGN, FOREIGN]
+    assert server.rows[138] == [0, 0]
+
+
+def test_failsafe_is_checked_before_every_remapped_character() -> None:
+    server = FakeX()
+
+    def park_in_corner(seconds: float) -> None:
+        server.pointer = CORNER
+
+    backend = X11Backend(
+        server.xlib(),
+        sleep=park_in_corner,
+        clock=server.clock,
+        timer=server.start_timer,
+    )
+    with pytest.raises(NativeInputError, match="fail-safe"):
+        backend.write("ЖжЁ")
+    # Ж went out before the cursor reached the corner; nothing after it.
+    assert remap_events(server) == [("map", 139, [ZHE, ZHE]), *tap(139)]
+    assert not server.timers[-1].cancelled
+
+
+def test_a_due_restore_does_nothing_while_a_write_runs() -> None:
+    server = FakeX(spares=(139,))
+    waits: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        server.now += seconds
+        if seconds > REMAP_SETTLE:  # a wait for 139 to age
+            waits.append(seconds)
+            # The restore armed by the previous write comes due right now.
+            server.timers[0].callback()
+
+    backend = X11Backend(
+        server.xlib(), sleep=sleep, clock=server.clock, timer=server.start_timer
+    )
+    backend.write("Ё")
+    backend.write("Жж")
+    assert len(waits) == 2
+    assert remap_events(server) == [
+        ("map", 139, [YO, YO]),
+        *tap(139),
+        ("map", 139, [ZHE, ZHE]),
+        *tap(139),
+        ("map", 139, [SMALL_ZHE, SMALL_ZHE]),
+        *tap(139),
+    ]
+    server.timers[-1].fire()
+    assert server.events[-2:] == [("map", 139, [0, 0]), ("sync",)]
+
+
+def test_the_reuse_wait_reads_the_mapping_again() -> None:
+    server = FakeX(spares=(139,))
+
+    def sleep(seconds: float) -> None:
+        server.now += seconds
+        if seconds > REMAP_SETTLE:  # xmodmap ran meanwhile
+            server.rows[139] = [FOREIGN, 0]
+
+    backend = X11Backend(
+        server.xlib(), sleep=sleep, clock=server.clock, timer=server.start_timer
+    )
+    # ж needs Ж's keycode, the only spare; meanwhile the row was taken.
+    with pytest.raises(NativeInputError, match="no spare keycode"):
+        backend.write("Жж")
+    assert remap_events(server) == [("map", 139, [ZHE, ZHE]), *tap(139)]
+    assert server.rows[139] == [FOREIGN, 0]
+
+
+def test_release_remaps_from_another_thread_waits_for_the_write() -> None:
+    server = FakeX()
+    releasers: list[threading.Thread] = []
+
+    def sleep(seconds: float) -> None:
+        server.now += seconds
+        if not releasers:  # Ж's settle: the write is half done
+            releaser = threading.Thread(target=backend.release_remaps)
+            releasers.append(releaser)
+            releaser.start()
+            releaser.join(0.2)
+            assert releaser.is_alive(), "release_remaps did not wait"
+
+    backend = X11Backend(
+        server.xlib(), sleep=sleep, clock=server.clock, timer=server.start_timer
+    )
+    backend.write("Жж")
+    [releaser] = releasers
+    releaser.join(5.0)
+    assert not releaser.is_alive()
+    assert remap_events(server) == [
+        ("map", 139, [ZHE, ZHE]),
+        *tap(139),
+        ("map", 138, [SMALL_ZHE, SMALL_ZHE]),
+        *tap(138),
+        ("map", 139, [0, 0]),
+        ("map", 138, [0, 0]),
+    ]
 
 
 def test_write_rejects_bad_input_before_sending() -> None:
@@ -708,6 +1060,50 @@ def test_interactor_hotkey_and_release_in_a_corner() -> None:
     assert server.input_events() == [("button", 1, True), ("button", 1, False)]
 
 
+class NoClipboard(types.ModuleType):
+    """A ``pyperclip`` stand-in that records any use of the clipboard."""
+
+    def __init__(self) -> None:
+        super().__init__("pyperclip")
+        self.calls: list[str] = []
+
+    def copy(self, text: str) -> None:
+        self.calls.append(f"copy {text!r}")
+        raise AssertionError("the clipboard was used")
+
+    def paste(self) -> str:
+        self.calls.append("paste")
+        raise AssertionError("the clipboard was used")
+
+
+def test_backend_declares_native_unicode_write() -> None:
+    backend, _, _ = make()
+    assert X11Backend.supports_unicode_write is True
+    assert ElementInteractor._writes_unicode(backend)
+
+
+def test_interactor_types_unicode_through_write_without_the_clipboard() -> None:
+    backend, server, _ = make()
+    clipboard = NoClipboard()
+    interactor = ElementInteractor(
+        backend=backend,
+        platform="linux",
+        clipboard=clipboard,
+        keyboard=None,
+        sleep=lambda s: None,
+    )
+    interactor.type_text("aЖ👋", human=False)
+    # One write per character; each new character gets its own keycode.
+    assert remap_events(server) == [
+        *tap(38),
+        ("map", 139, [ZHE, ZHE]),
+        *tap(139),
+        ("map", 138, [WAVE, WAVE]),
+        *tap(138),
+    ]
+    assert clipboard.calls == []
+
+
 # -- selection ---------------------------------------------------------------------
 
 
@@ -778,9 +1174,16 @@ def test_real_pointer_round_trip(real_backend: X11Backend) -> None:
 @real_x11
 def test_real_write_restores_the_keyboard_mapping(real_backend: X11Backend) -> None:
     xlib = x11.shared_xlib()
+    # The pool is the connection's: start from no keycode remapped.
+    real_backend.release_remaps()
     before = xlib.keyboard_mapping().rows
     assert xlib.keyboard_mapping().spare_keycodes(), "no spare keycode on this server"
     real_backend.write("Ж")
+    # Ж stays mapped through the quiet period, then every row comes back.
+    assert xlib.keyboard_mapping().find(char_keysym("Ж")) is not None
+    deadline = time.monotonic() + REMAP_QUIET + 5.0
+    while xlib.keyboard_mapping().rows != before and time.monotonic() < deadline:
+        time.sleep(0.1)
     assert xlib.keyboard_mapping().rows == before
 
 

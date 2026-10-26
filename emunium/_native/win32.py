@@ -844,6 +844,9 @@ class Win32Backend:
     the real user32 is used, none (an unknown layout) with an injected one.
     """
 
+    # write sends KEYEVENTF_UNICODE keystrokes, independent of the layout.
+    supports_unicode_write: bool = True
+
     def __init__(
         self, user32: User32Api | None = None, monitors: MonitorApi | None = None
     ) -> None:

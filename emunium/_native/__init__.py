@@ -2,7 +2,7 @@
 
 Contract: ``docs/architecture/native-input.md`` section 5a. A backend exposes the
 pyautogui-compatible subset ``emunium._element_interactor`` uses, so pyautogui
-itself (macOS) satisfies the same protocol. ``emunium._screen.input_backend``
+itself (macOS) stands in for a backend; it lacks only ``supports_unicode_write``. ``emunium._screen.input_backend``
 picks the process-wide backend; this package only knows which native backend
 fits a platform.
 """
@@ -35,7 +35,14 @@ class InputBackend(Protocol):
 
     Coordinates are INPUT units (physical px on Windows/Linux). ``_pause`` is
     accepted for pyautogui compatibility; native backends never pause.
+
+    ``supports_unicode_write`` is True when ``write`` types any character
+    whatever the keyboard layout, so the interactor needs no clipboard paste for
+    non-ASCII text. pyautogui lacks it; the interactor reads it with
+    ``getattr`` and treats anything but ``True`` as ASCII-only.
     """
+
+    supports_unicode_write: bool
 
     @property
     def platformModule(self) -> PlatformLayer: ...

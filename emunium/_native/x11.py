@@ -11,7 +11,19 @@ level is pressed plainly, one on its second level with Shift. Any other
 keysym, which covers every character the layout lacks (Cyrillic on a US map,
 CJK, emoji as ``0x01000000 + codepoint``), is typed on a spare keycode, one
 with no symbols at all, temporarily mapped to it with
-``XChangeKeyboardMapping`` and restored afterwards.
+``XChangeKeyboardMapping`` (``RemapPool``). X clients read a changed mapping
+lazily, when they handle the ``MappingNotify``, so a mapped keycode keeps its
+symbol while a client may still be reading it: consecutive characters take
+different keycodes (least recently used first), a character already mapped
+reuses its keycode, and every keycode gets its empty row back only after
+``REMAP_QUIET`` without remapped input, on ``X11Backend.release_remaps`` or at
+interpreter exit. A pooled keycode whose row someone else changed (setxkbmap,
+xmodmap, another client) is neither typed on nor restored.
+
+Run one emunium process per display: pools of different processes do not
+see each other. A mapping is read back after every change, so a keycode
+another process took meanwhile is left to it, but a pooled keycode it remaps
+between two of our reads can still carry its keysym for one key event.
 
 One display connection serves the process (``shared_xlib``); ``XInitThreads``
 runs before any other Xlib call and every multi-step sequence holds the
@@ -20,12 +32,15 @@ connection's lock. Works under XWayland too; pure Wayland has no X display.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
+import logging
 import os
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Mapping, Sequence
+import weakref
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import Any, NamedTuple, Protocol
 
 from emunium._native import check_failsafe
@@ -53,10 +68,18 @@ _BUTTONS = {"left": BUTTON_LEFT, "middle": BUTTON_MIDDLE, "right": BUTTON_RIGHT}
 UNICODE_KEYSYM_OFFSET = 0x01000000
 SHIFT_KEYSYM_NAME = "Shift_L"
 
-# Time the receiving client gets to read a temporary mapping before it is
-# restored: X clients fetch the new mapping only when they handle the
-# MappingNotify, which may come after the key events have been sent.
-REMAP_SETTLE = 0.05
+logger = logging.getLogger(__name__)
+
+# Head start for clients between mapping a keycode and its first key event:
+# they fetch the new mapping when they handle the MappingNotify.
+REMAP_SETTLE = 0.025
+# At most this many spare keycodes carry temporary symbols at once.
+REMAP_POOL_SIZE = 16
+# A keycode gets a new symbol only once its last key event is this old (s).
+REMAP_REUSE_AGE = 0.5
+# Remapped keycodes get their empty rows back after this long without
+# remapped input (s).
+REMAP_QUIET = 0.75
 
 # pyautogui key names -> X keysym names (XStringToKeysym).
 _KEY_NAMES: dict[str, str] = {
@@ -204,13 +227,18 @@ class KeyboardMapping:
             for index in range(count)
         }
 
-    def find(self, keysym: int) -> tuple[int, int] | None:
+    def find(
+        self, keysym: int, exclude: Collection[int] = ()
+    ) -> tuple[int, int] | None:
         """``(keycode, level)`` of the lowest key with ``keysym`` on level 0 or 1.
 
-        A plain-level match on any key wins over a Shift-level one.
+        A plain-level match on any key wins over a Shift-level one. Keycodes
+        in ``exclude`` (temporarily remapped ones) are skipped.
         """
         for level in (0, 1):
             for keycode, row in sorted(self.rows.items()):
+                if keycode in exclude:
+                    continue
                 if len(row) > level and row[level] == keysym:
                     return keycode, level
         return None
@@ -231,13 +259,19 @@ class Stroke(NamedTuple):
     remap: bool
 
 
-def plan_stroke(mapping: KeyboardMapping, keysym: int, shift: int | None) -> Stroke:
+def plan_stroke(
+    mapping: KeyboardMapping,
+    keysym: int,
+    shift: int | None,
+    exclude: Collection[int] = (),
+) -> Stroke:
     """Plain key for a level-0 keysym, Shift + key for level 1, else a remap.
 
     ``shift`` is the Shift key's keycode (``None`` when the mapping has none,
-    so a level-1 keysym is remapped instead).
+    so a level-1 keysym is remapped instead). Keycodes in ``exclude`` are
+    not keys of the layout (see ``KeyboardMapping.find``).
     """
-    found = mapping.find(keysym)
+    found = mapping.find(keysym, exclude)
     if found is not None and found[1] == 0:
         return Stroke(keysym, found[0], None, False)
     if found is not None and shift is not None:
@@ -351,6 +385,9 @@ class Xlib:
         }
         self._functions: dict[str, XFunction] = {}
         self.lock = threading.RLock()
+        # The connection's temporary keycodes (``remap_pool``), shared by
+        # every backend on it: the mapping is server-wide.
+        self.remaps: RemapPool | None = None
         # Must precede every other Xlib call in the process.
         self._call("XInitThreads")
         display = self._call("XOpenDisplay", None)
@@ -477,6 +514,10 @@ class Xlib:
         """Flush and wait until the server has processed every request."""
         self._call("XSync", self._display, 0)
 
+    @property
+    def is_open(self) -> bool:
+        return bool(self._display)
+
     def close(self) -> None:
         with self.lock:
             if self._display:
@@ -495,6 +536,282 @@ def shared_xlib() -> Xlib:
         if _SHARED is None:
             _SHARED = Xlib()
         return _SHARED
+
+
+# -- temporary keycodes ----------------------------------------------------------
+
+
+class Cancellable(Protocol):
+    def cancel(self) -> None: ...
+
+
+TimerFactory = Callable[[float, Callable[[], None]], Cancellable]
+
+
+def start_timer(delay: float, callback: Callable[[], None]) -> Cancellable:
+    """``callback`` on a daemon thread after ``delay`` s (``threading.Timer``)."""
+    timer = threading.Timer(delay, callback)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+# Exit-time restore: every pool that ever remapped a keycode, hook added once.
+_EXIT_LOCK = threading.Lock()
+_EXIT_HOOK_REGISTERED = False
+_EXIT_POOLS: weakref.WeakSet[RemapPool] = weakref.WeakSet()
+# How long the exit hook waits for a connection another thread holds (s).
+_EXIT_LOCK_TIMEOUT = 1.0
+
+
+def release_all_remaps() -> None:
+    """Restore every pool's keycodes; the atexit hook. Never raises."""
+    with _EXIT_LOCK:
+        pools = list(_EXIT_POOLS)
+    for pool in pools:
+        pool.release_at_exit()
+
+
+def _track_for_exit(pool: RemapPool) -> None:
+    global _EXIT_HOOK_REGISTERED
+    with _EXIT_LOCK:
+        _EXIT_POOLS.add(pool)
+        if not _EXIT_HOOK_REGISTERED:
+            atexit.register(release_all_remaps)
+            _EXIT_HOOK_REGISTERED = True
+
+
+def _holds(mapping: KeyboardMapping, keycode: int, keysym: int) -> bool:
+    """True when ``keycode``'s plain level is ``keysym`` in ``mapping``."""
+    row = mapping.rows.get(keycode)
+    return bool(row) and row[0] == keysym
+
+
+class RemapPool:
+    """Spare keycodes temporarily carrying keysyms the layout lacks.
+
+    Every method expects the caller to hold ``xlib.lock`` or takes it. A
+    keycode keeps its symbol until it is the least recently used one and its
+    last use is ``REMAP_REUSE_AGE`` old, or until the pool is released: after
+    ``REMAP_QUIET`` without a remapped key, by ``release``, or at exit. A
+    keycode whose row someone else changed leaves the pool unwritten.
+    """
+
+    def __init__(
+        self,
+        xlib: Xlib,
+        *,
+        sleep: Callable[[float], None],
+        clock: Callable[[], float],
+        timer: TimerFactory,
+    ) -> None:
+        self._xlib = xlib
+        self._sleep = sleep
+        self._clock = clock
+        self._timer_factory = timer
+        # keycode -> keysym, least recently used first.
+        self._mapped: dict[int, int] = {}
+        self._last_use: dict[int, float] = {}
+        self._original: dict[int, list[int]] = {}
+        self._timer: Cancellable | None = None
+        self._generation = 0
+
+    def keycodes(self) -> frozenset[int]:
+        """The keycodes carrying a temporary symbol now."""
+        return frozenset(self._mapped)
+
+    def prune(self, mapping: KeyboardMapping) -> None:
+        """Forget, without writing, every keycode whose row in ``mapping``
+        no longer holds the pooled keysym (setxkbmap, xmodmap or another
+        client changed it: the row is theirs now)."""
+        for keycode, keysym in list(self._mapped.items()):
+            if not _holds(mapping, keycode, keysym):
+                self._forget(keycode)
+
+    def can_map(self, mapping: KeyboardMapping) -> bool:
+        """True when a keysym can get a keycode (a pooled or a spare one)."""
+        self.prune(mapping)
+        return bool(self._mapped) or bool(self._free(mapping, ()))
+
+    def reuse_wait(self, keysym: int, mapping: KeyboardMapping) -> float:
+        """Seconds to wait before ``keycode_for`` may recycle a keycode.
+
+        Zero when ``keysym`` is pooled, a spare keycode is free, or the least
+        recently used keycode is ``REMAP_REUSE_AGE`` old.
+        """
+        self.prune(mapping)
+        if keysym in self._mapped.values() or not self._mapped:
+            return 0.0
+        if self._free(mapping, ()) and len(self._mapped) < REMAP_POOL_SIZE:
+            return 0.0
+        oldest = next(iter(self._mapped))
+        return max(0.0, REMAP_REUSE_AGE - (self._clock() - self._last_use[oldest]))
+
+    def wait(self, seconds: float) -> None:
+        """Sleep with ``xlib.lock`` still held (see ``X11Backend.write``)."""
+        self._xlib.flush()
+        self._sleep(seconds)
+
+    def hold_release(self) -> None:
+        """Cancel the pending restore for a write in progress.
+
+        A timer that already fired and waits for the lock finds its
+        generation stale and restores nothing; ``schedule_release`` re-arms.
+        """
+        with self._xlib.lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._generation += 1
+
+    def keycode_for(
+        self, keysym: int, mapping: KeyboardMapping
+    ) -> tuple[int, KeyboardMapping]:
+        """The keycode carrying ``keysym`` and the newest mapping snapshot.
+
+        ``mapping`` is a snapshot no older than the caller's last remap. A
+        pooled keycode counts only while ``mapping`` shows it still holds
+        ``keysym``. A newly mapped keycode is read back after the request
+        (another client may have changed it meanwhile, then the next spare
+        is tried) and given ``REMAP_SETTLE`` before it is returned.
+        """
+        self.prune(mapping)
+        for keycode, mapped in self._mapped.items():
+            if mapped == keysym:
+                self._touch(keycode)
+                return keycode, mapping
+        tried: set[int] = set()
+        while True:
+            # A recycled keycode is only ever the first candidate: its age
+            # was awaited (reuse_wait), a further one's was not.
+            keycode = self._take(mapping, tried, recycle=not tried)
+            tried.add(keycode)
+            # Pooled before the request, so a failed one is still restored;
+            # NO_SYMBOL matches no keysym a caller asks for.
+            self._mapped[keycode] = NO_SYMBOL
+            self._touch(keycode)
+            _track_for_exit(self)
+            # Both levels: Shift or Caps Lock cannot change it.
+            self._xlib.change_mapping(keycode, [keysym, keysym])
+            self._xlib.sync()
+            mapping = self._xlib.keyboard_mapping()
+            if _holds(mapping, keycode, keysym):
+                self._mapped[keycode] = keysym
+                self._sleep(REMAP_SETTLE)
+                return keycode, mapping
+            # Another client wrote this row after us: leave it to them.
+            self._forget(keycode)
+
+    def schedule_release(self) -> None:
+        """(Re)start the quiet period after which every keycode is restored.
+
+        Nothing to restore (an empty pool): no timer.
+        """
+        with self._xlib.lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._generation += 1
+            if not self._mapped:
+                return
+            generation = self._generation
+            self._timer = self._timer_factory(
+                REMAP_QUIET, lambda: self._expire(generation)
+            )
+
+    def release(self) -> None:
+        """Give every pooled keycode its original row back now."""
+        with self._xlib.lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            self._generation += 1
+            if not self._mapped:
+                return
+            if not self._xlib.is_open:
+                self._forget_all()
+                return
+            # Only rows that still hold the pooled keysym are ours to restore.
+            self.prune(self._xlib.keyboard_mapping())
+            for keycode in sorted(self._mapped, reverse=True):
+                self._xlib.change_mapping(keycode, self._original[keycode])
+                self._forget(keycode)
+            self._xlib.sync()
+
+    def release_at_exit(self) -> None:
+        """``release`` for the atexit hook: bounded wait, never raises."""
+        lock = self._xlib.lock
+        if not lock.acquire(timeout=_EXIT_LOCK_TIMEOUT):
+            logger.warning("X11 keycodes left remapped: the display stayed busy")
+            return
+        try:
+            self.release()
+        except Exception:
+            # Interpreter exit: report and go on with the remaining pools.
+            logger.warning("restoring remapped X11 keycodes failed", exc_info=True)
+        finally:
+            lock.release()
+
+    # -- internals ----------------------------------------------------------
+
+    def _free(self, mapping: KeyboardMapping, exclude: Collection[int]) -> list[int]:
+        return [
+            code
+            for code in mapping.spare_keycodes()
+            if code not in self._mapped and code not in exclude
+        ]
+
+    def _take(
+        self, mapping: KeyboardMapping, exclude: Collection[int], *, recycle: bool
+    ) -> int:
+        """A new spare keycode while the pool has room, else (``recycle``)
+        the least recently used one."""
+        free = self._free(mapping, exclude)
+        if free and len(self._mapped) < REMAP_POOL_SIZE:
+            keycode = free[0]
+            self._original[keycode] = list(mapping.rows[keycode])
+            return keycode
+        if recycle and self._mapped:
+            return next(iter(self._mapped))
+        raise NativeInputError(
+            "the keyboard mapping has no spare keycode to type a "
+            "character the layout lacks"
+        )
+
+    def _touch(self, keycode: int) -> None:
+        self._mapped[keycode] = self._mapped.pop(keycode)
+        self._last_use[keycode] = self._clock()
+
+    def _forget(self, keycode: int) -> None:
+        del self._mapped[keycode]
+        self._last_use.pop(keycode, None)
+        self._original.pop(keycode, None)
+
+    def _forget_all(self) -> None:
+        self._mapped.clear()
+        self._last_use.clear()
+        self._original.clear()
+
+    def _expire(self, generation: int) -> None:
+        with self._xlib.lock:
+            if generation != self._generation:
+                return
+            self._timer = None
+            self.release()
+
+
+def remap_pool(
+    xlib: Xlib,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    timer: TimerFactory = start_timer,
+) -> RemapPool:
+    """The connection's pool, created with these callables on first use."""
+    with xlib.lock:
+        if xlib.remaps is None:
+            xlib.remaps = RemapPool(xlib, sleep=sleep, clock=clock, timer=timer)
+        return xlib.remaps
 
 
 # -- backend -------------------------------------------------------------------
@@ -531,17 +848,40 @@ class X11Backend:
     ``_pause`` is accepted for compatibility and never sleeps.
     """
 
+    # write types a character the layout lacks on a temporarily mapped keycode.
+    supports_unicode_write: bool = True
+
     def __init__(
         self,
         xlib: Xlib | None = None,
         *,
         sleep: Callable[[float], None] = time.sleep,
         environ: Mapping[str, str] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        timer: TimerFactory = start_timer,
     ) -> None:
+        """``sleep``, ``clock`` and ``timer`` drive the connection's
+        ``RemapPool`` when this backend is the first on ``xlib``."""
         self._xlib = xlib if xlib is not None else shared_xlib()
-        self._sleep = sleep
         self._environ = environ
+        self._remaps = remap_pool(self._xlib, sleep=sleep, clock=clock, timer=timer)
         self.platformModule = RawReleases(self)
+
+    def release_remaps(self) -> None:
+        """Give temporarily remapped keycodes their empty rows back now.
+
+        Waits for a ``write``/``press`` in progress on this connection to
+        finish (the connection lock), then restores every row that still
+        holds its pooled keysym; a row someone else changed is left alone.
+        Otherwise this happens ``REMAP_QUIET`` after the last remapped key,
+        or at interpreter exit. The backend stays usable: the next character
+        the layout lacks maps a keycode again.
+        """
+        self._remaps.release()
+
+    def close(self) -> None:
+        """``release_remaps``; the shared display connection stays open."""
+        self.release_remaps()
 
     # -- reading ------------------------------------------------------------
 
@@ -660,7 +1000,13 @@ class X11Backend:
         self._tap(keysyms * presses)
 
     def write(self, message: str, _pause: bool = False) -> None:
-        """Type ``message``; any character, whatever the keyboard layout."""
+        """Type ``message``; any character, whatever the keyboard layout.
+
+        One call is atomic with respect to other emunium input on this
+        connection: it holds the connection lock throughout, including any
+        wait for a pooled keycode to age (at most ``REMAP_REUSE_AGE`` per
+        character, with the fail-safe checked before and after it).
+        """
         if not isinstance(message, str):
             raise TypeError(f"message must be str, got {type(message).__name__}")
         keysyms = [
@@ -715,10 +1061,13 @@ class X11Backend:
     def _held_keycode(self, key: str, keysym: int) -> int:
         """The key that carries ``keysym`` (either level), for down/up.
 
-        A held key is never remapped: the mapping would have to outlive the
-        call. ``"V"`` is the V key, without Shift.
+        A held key is never remapped, nor held on a pooled keycode: the
+        mapping would have to outlive the hold. ``"V"`` is the V key, without
+        Shift.
         """
-        found = self._xlib.keyboard_mapping().find(keysym)
+        mapping = self._xlib.keyboard_mapping()
+        self._remaps.prune(mapping)
+        found = mapping.find(keysym, self._remaps.keycodes())
         if found is None:
             raise NativeInputError(
                 f"no key carries {key!r} in the current keyboard mapping"
@@ -726,42 +1075,52 @@ class X11Backend:
         return found[0]
 
     def _tap(self, keysyms: Sequence[int]) -> None:
-        """Press and release each keysym in order (see ``press``)."""
+        """Press and release each keysym in order (see ``press``).
+
+        The lock is held throughout (see ``write``) and a pending restore is
+        held off until the last key, so no pooled keycode changes mid-call.
+        The fail-safe is checked again before every remapped keysym and after
+        each wait for a keycode to age (``RemapPool.reuse_wait``, at most
+        ``REMAP_REUSE_AGE``), after which the mapping is read again.
+        """
         if not keysyms:
             return
         xlib = self._xlib
+        remaps = self._remaps
         with xlib.lock:
             mapping = xlib.keyboard_mapping()
-            shift_found = mapping.find(self._named_keysym(SHIFT_KEYSYM_NAME))
+            remaps.prune(mapping)
+            pooled = remaps.keycodes()
+            shift_found = mapping.find(self._named_keysym(SHIFT_KEYSYM_NAME), pooled)
             shift = None if shift_found is None else shift_found[0]
-            plan = [plan_stroke(mapping, keysym, shift) for keysym in keysyms]
-            spare = mapping.spare_keycodes()
-            if not spare and any(stroke.remap for stroke in plan):
+            plan = [plan_stroke(mapping, keysym, shift, pooled) for keysym in keysyms]
+            if any(stroke.remap for stroke in plan) and not remaps.can_map(mapping):
                 raise NativeInputError(
                     "the keyboard mapping has no spare keycode to type a "
                     "character the layout lacks"
                 )
             self._failsafe()
-            remapped: dict[int, int] = {}  # keysym -> spare keycode
+            remapping = any(stroke.remap for stroke in plan)
+            if remapping:
+                remaps.hold_release()
             try:
                 for stroke in plan:
                     if not stroke.remap:
                         self._stroke(stroke.keycode, stroke.shift)
                         continue
-                    keycode = remapped.get(stroke.keysym)
-                    if keycode is None:
-                        if not spare:
-                            spare = self._restore(mapping, remapped)
-                        keycode = spare.pop(0)
-                        # Both levels: Shift or Caps Lock cannot change it.
-                        xlib.change_mapping(keycode, [stroke.keysym, stroke.keysym])
-                        xlib.sync()
-                        remapped[stroke.keysym] = keycode
+                    self._failsafe()
+                    wait = remaps.reuse_wait(stroke.keysym, mapping)
+                    while wait > 0:
+                        remaps.wait(wait)
+                        self._failsafe()
+                        mapping = xlib.keyboard_mapping()
+                        wait = remaps.reuse_wait(stroke.keysym, mapping)
+                    keycode, mapping = remaps.keycode_for(stroke.keysym, mapping)
                     self._stroke(keycode, None)
                 xlib.flush()
             finally:
-                if remapped:
-                    self._restore(mapping, remapped)
+                if remapping:
+                    remaps.schedule_release()
 
     def _stroke(self, keycode: int, shift: int | None) -> None:
         if shift is not None:
@@ -770,18 +1129,3 @@ class X11Backend:
         self._xlib.key(keycode, press=False)
         if shift is not None:
             self._xlib.key(shift, press=False)
-
-    def _restore(self, mapping: KeyboardMapping, remapped: dict[int, int]) -> list[int]:
-        """Give the remapped spare keycodes their original rows back.
-
-        Returns the freed keycodes, highest first.
-        """
-        xlib = self._xlib
-        xlib.sync()
-        self._sleep(REMAP_SETTLE)
-        freed = sorted(remapped.values(), reverse=True)
-        for keycode in freed:
-            xlib.change_mapping(keycode, mapping.rows[keycode])
-        xlib.sync()
-        remapped.clear()
-        return freed

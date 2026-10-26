@@ -632,6 +632,12 @@ def test_write_is_unicode_and_layout_independent() -> None:
     assert user32.mapped == []
 
 
+def test_backend_declares_native_unicode_write() -> None:
+    backend, _ = make()
+    assert Win32Backend.supports_unicode_write is True
+    assert ElementInteractor._writes_unicode(backend)
+
+
 def test_write_chunks_without_splitting_surrogates() -> None:
     backend, user32 = make()
     backend.write("x" * 31 + "\U0001f600")
