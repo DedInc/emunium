@@ -27,9 +27,11 @@ from emunium._screen import NATIVE_INPUT_LOCK, Geometry, input_per_dip
 from emunium._standalone.config import ClickType
 from emunium.errors import (
     ClickVerificationError,
+    ContentUnavailableError,
     InvalidArgumentError,
     NativeInputError,
     StaleElementError,
+    TargetClosedError,
 )
 
 __all__ = ["Element", "ElementQuery"]
@@ -43,6 +45,9 @@ SAMPLE_TOLERANCE_DIP = 1.0
 MAX_CORRECTIONS = 2
 # Net-zero cursor jiggle that makes the page emit a fresh event at the point.
 JIGGLE_PX = 1
+# Pause between the jiggle step and the move back (more than two 60 Hz frames):
+# back-to-back moves are coalesced by the OS and Chrome into no event at all.
+JIGGLE_SETTLE_S = 0.035
 # Classic scrollbar width (CSS px) excluded on a side whose axis scrolls.
 SCROLLBAR_CSS = 17.0
 # Margin on every side when the document's scroll extent is unknown.
@@ -51,6 +56,12 @@ PROBE_QUIET_MS = 40
 PROBE_WAIT_MS = 300
 PROBE_TIMEOUT = 10.0
 TYPE_CHUNK = 8
+# After type(): how long to wait for queued keystrokes to reach the page.
+TYPE_SETTLE_TIMEOUT_S = 2.0
+TYPE_SETTLE_POLL_S = 0.025
+# A value that changed but does not end with the typed text (type=number,
+# type=email, input masks) counts as settled once unchanged for this long.
+TYPE_SETTLE_STABLE_S = 0.1
 # Overall budget (s) for verifying the drop while the mouse button is held.
 DRAG_HOLD_DEADLINE_S = 2.0
 MIXED_DPI_HINT = (
@@ -68,6 +79,7 @@ _CLICK_BUTTONS = {
 _TYPE_CLICKS = (ClickType.LEFT, ClickType.DOUBLE)
 _RNG = random.Random()
 _monotonic = time.monotonic
+_sleep = time.sleep
 
 
 @dataclass(frozen=True)
@@ -555,8 +567,11 @@ class Element:
         """Prove the cursor is over this element; correct at most twice.
 
         Each round takes ``since`` and then jiggles the cursor 1 px and back, so
-        only an event produced at the final position can be accepted. With a
-        ``deadline`` (monotonic s) every round and probe shares that budget.
+        only an event produced at the final position can be accepted. The two
+        moves are ``JIGGLE_SETTLE_S`` apart: sent back to back, the OS and
+        Chrome coalesce them into a net-zero move that produces no event. With
+        a ``deadline`` (monotonic s) every round, pause and probe shares that
+        budget.
         """
         ctx = self._ctx
         interactor = ctx.interactor
@@ -565,13 +580,14 @@ class Element:
         samples = 0
         foreign_hits = 0
         while True:
-            budget = _remaining(deadline)
+            _remaining(deadline)
             x, y = interactor.position()
             step = self._jiggle_step(x, y, anchor)
             since = ctx.mark_action()
             interactor.move(x + step, y, human=False)
+            _sleep(JIGGLE_SETTLE_S)
             interactor.move(x, y, human=False)
-            probe, geometry = self._probe(since, budget)
+            probe, geometry = self._probe(since, _remaining(deadline))
             event = probe.get("event")
             position = interactor.position()
             if not isinstance(event, dict) or not self._is_fresh(event, since):
@@ -794,11 +810,15 @@ class Element:
         offset: int = 20,
         human: bool = True,
         click_type: ClickType = ClickType.LEFT,
+        settle: bool = True,
     ) -> None:
         """Verified click, focus check (one ``focus`` retry), then keystrokes.
 
         Text goes out in chunks of ``TYPE_CHUNK`` characters; focus is checked
-        again before every chunk, so keys stop the moment focus is lost.
+        again before every chunk, so keys stop the moment focus is lost. With
+        ``settle`` the call then waits (up to ``TYPE_SETTLE_TIMEOUT_S``) until
+        the page has received the keystrokes still queued in the OS; a timeout
+        only logs a warning.
         """
         if click_type not in _TYPE_CLICKS:
             raise InvalidArgumentError(
@@ -814,6 +834,7 @@ class Element:
                         f"(or the browser window has no OS focus); typed 0 of "
                         f"{len(text)} characters"
                     )
+            baseline = self._typed_content() if settle and text else None
             typed = 0
             for chunk in _chunks(text, TYPE_CHUNK):
                 if typed and not self._is_focused():
@@ -829,6 +850,56 @@ class Element:
                 )
                 typed += len(chunk)
             logger.info("Typed %d chars into %s", typed, self._element_id)
+            if baseline is not None:
+                self._await_typed(text, baseline)
+
+    def _typed_content(self) -> str:
+        """``value`` of inputs and textareas, rendered text otherwise
+        (contenteditable), with line breaks normalised to ``\\n``."""
+        data = self._ctx.bridge.describe_element(self._element_id, tab_id=self._tab())
+        value = data.get("value")
+        if not isinstance(value, str):
+            value = data.get("text")
+        return _normalise_newlines(value if isinstance(value, str) else "")
+
+    def _await_typed(self, text: str, baseline: str) -> None:
+        """Poll until the page shows ``text``; on timeout warn and return.
+
+        Settled means: the content ends with the typed text (and changed, when
+        it already ended with it before typing), or it changed and then stayed
+        unchanged for ``TYPE_SETTLE_STABLE_S`` (inputs that transform text).
+        """
+        expected = _normalise_newlines(text)
+        already_there = baseline.endswith(expected)
+        deadline = _monotonic() + TYPE_SETTLE_TIMEOUT_S
+        last: str | None = None
+        last_change = 0.0
+        while True:
+            try:
+                content = self._typed_content()
+            except (StaleElementError, ContentUnavailableError, TargetClosedError):
+                # The keys were sent; Enter may have submitted and navigated.
+                logger.info(
+                    "element %s went away while typed text settled", self._element_id
+                )
+                return
+            now = _monotonic()
+            if content != last:
+                last, last_change = content, now
+            changed = content != baseline
+            if content.endswith(expected) and (changed or not already_there):
+                return
+            if changed and now - last_change >= TYPE_SETTLE_STABLE_S:
+                return
+            if now >= deadline:
+                logger.warning(
+                    "typed text did not reach element %s within %g s (%d chars sent)",
+                    self._element_id,
+                    TYPE_SETTLE_TIMEOUT_S,
+                    len(text),
+                )
+                return
+            _sleep(TYPE_SETTLE_POLL_S)
 
     # -- drag ----------------------------------------------------------------
 
@@ -965,6 +1036,10 @@ def _remaining(deadline: float | None) -> float | None:
             "held-button deadline"
         )
     return remaining
+
+
+def _normalise_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _chunks(text: str, size: int) -> list[str]:

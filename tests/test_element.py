@@ -111,6 +111,39 @@ class World:
         self.clock = 0.0
         self.probe_cost = 0.0  # seconds a probe takes on the fake clock
         self.probe_budgets: list[tuple[float, int]] = []  # (timeout, waitMs)
+        # Typing: keys queue in ``typed_queue`` and reach ``typing_target`` (its
+        # ``values`` entry when it has one, else its ``texts`` entry) on reads.
+        self.values: dict[str, str] = {}
+        self.texts: dict[str, str] = {}
+        self.typing_target = "doc1.1"
+        self.typed_queue = ""
+        self.reads_before_delivery = 0  # describeElement reads that see nothing
+        self.deliver_per_read: int | None = None  # chars per read; None = all
+        self.transform: Callable[[str], str] | None = None  # e.g. type=number
+        self.after_type: Callable[[], None] | None = None
+        # Like the OS and Chrome: two jiggle moves with no pause between them
+        # merge into a net-zero move, so the probe sees no fresh event.
+        self.coalesce = False
+
+    def deliver_typed(self) -> None:
+        if not self.typed_queue:
+            return
+        if self.reads_before_delivery > 0:
+            self.reads_before_delivery -= 1
+            return
+        count = self.deliver_per_read or len(self.typed_queue)
+        chunk, self.typed_queue = self.typed_queue[:count], self.typed_queue[count:]
+        target = self.typing_target
+        if target in self.values:
+            value = self.values[target] + chunk.replace("\r\n", "\n")
+            self.values[target] = (
+                value if self.transform is None else self.transform(value)
+            )
+        else:
+            self.texts[target] = self.texts.get(target, "label") + chunk
+
+    def sleeps(self) -> list[float]:
+        return [entry[1] for entry in self.kinds("sleep")]
 
     def add(self, element_id: str, x: float, y: float, w: float, h: float) -> None:
         self.rects[element_id] = {"x": x, "y": y, "width": w, "height": h}
@@ -121,7 +154,8 @@ class World:
             "elementId": element_id,
             "tag": self.tags.get(element_id, "button"),
             "attrs": {"id": element_id},
-            "text": "label",
+            "text": self.texts.get(element_id, "label"),
+            "value": self.values.get(element_id),
             "visible": True,
             "rect": rect,
             "geometry": dict(self.geometry),
@@ -244,6 +278,9 @@ class FakeInteractor:
     ) -> None:
         self._check_lock()
         self.world.log.append(("type", text, characters_per_minute, offset, human))
+        self.world.typed_queue += text
+        if self.world.after_type is not None:
+            self.world.after_type()
 
 
 class FakeBridge(Bridge):
@@ -281,6 +318,10 @@ class FakeBridge(Bridge):
         element_id = params["elementId"]
         self._record(method, element_id, tab_id)
         world = self.world
+        merged = world.coalesce and [e[0] for e in world.log[-3:-1]] == [
+            "jiggle",
+            "jiggle",
+        ]
         world.probe_budgets.append((timeout, params["waitMs"]))
         world.clock += world.probe_cost
         result: dict[str, Any] = {
@@ -289,7 +330,7 @@ class FakeBridge(Bridge):
             "rect": dict(world.rects[element_id]),
             "geometry": dict(world.geometry),
         }
-        if not world.silent:
+        if not world.silent and not merged:
             position = world.cursor
             client_x, client_y = world.client_point(position)
             scale = input_per_dip(world.live())
@@ -356,6 +397,7 @@ class FakeBridge(Bridge):
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
     ) -> dict[str, Any]:
         self._record("describeElement", element_id, tab_id)
+        self.world.deliver_typed()
         return self.world.payload(element_id)
 
     def scroll_into_view(
@@ -433,6 +475,12 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     w = World()
     w.add("doc1.1", 100, 60, 100, 20)
     monkeypatch.setattr(element_module, "_monotonic", lambda: w.clock)
+
+    def fake_sleep(seconds: float) -> None:
+        w.log.append(("sleep", seconds))
+        w.clock += seconds
+
+    monkeypatch.setattr(element_module, "_sleep", fake_sleep)
     return w
 
 
@@ -462,10 +510,12 @@ def test_click_follows_the_transaction_order(world: World) -> None:
         "scrollIntoView",
         "move",
         "jiggle",
+        "sleep",
         "jiggle",
         "pointerProbe",
         "press",
     ]
+    assert world.sleeps() == [element_module.JIGGLE_SETTLE_S]
     assert world.presses() == [("press", "left", 1, world.cursor)]
     assert pressed_inside(world, "doc1.1")
     assert ctx.calibration.is_calibrated(world.live())
@@ -475,7 +525,8 @@ def test_os_events_are_sent_under_the_native_input_lock(world: World) -> None:
     ctx = make_ctx(world)
     world.focus_states = [dict(OK_FOCUS)]
     handle(ctx).type("abc")
-    assert world.lock_checks == len(world.log) - len(world.kinds("bridge"))
+    unlocked = len(world.kinds("bridge")) + len(world.kinds("sleep"))
+    assert world.lock_checks == len(world.log) - unlocked
     assert world.lock_checks >= 5
 
     with pytest.raises(AssertionError, match="NATIVE_INPUT_LOCK"):
@@ -748,6 +799,39 @@ def test_jiggle_stays_inside_at_an_explicit_right_edge(world: World) -> None:
     assert pressed_inside(world, "doc1.1")
 
 
+def test_jiggle_takes_since_first_and_pauses_between_steps(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = make_ctx(world)
+    real_mark = ctx.mark_action
+
+    def mark() -> float:
+        world.log.append(("since",))
+        return real_mark()
+
+    monkeypatch.setattr(ctx, "mark_action", mark)
+    handle(ctx).click()
+
+    steps = [s for s in world.sequence() if s != "move"]
+    assert steps[steps.index("since") :] == [
+        "since",
+        "jiggle",
+        "sleep",
+        "jiggle",
+        "pointerProbe",
+        "press",
+    ]
+    assert world.sleeps() == [0.035] and element_module.JIGGLE_SETTLE_S > 2 / 60
+
+
+@pytest.mark.parametrize("human", [True, False])
+def test_click_survives_move_coalescing(world: World, human: bool) -> None:
+    world.coalesce = True  # back-to-back jiggle moves would produce no event
+    ctx = make_ctx(world)
+    handle(ctx).click(human=human)
+    assert len(world.probes) == 1 and pressed_inside(world, "doc1.1")
+
+
 def test_no_safe_jiggle_at_an_explicit_edge_is_refused(world: World) -> None:
     world.blocked.add((199, 164))
     ctx = make_ctx(world)
@@ -990,6 +1074,114 @@ def test_type_after_failed_click_sends_no_keys(world: World) -> None:
     assert world.kinds("type") == [] and "focusState" not in world.bridge_methods()
 
 
+POLL = element_module.TYPE_SETTLE_POLL_S
+
+
+def after_typing(world: World) -> list[tuple[Any, ...]]:
+    last_type = max(i for i, entry in enumerate(world.log) if entry[0] == "type")
+    return world.log[last_type + 1 :]
+
+
+def settle_reads(world: World) -> int:
+    return sum(1 for e in after_typing(world) if e[:2] == ("bridge", "describeElement"))
+
+
+def test_type_waits_until_the_value_catches_up(world: World) -> None:
+    world.values["doc1.1"] = "x "
+    world.reads_before_delivery = 3  # keys still queued in the OS for 3 polls
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    handle(ctx).type("abc 123")
+
+    assert world.values["doc1.1"] == "x abc 123" and world.typed_queue == ""
+    assert settle_reads(world) == 4
+    assert [e for e in after_typing(world) if e[0] == "sleep"] == [("sleep", POLL)] * 3
+    assert after_typing(world)[-1][:2] == ("bridge", "describeElement")
+
+
+def test_type_waits_for_the_whole_text_not_a_prefix(world: World) -> None:
+    world.values["doc1.1"] = ""
+    world.deliver_per_read = 2
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    handle(ctx).type("abc 123")
+    assert world.values["doc1.1"] == "abc 123" and settle_reads(world) == 4
+
+
+def test_type_settles_on_contenteditable_text_with_crlf(world: World) -> None:
+    world.texts["doc1.1"] = "note: "
+    world.reads_before_delivery = 1
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    handle(ctx).type("a\r\nb")
+    assert world.texts["doc1.1"] == "note: a\r\nb" and settle_reads(world) == 2
+
+
+def test_type_into_a_transforming_input_settles_when_stable(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.values["doc1.1"] = ""
+    world.transform = str.strip  # type=email drops the surrounding spaces
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    with caplog.at_level("WARNING", logger="emunium.element"):
+        handle(ctx).type(" a@b.c ")
+
+    waited = sum(e[1] for e in after_typing(world) if e[0] == "sleep")
+    assert world.values["doc1.1"] == "a@b.c"
+    stable = element_module.TYPE_SETTLE_STABLE_S
+    assert stable - 1e-9 <= waited <= stable + POLL + 1e-9
+    assert caplog.records == []
+
+
+def test_type_already_ending_with_the_text_waits_for_a_change(world: World) -> None:
+    world.values["doc1.1"] = "abc"
+    world.reads_before_delivery = 2
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    handle(ctx).type("abc")
+    assert world.values["doc1.1"] == "abcabc" and settle_reads(world) == 3
+
+
+def test_type_settle_timeout_warns_and_returns(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    world.values["doc1.1"] = ""
+    world.reads_before_delivery = 10**6  # the keys never arrive
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    start = world.clock
+    with caplog.at_level("WARNING", logger="emunium.element"):
+        handle(ctx).type("abc")
+
+    waited = sum(e[1] for e in after_typing(world) if e[0] == "sleep")
+    timeout = element_module.TYPE_SETTLE_TIMEOUT_S
+    assert timeout == 2.0
+    assert timeout - POLL < waited <= timeout + POLL
+    assert world.clock - start == pytest.approx(waited + 0.035)  # + jiggle pause
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert "did not reach" in caplog.records[0].getMessage()
+
+
+def test_type_settle_false_returns_right_after_the_keys(world: World) -> None:
+    world.values["doc1.1"] = ""
+    world.reads_before_delivery = 10**6
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    handle(ctx).type("abc", settle=False)
+    assert after_typing(world) == []
+    assert "describeElement" not in world.bridge_methods()
+
+
+def test_type_settle_ends_quietly_when_the_element_goes_away(world: World) -> None:
+    world.values["doc1.1"] = ""
+    world.after_type = lambda: world.stale.add("doc1.1")  # Enter navigated away
+    world.focus_states = [dict(OK_FOCUS)]
+    ctx = make_ctx(world)
+    handle(ctx).type("q\n")
+    assert settle_reads(world) == 1 and world.kinds("type") != []
+
+
 # -- drag ------------------------------------------------------------------------
 
 
@@ -1094,10 +1286,14 @@ def test_native_dnd_with_drag_samples_drops_on_the_target(world: World) -> None:
     assert world.probes[-1]["event"]["type"] == "dragover"
 
 
-def test_drag_held_phase_shares_one_deadline(world: World) -> None:
+def test_drag_held_phase_shares_one_deadline(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _drag_world(world)
     world.after_button_down = lambda: world.covered.add("dst")
-    world.probe_cost = 1.75  # exact in binary, so the budgets compare exactly
+    # Exact in binary, so the budgets compare exactly.
+    world.probe_cost = 1.25
+    monkeypatch.setattr(element_module, "JIGGLE_SETTLE_S", 0.25)
     ctx = make_ctx(world)
 
     with pytest.raises(ClickVerificationError, match="deadline"):
@@ -1105,9 +1301,10 @@ def test_drag_held_phase_shares_one_deadline(world: World) -> None:
 
     pre_press = 2  # target hover + source, before the button went down
     assert world.probe_budgets[:pre_press] == [(10.0, 300), (10.0, 300)]
-    # Held phase: 2.0 s for the first probe, the 0.25 s left for the second
-    # (page-side wait = remaining - quiet period), then the deadline aborts.
-    assert world.probe_budgets[pre_press:] == [(2.0, 300), (0.25, 210)]
+    # Held phase: the jiggle pause counts against the 2.0 s, so 1.75 s for the
+    # first probe and 0.25 s for the second (page-side wait = remaining - quiet
+    # period), then the deadline aborts.
+    assert world.probe_budgets[pre_press:] == [(1.75, 300), (0.25, 210)]
     assert_cancelled_at_start(world)
 
 
