@@ -243,7 +243,9 @@ def test_copy_ignores_runtime_files_and_source_untouched(env, monkeypatch, tmp_p
         "manifest.json",
         "session.json",
     ]
-    assert json.loads((ext / "session.json").read_text(encoding="utf-8"))["token"] == TOKEN
+    assert (
+        json.loads((ext / "session.json").read_text(encoding="utf-8"))["token"] == TOKEN
+    )
     launcher.close(session)
     assert _snapshot(str(src)) == before
 
@@ -266,8 +268,12 @@ def test_two_sessions_get_separate_directories(env):
     launcher.launch(a, bridge_timeout=5)
     launcher.launch(b, bridge_timeout=5)
     assert a.session_dir != b.session_dir
-    port_a = json.loads(Path(a.extension_dir, "session.json").read_text(encoding="utf-8"))["port"]
-    port_b = json.loads(Path(b.extension_dir, "session.json").read_text(encoding="utf-8"))["port"]
+    port_a = json.loads(
+        Path(a.extension_dir, "session.json").read_text(encoding="utf-8")
+    )["port"]
+    port_b = json.loads(
+        Path(b.extension_dir, "session.json").read_text(encoding="utf-8")
+    )["port"]
     assert (port_a, port_b) == (40001, 40002)
     launcher.close(a)
     launcher.close(b)
@@ -483,7 +489,7 @@ def test_windows_graceful_nonzero_still_waits_then_terminates_job(env, monkeypat
     launcher.close(session)
     events = env["events"]
     assert events[0] == ("taskkill", "/PID", str(pid), "/T")
-    assert events[1] == ("wait", pid, launcher.TERMINATE_GRACE_SECONDS)
+    assert events[1] == ("wait", pid, launcher.GRACEFUL_TASKKILL_GRACE_SECONDS)
     assert events[2] == ("terminate_job", 701, 1)
     assert events[3] == ("close_job", 701)
     assert not any(e[0] == "taskkill" and "/F" in e for e in events)
@@ -526,11 +532,13 @@ def test_windows_assign_failure_falls_back_to_taskkill(env, monkeypatch, caplog)
     with caplog.at_level(logging.DEBUG, logger="emunium.browser"):
         session, proc = _launch_windows(env, monkeypatch)
     assert session._job is None
-    assert any("AssignProcessToJobObject failed" in r.getMessage() for r in caplog.records)
+    assert any(
+        "AssignProcessToJobObject failed" in r.getMessage() for r in caplog.records
+    )
     launcher.close(session)
     events = env["events"]
     assert events[0] == ("taskkill", "/PID", str(proc.pid), "/T")
-    assert events[1] == ("wait", proc.pid, launcher.TERMINATE_GRACE_SECONDS)
+    assert events[1] == ("wait", proc.pid, launcher.GRACEFUL_TASKKILL_GRACE_SECONDS)
     assert ("taskkill", "/PID", str(proc.pid), "/T", "/F") in events
     assert not any(e[0] == "terminate_job" for e in events)
 
@@ -581,6 +589,141 @@ def test_posix_close_path_unchanged(env, monkeypatch):
     assert ("killpg", proc.pid, launcher._SIGKILL) in events
     assert env["taskkills"] == []
     assert not any(e[0] in ("create_job", "terminate_job") for e in events)
+
+
+class TabsBridge(FakeBridge):
+    """A connected bridge that serves ``listTabs`` / ``closeTab`` from a list."""
+
+    def __init__(self, events, tab_ids=(11, 12), **kwargs):
+        super().__init__(**kwargs)
+        self.events = events
+        self.tab_ids = list(tab_ids)
+        self.connected = True
+        self.list_error = None
+        self.close_errors = {}
+        self.on_close = None  # callable(tab_id), e.g. advance a fake clock
+
+    def list_tabs(self, timeout=10.0):
+        self.events.append(("list_tabs", timeout))
+        if self.list_error is not None:
+            raise self.list_error
+        return [{"tabId": tab_id, "url": "about:blank"} for tab_id in self.tab_ids]
+
+    def close_tab(self, tab_id, timeout=10.0):
+        self.events.append(("close_tab", tab_id, timeout))
+        if self.on_close is not None:
+            self.on_close(tab_id)
+        if tab_id in self.close_errors:
+            raise self.close_errors[tab_id]
+        self.tab_ids.remove(tab_id)
+        if not self.tab_ids:
+            # Chrome exits with its last window; the reply never arrives.
+            for proc in FakePopen.instances:
+                proc.returncode = 0
+            raise BridgeError("disconnected")
+        return {"closed": True}
+
+
+def _launch_windows_with_tabs(env, monkeypatch, **attrs):
+    bridge = TabsBridge(env["events"])
+    session, proc = _launch_windows(env, monkeypatch, bridge=bridge, **attrs)
+    return session, proc, bridge
+
+
+def test_close_budgets():
+    assert launcher.CLOSE_TABS_BUDGET_SECONDS == 1.0
+    assert launcher.GRACEFUL_TASKKILL_GRACE_SECONDS == 2.0
+
+
+def test_windows_headed_close_closes_tabs_then_taskkill_then_job(env, monkeypatch):
+    bridge = TabsBridge(env["events"], tab_ids=(11, 12, 13))
+    session, proc = _launch_windows(env, monkeypatch, bridge=bridge)
+    pid = proc.pid
+    launcher.close(session)
+    events = env["events"]
+    kinds = [e[0] for e in events]
+    assert kinds[:4] == ["list_tabs", "close_tab", "close_tab", "close_tab"]
+    assert [e[1] for e in events[1:4]] == [11, 12, 13]
+    assert events[0][1] == launcher.CLOSE_TABS_BUDGET_SECONDS
+    assert all(0 < e[2] <= launcher.CLOSE_TABS_BUDGET_SECONDS for e in events[1:4])
+    assert proc.returncode is not None  # the last closeTab took Chrome down
+    assert events[4] == ("taskkill", "/PID", str(pid), "/T")
+    assert events[5] == ("wait", pid, launcher.GRACEFUL_TASKKILL_GRACE_SECONDS)
+    assert events[6:8] == [("terminate_job", 701, 1), ("close_job", 701)]
+    # the bridge is shut down only after the process tree is gone
+    assert bridge.calls[-1] == "shutdown"
+
+
+def test_windows_headed_close_waits_two_seconds_when_tabs_do_not_exit(env, monkeypatch):
+    session, proc, bridge = _launch_windows_with_tabs(env, monkeypatch)
+    bridge.close_errors = {11: BridgeError("gone"), 12: BridgeError("gone")}
+    launcher.close(session)
+    events = env["events"]
+    assert [e[0] for e in events[:3]] == ["list_tabs", "close_tab", "close_tab"]
+    assert events[3] == ("taskkill", "/PID", str(proc.pid), "/T")
+    assert events[4] == ("wait", proc.pid, 2.0)
+    assert events[5] == ("terminate_job", 701, 1)
+
+
+def test_windows_headed_close_ignores_list_tabs_error(env, monkeypatch):
+    session, proc, bridge = _launch_windows_with_tabs(env, monkeypatch)
+    bridge.list_error = BridgeError("no reply")
+    launcher.close(session)
+    events = env["events"]
+    assert events[0][0] == "list_tabs"
+    assert not any(e[0] == "close_tab" for e in events)
+    assert events[1] == ("taskkill", "/PID", str(proc.pid), "/T")
+    assert ("terminate_job", 701, 1) in events
+
+
+def test_windows_headed_close_tab_budget_is_overall(env, monkeypatch):
+    session, proc, bridge = _launch_windows_with_tabs(env, monkeypatch)
+    bridge.tab_ids = [11, 12, 13, 14]
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: clock["now"])
+
+    def slow_close(tab_id):
+        clock["now"] += 0.6
+
+    bridge.on_close = slow_close
+    launcher.close(session)
+    closes = [e for e in env["events"] if e[0] == "close_tab"]
+    # 0.6 s per tab: the second close starts with 0.4 s left, the third never starts.
+    assert [e[1] for e in closes] == [11, 12]
+    assert closes[0][2] == pytest.approx(1.0)
+    assert closes[1][2] == pytest.approx(0.4)
+    assert ("taskkill", "/PID", str(proc.pid), "/T") in env["events"]
+
+
+def test_windows_headed_close_skips_tabs_when_disconnected(env, monkeypatch):
+    session, proc, bridge = _launch_windows_with_tabs(env, monkeypatch)
+    bridge.connected = False
+    launcher.close(session)
+    assert env["events"][0] == ("taskkill", "/PID", str(proc.pid), "/T")
+    assert not any(e[0] in ("list_tabs", "close_tab") for e in env["events"])
+
+
+def test_windows_headed_close_skips_tabs_when_chrome_already_exited(env, monkeypatch):
+    session, proc, _bridge = _launch_windows_with_tabs(env, monkeypatch)
+    proc.returncode = 0
+    launcher.close(session)
+    assert not any(e[0] in ("list_tabs", "close_tab") for e in env["events"])
+
+
+def test_windows_headless_close_does_not_close_tabs(env, monkeypatch):
+    session, _proc, _bridge = _launch_windows_with_tabs(env, monkeypatch, headless=True)
+    launcher.close(session)
+    assert env["events"][0] == ("terminate_job", 701, 1)
+    assert not any(e[0] in ("list_tabs", "close_tab") for e in env["events"])
+
+
+def test_posix_close_does_not_close_tabs(env, monkeypatch):
+    monkeypatch.setattr(launcher, "_IS_WINDOWS", False)
+    session = _session(TabsBridge(env["events"]))
+    launcher.launch(session, bridge_timeout=5)
+    del env["events"][:]
+    launcher.close(session)
+    assert not any(e[0] in ("list_tabs", "close_tab") for e in env["events"])
 
 
 @pytest.mark.skipif(os.name != "nt", reason="kernel32 Job Objects are Windows-only")
@@ -793,7 +936,9 @@ def test_installer_restores_unix_permissions(inst, monkeypatch):
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks need POSIX")
 def test_installer_restores_symlinks(inst):
-    inst["zip"] = _zip_bytes(LINUX_ZIP + [("chrome-linux64/link", b"chrome", stat.S_IFLNK | 0o777)])
+    inst["zip"] = _zip_bytes(
+        LINUX_ZIP + [("chrome-linux64/link", b"chrome", stat.S_IFLNK | 0o777)]
+    )
     installer.ensure_chrome()
     link = inst["dest"] / "chrome-linux64" / "link"
     assert link.is_symlink() and os.readlink(str(link)) == "chrome"

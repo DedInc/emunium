@@ -18,13 +18,15 @@ safety net stays disarmed for these tests only.
 from __future__ import annotations
 
 import http.server
+import logging
 import os
 import sys
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import pytest
 
@@ -32,6 +34,8 @@ SITE_DIR = Path(__file__).resolve().parent / "site"
 ROOT_CONFTEST = Path(__file__).resolve().parent.parent / "conftest.py"
 # Upper bound for any single delay route, so a stuck test cannot pin a thread.
 MAX_DELAY_MS = 10_000
+
+logger = logging.getLogger("emunium.e2e")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -84,9 +88,13 @@ class _SiteHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self._write_quietly(b"<!doctype html><html><head><title>E2E Delayed</title>")
+            self._write_quietly(
+                b"<!doctype html><html><head><title>E2E Delayed</title>"
+            )
             time.sleep(self._delay_ms(parsed.query) / 1000.0)
-            self._write_quietly(b"</head><body><h1 id='heading'>late body</h1></body></html>")
+            self._write_quietly(
+                b"</head><body><h1 id='heading'>late body</h1></body></html>"
+            )
             self.close_connection = True
             return
         super().do_GET()
@@ -129,18 +137,35 @@ def chrome_path() -> str:
 
 @pytest.fixture
 def make_browser(chrome_path: str) -> Iterator[Callable[..., Any]]:
-    """``make_browser(**kwargs)`` -> a launched ``Browser``; all closed at teardown."""
+    """``make_browser(**kwargs)`` -> a launched ``Browser``; all closed at teardown.
+
+    A failed launch is logged and retried once with a new ``Browser`` (new
+    bridge, new session directory, so a fresh profile unless the test passed
+    its own ``user_data_dir``). Every instance created, launched or not, is
+    closed at teardown.
+    """
     from emunium import Browser
 
     launched: list[Any] = []
 
+    def launch_one(kwargs: dict[str, Any]) -> Any:
+        browser = Browser(**kwargs)
+        # Registered before launch(): a half-started browser is closed too.
+        launched.append(browser)
+        browser.launch()
+        return browser
+
     def factory(**kwargs: Any) -> Any:
         kwargs.setdefault("chrome_path", chrome_path)
         kwargs.setdefault("bridge_timeout", 30.0)
-        browser = Browser(**kwargs)
-        browser.launch()
-        launched.append(browser)
-        return browser
+        try:
+            return launch_one(kwargs)
+        except Exception:
+            logger.warning(
+                "Browser launch failed; retrying once with a fresh session",
+                exc_info=True,
+            )
+        return launch_one(kwargs)
 
     try:
         yield factory

@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any
 
 from emunium.chrome_installer import CHROME_PATH_ENV, ensure_chrome
 from emunium.errors import EmuniumError, LaunchError
@@ -33,6 +33,9 @@ SESSION_DIR_PREFIX = "emunium-"
 EXTENSION_COPY_IGNORE = ("port.json", "session.json", "__pycache__")
 CONNECT_POLL_SECONDS = 0.25
 TERMINATE_GRACE_SECONDS = 5.0
+# Headed Windows close: tabs first, then a graceful taskkill, then the kill.
+CLOSE_TABS_BUDGET_SECONDS = 1.0
+GRACEFUL_TASKKILL_GRACE_SECONDS = 2.0
 TASKKILL_TIMEOUT_SECONDS = 10.0
 RMTREE_ATTEMPTS = 10
 RMTREE_RETRY_DELAY = 0.3
@@ -54,38 +57,38 @@ CHROME_FLAGS = (
 
 class BrowserSession:
     __slots__ = (
-        "bridge",
-        "process",
-        "headless",
-        "user_data_dir",
-        "chrome_path",
-        "extra_args",
-        "session_dir",
-        "extension_dir",
-        "profile_dir",
-        "log_path",
-        "executable_path",
         "_bridge_started",
         "_job",
+        "bridge",
+        "chrome_path",
+        "executable_path",
+        "extension_dir",
+        "extra_args",
+        "headless",
+        "log_path",
+        "process",
+        "profile_dir",
+        "session_dir",
+        "user_data_dir",
     )
 
     def __init__(self) -> None:
         self.bridge: Any = None
-        self.process: Optional[subprocess.Popen] = None
+        self.process: subprocess.Popen | None = None
         self.headless: bool = False
-        self.user_data_dir: Optional[str] = None
+        self.user_data_dir: str | None = None
         # Explicit Chrome binary; None -> EMUNIUM_CHROME_PATH -> Chrome for Testing.
-        self.chrome_path: Optional[str] = None
-        self.extra_args: List[str] = []
-        self.session_dir: Optional[str] = None
-        self.extension_dir: Optional[str] = None
-        self.profile_dir: Optional[str] = None
-        self.log_path: Optional[str] = None
+        self.chrome_path: str | None = None
+        self.extra_args: list[str] = []
+        self.session_dir: str | None = None
+        self.extension_dir: str | None = None
+        self.profile_dir: str | None = None
+        self.log_path: str | None = None
         # Binary actually started by the last launch().
-        self.executable_path: Optional[str] = None
+        self.executable_path: str | None = None
         self._bridge_started: bool = False
         # Windows Job Object handle owning the Chrome process tree, if any.
-        self._job: Optional[int] = None
+        self._job: int | None = None
 
 
 def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
@@ -156,7 +159,9 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
     session.process = _spawn(args, session.log_path)
     if _IS_WINDOWS:
         session._job = _attach_job(session.process)
-    logger.info("Chrome started (pid %s), session dir %s", session.process.pid, session_dir)
+    logger.info(
+        "Chrome started (pid %s), session dir %s", session.process.pid, session_dir
+    )
 
     _await_connection(session, bridge_timeout)
     logger.info("Extension connected to bridge")
@@ -168,8 +173,8 @@ def build_args(
     extension_dir: str,
     *,
     headless: bool = False,
-    extra_args: Optional[List[str]] = None,
-) -> List[str]:
+    extra_args: list[str] | None = None,
+) -> list[str]:
     args = [executable, "--user-data-dir=%s" % profile_dir]
     args.extend(CHROME_FLAGS)
     args.append("--disable-extensions-except=%s" % extension_dir)
@@ -185,6 +190,9 @@ def close(session: BrowserSession) -> None:
     process, session.process = session.process, None
     job, session._job = session._job, None
     if process is not None:
+        if _IS_WINDOWS and not session.headless and process.poll() is None:
+            # Chrome ignores the graceful taskkill; closing its last tab exits it.
+            _close_all_tabs(session.bridge, CLOSE_TABS_BUDGET_SECONDS)
         _stop_process_tree(process, job, headless=session.headless)
     elif job is not None:
         _close_job(job, terminate=True)
@@ -219,7 +227,7 @@ def _resolve_executable(session: BrowserSession) -> str:
     return executable
 
 
-def _validated_extra_args(extra_args: Any) -> List[str]:
+def _validated_extra_args(extra_args: Any) -> list[str]:
     if extra_args is None:
         return []
     if isinstance(extra_args, str):
@@ -236,7 +244,7 @@ def _write_session_file(extension_dir: Path, port: int, token: str) -> None:
     (extension_dir / "session.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _spawn(args: List[str], log_path: str) -> subprocess.Popen:
+def _spawn(args: list[str], log_path: str) -> subprocess.Popen:
     kwargs = {}
     if not _IS_WINDOWS:
         # Own process group, so close() can signal the whole tree with killpg.
@@ -248,7 +256,7 @@ def _spawn(args: List[str], log_path: str) -> subprocess.Popen:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=log_file,
-            **kwargs
+            **kwargs,
         )
 
 
@@ -279,14 +287,14 @@ def _early_exit_message(session: BrowserSession, code: int) -> str:
     return message + _log_tail_suffix(session.log_path)
 
 
-def _log_tail_suffix(log_path: Optional[str]) -> str:
+def _log_tail_suffix(log_path: str | None) -> str:
     lines = _read_log_tail(log_path)
     if not lines:
         return ""
     return "\nLast %d line(s) of %s:\n%s" % (len(lines), log_path, "\n".join(lines))
 
 
-def _read_log_tail(log_path: Optional[str], count: int = LOG_TAIL_LINES) -> List[str]:
+def _read_log_tail(log_path: str | None, count: int = LOG_TAIL_LINES) -> list[str]:
     if not log_path:
         return []
     try:
@@ -299,7 +307,7 @@ def _read_log_tail(log_path: Optional[str], count: int = LOG_TAIL_LINES) -> List
 
 
 def _stop_process_tree(
-    process: subprocess.Popen, job: Optional[int] = None, headless: bool = False
+    process: subprocess.Popen, job: int | None = None, headless: bool = False
 ) -> None:
     pid = process.pid
     if _IS_WINDOWS:
@@ -308,7 +316,7 @@ def _stop_process_tree(
             # meaningless: windowless renderer/GPU processes always make it
             # non-zero. Popen.wait returns as soon as the parent exits.
             _run_taskkill(pid, force=False)
-            _wait_quietly(process, TERMINATE_GRACE_SECONDS)
+            _wait_quietly(process, GRACEFUL_TASKKILL_GRACE_SECONDS)
         # Headless Chrome has no window to close, so it goes straight to the kill.
         # Unconditional: kills every process left in the tree, orphans included.
         job_killed = job is not None and _close_job(job, terminate=True)
@@ -330,6 +338,39 @@ def _stop_process_tree(
         if not _signal_group(pid, _SIGKILL) and process.poll() is None:
             _kill_quietly(process)
     _wait_quietly(process, TERMINATE_GRACE_SECONDS)
+
+
+# EmuniumError covers every bridge failure; OSError/RuntimeError a closing socket
+# or event loop. Anything else is a bug and must not be hidden.
+_CLOSE_TABS_ERRORS = (EmuniumError, OSError, RuntimeError)
+
+
+def _close_all_tabs(bridge: Any, budget: float) -> None:
+    """Best effort: ``closeTab`` every listed tab within *budget* seconds overall.
+
+    Bridge errors are expected and ignored: the reply to the last ``closeTab``
+    usually never arrives because Chrome exits with its last window.
+    """
+    if bridge is None or not getattr(bridge, "connected", False):
+        return
+    deadline = time.monotonic() + budget
+    try:
+        tabs = bridge.list_tabs(timeout=budget)
+    except _CLOSE_TABS_ERRORS as exc:
+        logger.debug("listTabs before close failed: %s", exc)
+        return
+    for tab in tabs if isinstance(tabs, list) else ():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.debug("Tab close budget of %.1f s spent", budget)
+            return
+        tab_id = tab.get("tabId") if isinstance(tab, dict) else None
+        if not isinstance(tab_id, int) or isinstance(tab_id, bool):
+            continue
+        try:
+            bridge.close_tab(tab_id, timeout=remaining)
+        except _CLOSE_TABS_ERRORS as exc:
+            logger.debug("closeTab(%s) before close failed: %s", tab_id, exc)
 
 
 # -- Windows Job Object ----------------------------------------------------------
@@ -472,7 +513,7 @@ def _job_api() -> Any:
     return _JOB_API
 
 
-def _attach_job(process: subprocess.Popen) -> Optional[int]:
+def _attach_job(process: subprocess.Popen) -> int | None:
     try:
         api = _job_api()
         job = api.create_kill_on_close_job()
@@ -483,7 +524,9 @@ def _attach_job(process: subprocess.Popen) -> Optional[int]:
         api.assign(job, process)
     except Exception as exc:
         # e.g. already inside a job that forbids nesting (pre-Windows 8 hosts).
-        logger.debug("AssignProcessToJobObject failed, falling back to taskkill: %s", exc)
+        logger.debug(
+            "AssignProcessToJobObject failed, falling back to taskkill: %s", exc
+        )
         _close_job(job, terminate=False)
         return None
     return job
