@@ -143,6 +143,29 @@ observe; they are listed first.
 - `Browser.expect_navigation(url=None, *, timeout=30.0, wait_until="load")`
   context manager: on exit, waits until the URL changes (and matches `url`
   when given) and the page has loaded; `.value` is the new `PageInfo`.
+- Live locators: `Browser.locator(selector)` (`css=`, `xpath=`, `text=`, bare
+  `//` / `(//` XPath, else CSS), `get_by_role(role, *, name=None,
+  exact=False)`, `get_by_label`, `get_by_placeholder`, `get_by_test_id` and
+  `Browser.test_id_attribute` (default `data-testid`) return an immutable
+  `ElementLocator` that queries the page again on every call. Refine with
+  `nth`, `first`, `last` and `filter(has_text=..., visible=...)`; resolve with
+  `element`, `all`, `count`, `exists`, `is_visible` and `wait_for`; act with
+  `click`, `double_click`, `right_click`, `hover`, `type`, `drag_to` and
+  `scroll_into_view` after waiting for the actionable state. A click, hover or
+  scroll whose element went stale before any button or key event is retried
+  once. Role, label, placeholder and test-id locators compile to XPath (case
+  folding for ASCII and Cyrillic U+0400-U+042F); the extension is unchanged.
+  `Browser.get_by_text` still returns a list of elements.
+- `expect(locator)` / `expect(browser)` assertions: `to_be_visible`,
+  `to_be_hidden`, `to_be_attached`, `to_be_detached`, `to_have_text`,
+  `to_contain_text`, `to_have_attribute`, `to_have_count`, `to_have_url`,
+  `to_have_title`, each negated with `.not_`. They retry until the condition
+  holds or the timeout (5 s) runs out, then raise `ExpectationError`. Text and
+  title assertions are case-sensitive (`ignore_case=True` to fold); text read
+  from a 500-character-capped `Element.text` that cannot be fully compared
+  never passes. Navigations during a locator wait or an assertion are retried
+  within the same deadline. `ElementLocator` and `expect` are exported from
+  `emunium`.
 
 ### Changed
 

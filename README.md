@@ -32,6 +32,7 @@ matching and OCR.
 - [Navigation](#navigation)
 - [Waiting](#waiting)
 - [Element API](#element-api)
+- [Locators](#locators)
 - [Mouse and keyboard](#mouse-and-keyboard)
 - [Human-like input](#human-like-input)
 - [Tabs](#tabs)
@@ -413,6 +414,162 @@ element.refresh(requery=True)
   the query that produced it (same selector and index). With `requery=False`, or
   when the query no longer finds an element of the same tag, `StaleElementError`
   is raised.
+
+---
+
+## Locators
+
+An `ElementLocator` describes how to find an element instead of holding one.
+It is immutable, and every call queries the page again, so it never goes stale.
+
+```python
+import re
+
+from emunium import Browser, expect
+
+with Browser() as browser:
+    browser.goto("https://example.com/login")
+
+    browser.get_by_label("Email").type("me@example.com")
+    browser.get_by_placeholder("Password").type("secret")
+    browser.get_by_role("button", name="Sign in").click()
+
+    expect(browser).to_have_url("*/dashboard")
+    expect(browser.get_by_role("heading", name="Welcome")).to_be_visible()
+    expect(browser.locator("li.message")).to_have_count(3)
+    expect(browser.get_by_test_id("status")).to_have_text(re.compile(r"\d+ new"))
+    expect(browser.locator("#spinner")).not_.to_be_visible()
+```
+
+Building locators:
+
+```python
+browser.locator("button.save")         # CSS ("css=..." works too)
+browser.locator("//table//tr")          # XPath: "//", "(//" or "xpath=..."
+browser.locator("text=Sign in")         # deepest elements containing the text
+browser.get_by_role("button", name="Save", exact=False)
+browser.get_by_label("Email address", exact=False)
+browser.get_by_placeholder("Search", exact=False)
+browser.get_by_test_id("submit")        # data-testid
+Browser.test_id_attribute = "data-qa"   # or set it on one browser instance
+```
+
+- Roles are the implicit roles of `PageParser` (`button`, `link`, `heading`,
+  `textbox`, `checkbox`, `radio`, `listitem`, `img`, `navigation`) plus any
+  element with a matching `role="..."` attribute. An explicit role does not
+  override the implicit one: `<button role="tab">` matches both
+  `get_by_role("button")` and `get_by_role("tab")`.
+- `name` matches when any one of these sources matches (they are OR'ed, not
+  computed as one accessible name): the element's text content, `aria-label`,
+  `title`, `alt`, the `value` of input buttons, or the text of a `<label>`
+  that names it (`<label for="id">` or a label around it).
+- This is simpler than Playwright, which computes a single accessible name
+  (ARIA name computation, `aria-labelledby`, explicit roles first) and matches
+  only that; here a button whose `title` contains "Save" matches
+  `name="Save"` even when its text says something else.
+- `exact=False` (the default) is a case-insensitive substring match.
+  `exact=True` is whole-string equality after collapsing whitespace.
+- Case folding maps ASCII `A-Z` and the Cyrillic capitals U+0400-U+042F
+  (`Ѐ`-`Џ` and `А`-`Я`: Ё, Є, І, Ї, Ў, Ђ, ...) to their lower-case forms.
+  Other letters are compared as they are: `Ґ`, Greek, Latin with diacritics
+  (`É`) are case-sensitive.
+- `get_by_label` finds `input`, `select`, `textarea` and `contenteditable`
+  elements named by a label, plus elements whose `aria-label` matches.
+- Role, label, placeholder and test-id locators are compiled to XPath in
+  Python; the extension is unchanged.
+
+Refining and resolving:
+
+```python
+rows = browser.locator("tr").filter(has_text="paid", visible=True)
+rows.first, rows.last, rows.nth(2)     # new locators, nothing is queried yet
+
+rows.element(timeout=10)               # waits for presence, returns an Element
+rows.all()                             # list[Element], no wait
+rows.count(), rows.exists(), rows.is_visible()   # no wait
+rows.wait_for("visible")               # also "attached", "hidden", "detached"
+rows.first.text()                      # waits for presence
+rows.first.get_attribute("data-id")
+```
+
+- Refinements apply in the order they are chained: `filter(...).nth(1)` is the
+  second match that has the text; `nth(1).filter(...)` is the second match,
+  only if it has the text.
+- On XPath-based locators `has_text` and `nth` become part of the XPath, so
+  waits run inside the page. On CSS and `text=` locators, and for `visible`
+  (which XPath cannot express), refinements run in Python on the matched
+  elements (`Element.text`, `Element.visible`) and waits poll every 100 ms.
+- `has_text` therefore reads different text per locator kind: on XPath-based
+  locators the element's full string value (`textContent`, hidden text
+  included); on CSS and `text=` locators `Element.text`, the rendered text,
+  which the extension cuts at 500 characters. Known limitation: on CSS and
+  `text=` locators, a longer text whose first 500 characters lack the needle
+  does not match.
+- `.last` is decided at the time of each call.
+- A call uses one deadline for everything it waits for, retries included. A
+  navigation or document swap during a wait (`ContentUnavailableError`, a
+  stale element, a bridge timeout before the deadline) is retried with the
+  time left; a wait that times out raises `WaitTimeoutError` naming the
+  locator.
+
+Actions wait for the element first (clickable for clicks, visible for hover,
+typing and dragging) and then act through `Element`:
+
+```python
+browser.get_by_role("button", name="Save").click()
+browser.locator("#menu").hover()
+browser.get_by_label("Name").type("Ada", characters_per_minute=300)
+browser.locator(".card").first.drag_to(browser.locator("#trash"))
+browser.locator("footer").scroll_into_view()
+```
+
+If the element goes stale (the page re-rendered it) before any mouse button
+or key was pressed, a click, hover or scroll is retried once with a freshly
+found element. `type` and `drag_to` are never retried: they press the button
+before their later steps can fail, and a second attempt would type or drop
+twice.
+
+### Assertions
+
+`expect(locator)` and `expect(browser)` retry until the condition holds or the
+timeout (default 5 s) runs out, then raise `ExpectationError` (an
+`AssertionError`) with the expected value, the last actual value and the
+locator. `.not_` negates any assertion. A navigation while an assertion waits
+is retried with the time left; running out of time is always an
+`ExpectationError`, chained from the last navigation error if there was one.
+
+```python
+expect(locator, timeout=5.0).to_be_visible()      # .to_be_hidden()
+expect(locator).to_be_attached()                   # .to_be_detached()
+expect(locator).to_have_text("Saved")              # whole text, whitespace collapsed
+expect(locator).to_have_text("saved", ignore_case=True)
+expect(locator).to_have_text("Saved", exact=True)  # whole text exactly as rendered
+expect(locator).to_have_text(re.compile(r"^\d+ items$"))   # re.search
+expect(locator).to_contain_text("Sav")             # substring
+expect(locator).to_contain_text("sav", ignore_case=True)
+expect(locator).to_have_attribute("aria-busy", "false")    # or just the name
+expect(locator).to_have_count(3)
+expect(browser).to_have_url("*/checkout")          # glob, re.Pattern or callable
+expect(browser).to_have_title("Checkout")          # or a re.Pattern; ignore_case=
+```
+
+- `to_have_text`, `to_contain_text` and `to_have_title` are case-sensitive;
+  `ignore_case=True` compares with `str.casefold()` (a pattern gets
+  `re.IGNORECASE`). `to_contain_text(..., ignore_case=True)` polls, because
+  the in-page `text_contains` wait is case-sensitive.
+- `to_have_text` collapses whitespace on both sides; `exact=True` compares the
+  rendered text as it is, which is brittle: the whitespace of rendered text
+  depends on layout.
+- Text assertions read `Element.text`, which the extension cuts at 500
+  characters. On a text that long only the first 500 characters are known:
+  `to_contain_text` passes when the substring is found there and
+  `not_.to_contain_text` fails then; otherwise the result is unknown and
+  neither passes. `to_have_text` never passes on such a text, plain or
+  negated. The failure message says the text was truncated.
+- `emunium.expect` is the function. To import the module itself (for
+  `LocatorAssertions`, `PageAssertions`), use
+  `importlib.import_module("emunium.expect")` or
+  `from emunium.expect import LocatorAssertions`.
 
 ---
 

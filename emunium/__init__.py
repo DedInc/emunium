@@ -10,6 +10,7 @@ from emunium import _screen
 
 _screen.ensure_dpi_awareness()
 
+from emunium._browser.locators import ElementLocator
 from emunium._motion import (
     BezierTremorPlanner,
     FittsTiming,
@@ -52,6 +53,7 @@ from emunium.errors import (
     TargetClosedError,
     WaitTimeoutError,
 )
+from emunium.expect import expect
 from emunium.locator import Locator, PageParser
 from emunium.results import NetworkResponse, PageInfo, Point, Record, TabInfo
 from emunium.standalone import Emunium
@@ -73,6 +75,7 @@ __all__ = [
     "ContentUnavailableError",
     "CoordsStore",
     "Element",
+    "ElementLocator",
     "ElementNotFoundError",
     "ElementRecord",
     "Emunium",
@@ -107,4 +110,5 @@ __all__ = [
     "WaitTimeoutError",
     "WindMousePlanner",
     "ensure_chrome",
+    "expect",
 ]

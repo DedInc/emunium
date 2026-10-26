@@ -12,10 +12,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from emunium._browser import dom, page
+from emunium._browser import dom, locators, page
 from emunium._browser import tabs as tab_ops
 from emunium._browser.context import BrowserContext
 from emunium._browser.launcher import BrowserSession, close, launch
+from emunium._browser.locators import ElementLocator
 from emunium._browser.page import (
     NavigationExpectation,
     ResponseExpectation,
@@ -38,6 +39,9 @@ _CLICK_TYPES = (ClickType.LEFT, ClickType.DOUBLE, ClickType.RIGHT, ClickType.MID
 
 
 class Browser:
+    # Attribute get_by_test_id matches; override on the class or an instance.
+    test_id_attribute: str = "data-testid"
+
     def __init__(
         self,
         headless: bool = False,
@@ -175,6 +179,36 @@ class Browser:
 
     def get_all_interactive(self) -> list[Element]:
         return dom.get_all_interactive(self._ctx)
+
+    # -- live locators --------------------------------------------------------
+
+    def locator(self, selector: str) -> ElementLocator:
+        """Lazy locator: ``css=``/``xpath=``/``text=`` prefix, a bare ``//`` or
+        ``(//`` XPath, else CSS. Every call on it queries the page again."""
+        return locators.locator(self._ctx, selector)
+
+    def get_by_role(
+        self, role: str, *, name: str | None = None, exact: bool = False
+    ) -> ElementLocator:
+        """Elements with ``role`` (implicit or ``role=``), optionally with an
+        accessible name matching ``name`` (substring, case-insensitive unless
+        ``exact``)."""
+        return locators.get_by_role(self._ctx, role, name=name, exact=exact)
+
+    def get_by_label(self, text: str, *, exact: bool = False) -> ElementLocator:
+        """Form controls named by a ``<label>`` matching ``text``, and elements
+        whose ``aria-label`` matches it."""
+        return locators.get_by_label(self._ctx, text, exact=exact)
+
+    def get_by_placeholder(self, text: str, *, exact: bool = False) -> ElementLocator:
+        """Elements whose ``placeholder`` matches ``text``."""
+        return locators.get_by_placeholder(self._ctx, text, exact=exact)
+
+    def get_by_test_id(self, test_id: str) -> ElementLocator:
+        """Elements whose ``test_id_attribute`` (``data-testid``) equals ``test_id``."""
+        return locators.get_by_test_id(
+            self._ctx, test_id, attribute=self.test_id_attribute
+        )
 
     def _resolve_element(
         self, target: str | Element, *, timeout: float = 10.0

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>E2E Locators</title>
+  <style>
+    .gone { display: none; }
+  </style>
+</head>
+<body>
+  <h1 id="heading">Locators</h1>
+  <nav id="main-nav" aria-label="Main menu"><a id="link-a" href="#alpha">Alpha link</a></nav>
+
+  <section id="buttons">
+    <button id="save">Save</button>
+    <button id="save-all" title="Save everything">All</button>
+    <input id="submit-input" type="submit" value="Send it">
+    <div id="div-button" role="button">Custom action</div>
+    <button id="quote-button">Don't say "never"</button>
+    <button id="cyr-button">СОХРАНИТЬ файл</button>
+    <button id="disabled-button" disabled>Disabled one</button>
+    <img id="logo" alt="Company logo" width="16" height="16"
+         src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'/%3E">
+  </section>
+
+  <form id="form" onsubmit="return false">
+    <label for="email">Email address</label>
+    <input id="email" type="email" placeholder="you@example.com">
+    <label id="name-label">Full name <input id="full-name" type="text" placeholder="Иван Петров"></label>
+    <textarea id="notes" aria-label="Notes"></textarea>
+    <label for="country">Country</label>
+    <select id="country"><option>France</option></select>
+    <div id="editor" contenteditable="true" aria-label="Rich editor"></div>
+  </form>
+
+  <button id="test-id" data-testid="primary-action">Primary</button>
+  <span id="qa" data-qa="qa-node">QA node</span>
+
+  <ul id="list">
+    <li>One</li>
+    <li>Two</li>
+    <li>Three</li>
+  </ul>
+
+  <p id="hidden-p" class="gone">Hidden paragraph</p>
+  <p id="status" data-state="idle">Status:   idle</p>
+  <script>
+    // The navigation tests load this page again with ?next=...; only that
+    // document has the #arrived heading.
+    if (new URLSearchParams(location.search).has("next")) {
+      const heading = document.createElement("h2");
+      heading.id = "arrived";
+      heading.textContent = "Arrived";
+      document.body.appendChild(heading);
+    }
+  </script>
+</body>
+</html>
