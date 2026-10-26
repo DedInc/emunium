@@ -44,7 +44,11 @@ INNER_FRACTION = (0.3, 0.7)
 SAMPLE_TOLERANCE_DIP = 1.0
 MAX_CORRECTIONS = 2
 # Net-zero cursor jiggle that makes the page emit a fresh event at the point.
+# Smallest step; the real step is one CSS px rounded up to whole input px.
 JIGGLE_PX = 1
+# Float noise allowed when rounding the input-px-per-CSS-px scale up (dpr / zoom
+# * zoom need not be exactly dpr).
+JIGGLE_SCALE_EPSILON = 1e-6
 # Pause between the jiggle step and the move back (more than two 60 Hz frames):
 # back-to-back moves are coalesced by the OS and Chrome into no event at all.
 JIGGLE_SETTLE_S = 0.035
@@ -153,6 +157,12 @@ def _axis_point(
         return low + fraction * (high - low)
     value = origin + offset
     return value if low <= value < high else None
+
+
+def _jiggle_size(geometry: Geometry) -> int:
+    """Input px per jiggle: one CSS px (``input_per_dip * zoom``) rounded up."""
+    per_css = input_per_dip(geometry) * geometry.zoom
+    return max(JIGGLE_PX, math.ceil(per_css - JIGGLE_SCALE_EPSILON))
 
 
 class Element:
@@ -532,24 +542,27 @@ class Element:
         return self._verify(anchor, deadline)
 
     def _jiggle_step(self, x: int, y: int, anchor: _Anchor) -> int:
-        """+1 or -1 px: on the screen, off screen corners, inside the element.
+        """Signed jiggle step: on the screen, off screen corners, inside the element.
 
-        +1 is preferred. A step that would leave the element's visible part is
-        avoided; with an explicit x offset it is refused outright.
+        The step is one CSS px rounded up to whole input px, so the page sees a
+        move even where a 1 input px step stays inside one DIP (Chrome then
+        emits no event). Candidates in order: +size, -size, then +1, -1 px. A
+        step that would leave the element's visible part is avoided; with an
+        explicit x offset it is refused outright.
         """
+        size = _jiggle_size(self._require_geometry())
+        candidates = list(dict.fromkeys((size, -size, JIGGLE_PX, -JIGGLE_PX)))
         interactor = self._ctx.interactor
-        landable = [
-            step for step in (JIGGLE_PX, -JIGGLE_PX) if interactor.can_land(x + step, y)
-        ]
+        landable = [step for step in candidates if interactor.can_land(x + step, y)]
         inside = [step for step in landable if self._step_stays_inside(anchor, step)]
         if inside:
             return inside[0]
         if landable and anchor.offset_x is None:
             return landable[0]
         raise NativeInputError(
-            f"no safe 1 px jiggle around Input({x}, {y}) for element "
-            f"{self._element_id!r}: each neighbour is off-screen, a screen corner "
-            "or outside the requested point's element"
+            f"no safe jiggle (±{size} or ±{JIGGLE_PX} px) around Input({x}, {y}) "
+            f"for element {self._element_id!r}: each neighbour is off-screen, a "
+            "screen corner or outside the requested point's element"
         )
 
     def _step_stays_inside(self, anchor: _Anchor, step: int) -> bool:
@@ -566,7 +579,8 @@ class Element:
     ) -> tuple[int, int]:
         """Prove the cursor is over this element; correct at most twice.
 
-        Each round takes ``since`` and then jiggles the cursor 1 px and back, so
+        Each round takes ``since`` and then jiggles the cursor by at least one
+        CSS px (``_jiggle_step``) and back, so
         only an event produced at the final position can be accepted. The two
         moves are ``JIGGLE_SETTLE_S`` apart: sent back to back, the OS and
         Chrome coalesce them into a net-zero move that produces no event. With

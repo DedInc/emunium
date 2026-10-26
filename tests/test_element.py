@@ -10,16 +10,19 @@ fake interactor asserts that ``NATIVE_INPUT_LOCK`` is held for every event.
 from __future__ import annotations
 
 import gc
+import math
 import random
 import subprocess
 import sys
 import threading
 import weakref
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
+from emunium import _screen as screen_module
 from emunium import element as element_module
 from emunium._bridge.facade import Bridge
 from emunium._bridge.transport import PINNED, Reply
@@ -55,6 +58,8 @@ GEOMETRY: dict[str, Any] = {
     "innerHeight": 700,
     "devicePixelRatio": 1.0,
 }
+# Largest horizontal non-human step the fake interactor logs as a jiggle.
+MAX_JIGGLE_PX = 3
 OK_FOCUS = {"documentHasFocus": True, "activeIsElement": True}
 LOST_FOCUS = {"documentHasFocus": True, "activeIsElement": False}
 
@@ -124,6 +129,9 @@ class World:
         # Like the OS and Chrome: two jiggle moves with no pause between them
         # merge into a net-zero move, so the probe sees no fresh event.
         self.coalesce = False
+        # Like Chrome at a fractional scale: a jiggle that stays inside one CSS
+        # px column produces no pointer event.
+        self.css_px_events = False
 
     def deliver_typed(self) -> None:
         if not self.typed_queue:
@@ -229,9 +237,10 @@ class FakeInteractor:
         failure = self.world.move_failures.get(target)
         if failure is not None:
             raise failure
-        if not human and target in (
-            (current[0] + 1, current[1]),
-            (current[0] - 1, current[1]),
+        if (
+            not human
+            and target[1] == current[1]
+            and 0 < abs(target[0] - current[0]) <= MAX_JIGGLE_PX
         ):
             kind, self._jiggle_from = "jiggle", current
         elif not human and target == self._jiggle_from:
@@ -322,6 +331,10 @@ class FakeBridge(Bridge):
             "jiggle",
             "jiggle",
         ]
+        if world.css_px_events:
+            out, back = [e[1] for e in world.kinds("jiggle")][-2:]
+            out_column = math.floor(world.client_point(out)[0])
+            merged = merged or out_column == math.floor(world.client_point(back)[0])
         world.probe_budgets.append((timeout, params["waitMs"]))
         world.clock += world.probe_cost
         result: dict[str, Any] = {
@@ -838,6 +851,76 @@ def test_no_safe_jiggle_at_an_explicit_edge_is_refused(world: World) -> None:
     with pytest.raises(NativeInputError, match="jiggle"):
         handle(ctx).click(offset_x=99.6, offset_y=4)
     assert world.presses() == [] and world.probes == []
+
+
+def _scale(
+    world: World, monkeypatch: pytest.MonkeyPatch, dpr: float, zoom: float
+) -> float:
+    """Set the page scale (physical input px, as on Windows); return input px per CSS px."""
+    monkeypatch.setattr(screen_module, "_platform", lambda: "win32")
+    # outer == inner * zoom: no border, origin (0, outerHeight - innerHeight * zoom).
+    world.geometry.update(
+        devicePixelRatio=dpr,
+        outerWidth=1200,
+        innerWidth=1200 / zoom,
+        outerHeight=900,
+        innerHeight=600 / zoom,
+    )
+    world.zoom = world.scroll_zoom = zoom
+    return input_per_dip(world.live()) * zoom
+
+
+def _column_offset(column: int, per_css: float) -> float:
+    """CSS x offset into doc1.1 (x = 100) that puts the cursor on ``column``."""
+    return (column + 0.25) / per_css - 100
+
+
+@pytest.mark.parametrize(
+    ("dpr", "zoom", "size"),
+    [(1.0, 1.0, 1), (1.5, 1.0, 2), (2.0, 1.0, 2), (1.5, 1.5, 2)],
+)
+def test_jiggle_crosses_a_css_px_at_every_column(
+    world: World, monkeypatch: pytest.MonkeyPatch, dpr: float, zoom: float, size: int
+) -> None:
+    per_css = _scale(world, monkeypatch, dpr, zoom)
+    world.css_px_events = True  # a jiggle inside one CSS px column is not seen
+    ctx = make_ctx(world)
+    first = 6 * int(150 * per_css // 6)  # a column at CSS x = 100 + ~50
+    columns = [first, first + 1, first + 2]  # every residue of 1.5 and 2
+    for column in columns:
+        handle(ctx).click(offset_x=_column_offset(column, per_css), offset_y=10)
+
+    pressed = [entry[3] for entry in world.presses()]
+    assert [x for x, _ in pressed] == columns and len(world.probes) == 3
+    expected: list[tuple[int, int]] = []
+    for x, y in pressed:
+        expected += [(x + size, y), (x, y)]
+    assert jiggles(world) == expected
+
+
+def test_large_jiggle_steps_left_when_right_is_off_screen(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    per_css = _scale(world, monkeypatch, 1.5, 1.0)
+    column = 225
+    world.virtual_screen = (0, 0, column + 2, 1080)  # column + 2 is off every monitor
+    ctx = make_ctx(world)
+    handle(ctx).click(offset_x=_column_offset(column, per_css), offset_y=10)
+
+    (x, y) = world.presses()[-1][3]
+    assert x == column and jiggles(world) == [(column - 2, y), (column, y)]
+
+
+def test_jiggle_falls_back_to_one_px_when_only_that_stays_inside(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scale(world, monkeypatch, 2.0, 1.0)
+    world.add("sliver", 300, 200, 1.5, 6)  # 3 input px wide: +-2 px leave it
+    ctx = make_ctx(world)
+    handle(ctx, "sliver").click(offset_x=0.6, offset_y=3)  # Input x = 601
+
+    (x, y) = world.presses()[-1][3]
+    assert x == 601 and jiggles(world) == [(602, y), (601, y)]
 
 
 class _RawKeys:

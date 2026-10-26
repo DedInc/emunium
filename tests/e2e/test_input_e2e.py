@@ -18,8 +18,9 @@ import math
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -28,7 +29,6 @@ from emunium import (
     ClickType,
     ClickVerificationError,
     Element,
-    NativeInputError,
 )
 
 pytestmark = pytest.mark.e2e
@@ -40,9 +40,6 @@ WINDOW_ARGS = ["--window-position=60,40", "--window-size=900,600"]
 ZOOM_150_LEVEL = math.log(1.5) / math.log(1.2)
 # --force-device-scale-factor=1.5 on a 96 DPI desktop: 1.5 input px per CSS px.
 DSF_INPUT_PER_CSS = 1.5
-# Physical column residue (x % 3) where the 1 px jiggle is seen by Chrome in
-# this window placement (measured: residues 0 and 1 verify, 2 never does).
-DSF_GOOD_RESIDUE = 0
 
 
 def _seed_default_zoom(profile: Path, level: float) -> None:
@@ -54,7 +51,11 @@ def _seed_default_zoom(profile: Path, level: float) -> None:
 
 
 def _launch(
-    make_browser: MakeBrowser, site_url: str, *, extra: list[str] | None = None, **kwargs: Any
+    make_browser: MakeBrowser,
+    site_url: str,
+    *,
+    extra: list[str] | None = None,
+    **kwargs: Any,
 ) -> Browser:
     browser = make_browser(extra_args=[*WINDOW_ARGS, *(extra or [])], **kwargs)
     browser.goto(site_url + "/input.html")
@@ -205,12 +206,8 @@ def test_click_lands_on_target(
         expected_dpr, abs=0.01
     )
 
-    if config == "dsf150":
-        # Pinned to a column where the 1 px verification jiggle crosses a DIP
-        # boundary; random columns hit the defect pinned by the xfail below.
-        button.click(human=True, **_dsf_column_offsets(button, DSF_GOOD_RESIDUE))
-    else:
-        browser.click(button, human=True)
+    # Random click points: at DSF 1.5 any physical column must verify.
+    browser.click(button, human=True)
 
     state = _state(browser)
     assert state["clicks"] == 1
@@ -226,27 +223,10 @@ def test_click_lands_on_target(
     assert rect["top"] <= last["clientY"] <= rect["bottom"]
 
     # A second, direct (non-human) click lands too, now on the calibrated mapping.
-    if config == "dsf150":
-        button.refresh()
-        button.click(human=False, **_dsf_column_offsets(button, DSF_GOOD_RESIDUE))
-    else:
-        browser.click("#btn", human=False)
+    browser.click("#btn", human=False)
     assert _state(browser)["clicks"] == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=NativeInputError,
-    reason=(
-        "product defect: with --force-device-scale-factor=1.5 a verified click "
-        "whose human approach ends at a physical column x % 3 == 2 raises "
-        "NativeInputError 'no fresh pointer event' without pressing, although the "
-        "cursor is on the target: the page logged no pointermove for the last "
-        "approach step nor for Element._verify's fixed JIGGLE_PX = 1 jiggle "
-        "(1 px = 0.67 DIP), so random click points fail about 1 in 3 at DSF 1.5 "
-        "(measured 9/9 failures at x % 3 == 2, 0 at the other columns)"
-    ),
-)
 def test_dsf150_click_verifies_at_every_pixel_column(
     make_browser: MakeBrowser, site_url: str
 ) -> None:
@@ -285,17 +265,18 @@ def test_typing_ascii_cyrillic_and_emoji(headed: Browser) -> None:
     text = "Hello, world 123 Привет, мир Ёж 👋🚀"
 
     field = headed.type("#field", text, human=False)
-    assert headed.execute_script(
-        "return document.getElementById('field').value"
-    ) == text
+    assert (
+        headed.execute_script("return document.getElementById('field').value") == text
+    )
 
     # Element.type with a human rhythm; it settles before returning. The field
     # is emptied first: its own click places the caret wherever it lands.
     headed.execute_script("document.getElementById('field').value = ''")
     field.type("Ёж ok ✓ 🙂", human=True, characters_per_minute=1200, offset=5)
-    assert headed.execute_script(
-        "return document.getElementById('field').value"
-    ) == "Ёж ok ✓ 🙂"
+    assert (
+        headed.execute_script("return document.getElementById('field').value")
+        == "Ёж ok ✓ 🙂"
+    )
 
 
 def test_drag_and_drop(headed: Browser) -> None:
@@ -314,9 +295,12 @@ def test_hover(headed: Browser) -> None:
     state = _state(headed)
     assert state["enters"] >= 1
     assert state["mousedowns"] == 0
-    assert headed.execute_script(
-        "return document.getElementById('hover-target').matches(':hover')"
-    ) is True
+    assert (
+        headed.execute_script(
+            "return document.getElementById('hover-target').matches(':hover')"
+        )
+        is True
+    )
 
 
 def test_click_on_covered_element_raises_without_press(headed: Browser) -> None:
