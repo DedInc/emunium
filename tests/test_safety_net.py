@@ -7,16 +7,19 @@ it, so a missing trap fails the assertion instead of reaching the desktop.
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import sys
+from collections.abc import Sequence
 from types import ModuleType
-from typing import Sequence
+from typing import Any
 
 import pytest
 from conftest import (
-    CTYPES_TRAPS,
     MODULE_TRAPS,
     PYAUTOGUI_PLATFORM_TRAPS,
     REAL_INPUT_MESSAGE,
+    USER32_TRAPS,
+    XLIB_TRAPS,
     SafetyNet,
 )
 
@@ -25,6 +28,7 @@ from emunium._element_interactor import (
     WindowsKeyboardSender,
     keyboard_events,
 )
+from emunium._native import x11
 
 # SECURITY_MANDATORY_MEDIUM_RID: a non-elevated process's integrity level.
 _MEDIUM_INTEGRITY = 0x2000
@@ -115,13 +119,84 @@ def test_humancursor_system_cursor_trapped(net):
 def test_ctypes_user32_input_functions_trapped(net):
     private = ctypes.WinDLL("user32", use_last_error=True)
     shared = ctypes.windll.user32
-    names = sorted(CTYPES_TRAPS)
+    names = sorted(USER32_TRAPS)
     _assert_trapped(net, private, names)
     _assert_trapped(net, shared, names)
     for name in names:
         assert net.is_trap(private[name])
     # Read-only user32 calls stay real.
     assert not net.is_trap(private.GetAsyncKeyState)
+
+
+def _c_library() -> ctypes.CDLL:
+    """A private ctypes handle that loads on every platform (the C runtime)."""
+    return ctypes.CDLL("msvcrt" if sys.platform == "win32" else None)
+
+
+def test_ctypes_xlib_input_functions_trapped(net):
+    # Trapped by name on any library object, so this runs without libXtst too:
+    # the C runtime has no such exports, a missing trap fails the lookup.
+    library = _c_library()
+    names = sorted(XLIB_TRAPS)
+    assert {
+        "XTestFakeMotionEvent",
+        "XTestFakeButtonEvent",
+        "XTestFakeKeyEvent",
+        "XChangeKeyboardMapping",
+    } <= set(names)
+    _assert_trapped(net, library, names)
+    for name in names:
+        assert net.is_trap(library[name])
+    assert not net.is_trap(library.strlen)
+
+
+class _FakeFunction:
+    """A foreign function that returns ``result``; prototypes are accepted."""
+
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.argtypes: Any = None
+        self.restype: Any = None
+
+    def __call__(self, *args: Any) -> int:
+        return self.result
+
+
+class _SetupFakedLibrary:
+    """Fakes for the connection setup calls; every other export is ``real``'s."""
+
+    def __init__(self, real: ctypes.CDLL, fakes: dict[str, _FakeFunction]) -> None:
+        self._real = real
+        self._fakes = fakes
+
+    def __getitem__(self, name: str, /) -> Any:
+        fake = self._fakes.get(name)
+        return self._real[name] if fake is None else fake
+
+
+def test_xlib_input_calls_hit_the_ctypes_traps(net):
+    # Xlib's own lookup path through a real ctypes library. The C runtime has
+    # no XTest exports, so without a trap the lookup fails; nothing is sent.
+    setup = {
+        "XInitThreads": 1,
+        "XOpenDisplay": 0x1000,
+        "XTestQueryExtension": 1,
+        "XDefaultScreen": 0,
+        "XRootWindow": 0x200,
+    }
+    library = _SetupFakedLibrary(
+        _c_library(), {name: _FakeFunction(result) for name, result in setup.items()}
+    )
+    xlib = x11.Xlib(x11=library, xtst=library)
+    sends = [
+        lambda: xlib.motion(10, 10),
+        lambda: xlib.button(x11.BUTTON_LEFT, press=True),
+        lambda: xlib.key(38, press=True),
+        lambda: xlib.change_mapping(255, [0x61, 0x61]),
+    ]
+    for send in sends:
+        with pytest.raises(RuntimeError, match=REAL_INPUT_MESSAGE):
+            send()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="SendInput is Windows-only")

@@ -31,6 +31,7 @@ from emunium._native import (
     failsafe_enabled,
     in_failsafe_corner,
     win32,
+    x11,
 )
 from emunium._native.win32 import (
     INPUT,
@@ -885,9 +886,27 @@ def test_interactor_releases_in_failsafe_corner() -> None:
 # -- selection -------------------------------------------------------------------
 
 
-def test_native_backend_only_on_windows() -> None:
-    assert _native.native_backend("linux") is None
-    assert _native.native_backend("darwin") is None
+def test_native_backend_none_off_windows_without_a_display() -> None:
+    # An explicit empty environment: the runner's DISPLAY would pick X11.
+    assert _native.native_backend("linux", {}) is None
+    assert _native.native_backend("darwin", {}) is None
+
+
+def test_native_backend_selects_x11_when_display_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[str] = []
+
+    class StubX11Backend:
+        def __init__(self) -> None:
+            built.append("x11")
+
+    # No libX11 or X server needed: only the selection is under test.
+    monkeypatch.setattr(x11, "X11Backend", StubX11Backend)
+    assert isinstance(
+        _native.native_backend("linux", {"DISPLAY": ":0"}), StubX11Backend
+    )
+    assert built == ["x11"]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="user32 is Windows-only")

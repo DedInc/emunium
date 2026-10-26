@@ -1763,7 +1763,13 @@ def _window_steps(world: World) -> list[str]:
 
 
 @pytest.fixture
-def desktop(world: World) -> FakeWindows:
+def desktop(world: World, monkeypatch: pytest.MonkeyPatch) -> FakeWindows:
+    """The fake desktop, with the context treating the host as Windows.
+
+    Foreground management only runs on Windows (``manages_foreground``); every
+    window call goes to this fake, so the tests run on any OS.
+    """
+    monkeypatch.setattr(context_module, "_on_windows", lambda: True)
     return FakeWindows(world)
 
 

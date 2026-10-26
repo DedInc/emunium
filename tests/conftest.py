@@ -17,9 +17,10 @@ import ctypes
 import importlib.abc
 import os
 import sys
+from collections.abc import Callable, Iterator, Sequence
 from importlib.machinery import ModuleSpec
 from types import ModuleType
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any
 
 import pytest
 
@@ -125,8 +126,21 @@ MODULE_TRAPS: dict[str, tuple[str, ...]] = {
     "humancursor": ("SystemCursor",),
     "humancursor.system_cursor": ("SystemCursor",),
 }
-# user32 exports that inject input, trapped on every ctypes library object.
-CTYPES_TRAPS = frozenset({"SendInput", "SetCursorPos", "mouse_event", "keybd_event"})
+# user32 exports that inject input.
+USER32_TRAPS = frozenset({"SendInput", "SetCursorPos", "mouse_event", "keybd_event"})
+# libXtst exports that inject input, and the libX11 call that rewrites the
+# server's keyboard mapping (emunium._native.x11 types missing characters on a
+# temporarily remapped keycode).
+XLIB_TRAPS = frozenset(
+    {
+        "XTestFakeMotionEvent",
+        "XTestFakeButtonEvent",
+        "XTestFakeKeyEvent",
+        "XChangeKeyboardMapping",
+    }
+)
+# Trapped by name on every ctypes library object, whatever library it loaded.
+CTYPES_TRAPS = USER32_TRAPS | XLIB_TRAPS
 
 # True only while an e2e test runs. A trap that leaked past teardown (a module
 # that bound ``user32.SendInput`` at import inside a unit test) raises unless
@@ -263,7 +277,8 @@ class SafetyNet:
             return InputTrap(label, lambda: real_getitem(library, name))
 
         # Traps are returned uncached so no library object keeps one after
-        # disarm; WinDLL, OleDLL and windll.* all inherit these two methods.
+        # disarm; WinDLL, OleDLL, windll.* and the private libX11/libXtst
+        # handles of emunium._native.x11 all inherit these two methods.
         def trapped_getattr(library: ctypes.CDLL, name: str) -> Any:
             if name in CTYPES_TRAPS:
                 return make_trap(library, name)
