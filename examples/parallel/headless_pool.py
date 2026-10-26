@@ -51,15 +51,21 @@ def read_page(browser: Browser, url: str, timeout: float) -> dict[str, Any]:
     record: dict[str, Any] = {"url": url, "thread": threading.current_thread().name}
     try:
         info = browser.goto(url, timeout=timeout)
+        # Not every page has a heading (example.com has none): check, don't wait.
+        first_heading = browser.get_by_role("heading").first
         try:
-            h1 = browser.locator("h1").text(timeout=5).strip()
+            heading = (
+                first_heading.text(timeout=5).strip()
+                if first_heading.exists()
+                else None
+            )
         except WaitTimeoutError:
-            h1 = None
+            heading = None
         record.update(
             status="ok",
             final_url=info.url,
             title=browser.title,
-            h1=h1,
+            heading=heading,
             links=browser.get_by_role("link").count(),
             error=None,
         )
@@ -123,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     for record in records:
-        detail = record["error"] or f"{record['title']!r} h1={record['h1']!r}"
+        detail = record["error"] or f"{record['title']!r} heading={record['heading']!r}"
         print(f"{record['status']:<7}{record['url']:<45}{detail}")
     done = sum(1 for record in records if record["status"] == "ok")
     print(f"\n{done}/{len(urls)} page(s) read with {threads} headless browser(s)")

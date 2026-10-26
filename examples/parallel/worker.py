@@ -10,7 +10,8 @@ A job file is a JSON list. Each item is a URL string or an object::
     ]
 
 For every job the worker opens the URL, waits for the page to settle, reads
-the title and the first ``h1``, and (unless ``"click": false`` or
+the title and the first heading (``h1``-``h6`` or ``role="heading"``, null
+when the page has none), and (unless ``"click": false`` or
 ``--headless``) clicks the first visible link with a real, verified, human
 mouse movement. A page without a link is reported as a skipped click, not as
 a failure. The result goes to ``RESULTS_DIR/RUN_ID/<job id>.json``.
@@ -257,10 +258,14 @@ def run_job(
     info = browser.goto(job.url, timeout=deadline.left(30), wait_until="load")
     browser.wait_for_idle(silence=0.5, timeout=deadline.left(10))
     result: dict[str, Any] = {"final_url": info.url, "title": browser.title}
+    # Not every page has a heading (example.com has none): check, don't wait.
+    heading = browser.get_by_role("heading").first
     try:
-        result["h1"] = browser.locator("h1").text(timeout=deadline.left(5)).strip()
+        result["heading"] = (
+            heading.text(timeout=deadline.left(5)).strip() if heading.exists() else None
+        )
     except WaitTimeoutError:
-        result["h1"] = None
+        result["heading"] = None
     if not job.click:
         result["click"] = {"status": "skipped", "reason": "click disabled for this job"}
     elif headless:

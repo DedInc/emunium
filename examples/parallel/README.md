@@ -93,7 +93,7 @@ and reported as such).
 ```
 
 For each job `worker.py` opens the URL, waits for the page to settle, reads
-the title and the first `h1`, and clicks the first visible link with a human,
+the title and the first heading (`null` when the page has none), and clicks the first visible link with a human,
 verified mouse movement (skipped for `"click": false`, in headless mode, and
 reported as skipped when the page has no link). Every job gets its own time
 budget (`JOB_TIMEOUT`, default 60 s) that all of its waits share. Each job

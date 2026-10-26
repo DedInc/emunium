@@ -101,12 +101,12 @@ with Browser() as browser:
     info = browser.goto("https://example.com/")
     print(info.url, info.tab_id)  # a result record: the reply dict, plus attributes
 
-    heading = browser.locator("h1")  # a live locator: queried again on every call
-    expect(heading).to_have_text("Example Domain")
-    print(heading.text())
+    expect(browser).to_have_title("Example Domain")  # retries until it holds
+    link = browser.get_by_role("link").first  # a live locator: queried again on every call
+    print(link.text())
 
     with browser.expect_navigation("*iana.org*") as nav:
-        browser.locator("a").first.click()  # a real, verified mouse click
+        link.click()  # a real, verified mouse click
     print(nav.value.title, nav.value.ready_state)
 ```
 
