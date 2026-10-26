@@ -3,30 +3,42 @@
 
   const scope = globalThis.EmuniumContent;
 
-  function querySelector({ selector }) {
-    const element = document.querySelector(selector);
-    if (!element) {
-      return { error: "Element not found", selector };
+  function requireString(value, name) {
+    if (typeof value !== "string" || value === "") {
+      throw scope.codedError("invalid_argument", `'${name}' must be a non-empty string`);
     }
-    return scope.serializeElement(element);
+    return value;
+  }
+
+  // SyntaxError (bad CSS) passes through: handleMessage maps it to invalid_argument.
+  function querySelector({ selector }) {
+    const element = document.querySelector(requireString(selector, "selector"));
+    return element ? scope.serializeElement(element) : null;
   }
 
   function querySelectorAll({ selector }) {
-    return Array.from(document.querySelectorAll(selector)).map(scope.serializeElement);
+    return Array.from(document.querySelectorAll(requireString(selector, "selector")), (element) =>
+      scope.serializeElement(element)
+    );
   }
 
   function queryXPath({ xpath }) {
-    const result = document.evaluate(
-      xpath,
-      document,
-      null,
-      XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
-      null
-    );
+    requireString(xpath, "xpath");
+    let result;
+    try {
+      result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    } catch (error) {
+      // SyntaxError / NamespaceError: malformed; TypeError: not a node-set (e.g. count(//a)).
+      const name = error && error.name;
+      if (name === "SyntaxError" || name === "NamespaceError" || name === "TypeError") {
+        throw scope.codedError("invalid_argument", `invalid XPath: ${error.message}`);
+      }
+      throw error;
+    }
     const matches = [];
     for (let index = 0; index < result.snapshotLength; index += 1) {
       const element = result.snapshotItem(index);
-      if (element?.nodeType === Node.ELEMENT_NODE) {
+      if (element && element.nodeType === Node.ELEMENT_NODE) {
         matches.push(scope.serializeElement(element));
       }
     }
@@ -34,7 +46,8 @@
   }
 
   function queryByText({ text, exact }) {
-    return scope.findElementsByText(text, Boolean(exact)).map(scope.serializeElement);
+    requireString(text, "text");
+    return scope.findElementsByText(text, Boolean(exact)).map((element) => scope.serializeElement(element));
   }
 
   function getAllInteractive() {
@@ -43,7 +56,7 @@
         const rect = element.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
       })
-      .map(scope.serializeElement);
+      .map((element) => scope.serializeElement(element));
   }
 
   Object.assign(scope, {

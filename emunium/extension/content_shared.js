@@ -2,63 +2,147 @@
   "use strict";
 
   const scope = (globalThis.EmuniumContent = globalThis.EmuniumContent || {});
-  const state = scope.state || { elements: new Map(), nextId: 1 };
+
   const INTERACTIVE_SELECTOR =
     "input,button,a,textarea,select,[role],[aria-label],[data-state]," +
     "[placeholder],[data-testid],[name],[type],[contenteditable]";
+  // Subtrees whose text is never rendered: they are neither text matches nor do they
+  // hide a matching parent.
+  const TEXT_SKIP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+  // Without FinalizationRegistry the id map is swept of collected entries this often.
+  const SWEEP_EVERY = 1000;
+  const LARGE_TEXT_LENGTH = 5000;
 
-  function nextElementId() {
-    const id = "e_" + state.nextId;
-    state.nextId += 1;
-    return id;
+  function codedError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  function randomToken() {
+    const bytes = new Uint8Array(6);
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+      globalThis.crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // One state per isolated world (= per document). Re-injecting the scripts into the
+  // same document keeps it, so handles issued before the re-injection stay valid.
+  function createState() {
+    const refs = new Map();
+    const registry =
+      typeof FinalizationRegistry === "function" ? new FinalizationRegistry((id) => refs.delete(id)) : null;
+    return { token: randomToken(), nextId: 1, refs, ids: new WeakMap(), registry, issuedSinceSweep: 0 };
+  }
+
+  const existing = scope.state;
+  const state =
+    existing && typeof existing.token === "string" && existing.refs instanceof Map && existing.ids instanceof WeakMap
+      ? existing
+      : createState();
+
+  function sweep() {
+    for (const [id, ref] of state.refs) {
+      if (ref.deref() === undefined) state.refs.delete(id);
+    }
   }
 
   function getElementId(element) {
-    for (const [id, reference] of state.elements) {
-      if (reference === element) {
-        return id;
-      }
+    const known = state.ids.get(element);
+    if (known !== undefined && state.refs.has(known)) {
+      return known;
     }
-    const id = nextElementId();
-    state.elements.set(id, element);
+    const id = state.token + "." + state.nextId;
+    state.nextId += 1;
+    state.refs.set(id, new WeakRef(element));
+    state.ids.set(element, id);
+    if (state.registry) {
+      state.registry.register(element, id);
+    } else if ((state.issuedSinceSweep += 1) >= SWEEP_EVERY) {
+      state.issuedSinceSweep = 0;
+      sweep();
+    }
     return id;
   }
 
+  /** Returns the live element or throws `stale_element` / `invalid_argument`. */
   function resolveElement(elementId) {
-    const element = state.elements.get(elementId);
-    if (!element || !element.isConnected) {
-      state.elements.delete(elementId);
-      return null;
+    if (typeof elementId !== "string" || elementId === "") {
+      throw codedError("invalid_argument", "'elementId' must be a non-empty string");
+    }
+    const dot = elementId.lastIndexOf(".");
+    if (dot <= 0 || elementId.slice(0, dot) !== state.token) {
+      throw codedError("stale_element", `element ${elementId} belongs to another document`);
+    }
+    const ref = state.refs.get(elementId);
+    const element = ref ? ref.deref() : undefined;
+    if (element === undefined) {
+      state.refs.delete(elementId);
+      throw codedError("stale_element", `element ${elementId} no longer exists`);
+    }
+    if (!element.isConnected || element.ownerDocument !== document) {
+      throw codedError("stale_element", `element ${elementId} is detached from the document`);
     }
     return element;
   }
 
-  function getWindowBorders() {
-    return {
-      left: (window.outerWidth - window.innerWidth) / 2,
-      top: window.outerHeight - window.innerHeight,
-    };
+  function withResolvedElement(elementId, callback) {
+    return callback(resolveElement(elementId));
   }
 
   function toRectPayload(rect) {
     return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
   }
 
-  function getElementText(element, maxLength = 500) {
-    return (element.innerText || element.textContent || "").slice(0, maxLength);
+  // Window geometry at call time: screenX/Y and outerWidth/Height are DIP,
+  // innerWidth/Height CSS px, devicePixelRatio = OS scale x page zoom.
+  function readGeometry() {
+    const viewport = window.visualViewport;
+    return {
+      screenX: window.screenX ?? 0,
+      screenY: window.screenY ?? 0,
+      outerWidth: window.outerWidth ?? 0,
+      outerHeight: window.outerHeight ?? 0,
+      innerWidth: window.innerWidth ?? 0,
+      innerHeight: window.innerHeight ?? 0,
+      devicePixelRatio: window.devicePixelRatio ?? 1,
+      visualViewport: {
+        offsetLeft: viewport?.offsetLeft ?? 0,
+        offsetTop: viewport?.offsetTop ?? 0,
+        scale: viewport?.scale ?? 1,
+      },
+    };
   }
 
-  function getAbsoluteCoords(element, { scroll = false } = {}) {
-    if (scroll) {
-      element.scrollIntoView({ behavior: "instant", block: "center" });
-    }
-    const rect = element.getBoundingClientRect();
-    const borders = getWindowBorders();
+  // Legacy DIP estimate of the rect centre, assuming page zoom 1 (the content script
+  // cannot see the zoom; Python converts `rect` + `geometry` + reply `zoom` instead).
+  function estimateScreenCenter(rect, geometry) {
+    const border = Math.max(0, (geometry.outerWidth - geometry.innerWidth) / 2);
+    const originX = geometry.screenX + border;
+    const originY = geometry.screenY + geometry.outerHeight - geometry.innerHeight - border;
     return {
-      absoluteScreenX: window.screenX + borders.left + rect.x + rect.width / 2,
-      absoluteScreenY: window.screenY + borders.top + rect.y + rect.height / 2,
-      rect,
+      absoluteScreenX: originX + rect.x + rect.width / 2,
+      absoluteScreenY: originY + rect.y + rect.height / 2,
     };
+  }
+
+  function getAbsoluteCoords(element) {
+    const rect = element.getBoundingClientRect();
+    const geometry = readGeometry();
+    return Object.assign({ rect, geometry }, estimateScreenCenter(rect, geometry));
+  }
+
+  // innerText lays out and builds the whole rendered text; for big containers the raw
+  // textContent prefix is good enough for a 500-character preview.
+  function getElementText(element, maxLength = 500) {
+    const raw = element.textContent || "";
+    if (raw.length > LARGE_TEXT_LENGTH) {
+      return raw.slice(0, maxLength);
+    }
+    return (element.innerText || raw).slice(0, maxLength);
   }
 
   function collectAttributes(element) {
@@ -75,49 +159,67 @@
       elementId: getElementId(element),
       tag: element.tagName.toLowerCase(),
       attrs: collectAttributes(element),
-      rect: toRectPayload(coords.rect),
       text: getElementText(element),
-      visible: coords.rect.width > 0 && coords.rect.height > 0,
       value: element.value !== undefined ? element.value : null,
+      visible: coords.rect.width > 0 && coords.rect.height > 0,
+      rect: toRectPayload(coords.rect),
+      geometry: coords.geometry,
       absoluteScreenX: coords.absoluteScreenX,
       absoluteScreenY: coords.absoluteScreenY,
     };
   }
 
-  function withResolvedElement(elementId, callback) {
-    const element = resolveElement(elementId);
-    if (!element) {
-      return { error: "Element not found or detached" };
-    }
-    return callback(element);
+  function collapseText(value) {
+    return value.replace(/\s+/g, " ").trim().toLowerCase();
   }
 
+  function isTextSkipped(element) {
+    return TEXT_SKIP_TAGS.has(String(element.tagName).toUpperCase());
+  }
+
+  /** Deepest elements whose text matches: a match with a matching element child loses. */
   function findElementsByText(text, exact = false) {
-    if (!document.body) {
+    const root = document.body;
+    if (!root || typeof text !== "string") {
       return [];
     }
-    const matcher = exact ? text : text.toLowerCase();
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
-    const matches = [];
+    const needle = exact ? text : text.toLowerCase();
+    // Pruning key: textContent is a cheap superset of the rendered text. Case is folded
+    // even for exact matches because innerText applies CSS text-transform.
+    const pruneNeedle = collapseText(text);
+    const mayContain = (node) => collapseText(node.textContent || "").includes(pruneNeedle);
+    const matched = new Set();
+    const order = [];
+    const visit = (node) => {
+      const value = (node.innerText || node.textContent || "").trim();
+      if (value && (exact ? value === needle : value.toLowerCase().includes(needle))) {
+        matched.add(node);
+        order.push(node);
+      }
+    };
+    if (!mayContain(root)) {
+      return [];
+    }
+    visit(root);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+      acceptNode: (node) =>
+        isTextSkipped(node) || !mayContain(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+    });
     let node;
     while ((node = walker.nextNode())) {
-      const value = (node.innerText || node.textContent || "").trim();
-      if (!value) {
-        continue;
-      }
-      if (exact ? value === text : value.toLowerCase().includes(matcher)) {
-        matches.push(node);
-      }
+      visit(node);
     }
-    return matches;
+    return order.filter((candidate) => !Array.from(candidate.children || []).some((child) => matched.has(child)));
   }
 
   Object.assign(scope, {
     INTERACTIVE_SELECTOR,
+    codedError,
     findElementsByText,
     getAbsoluteCoords,
     getElementId,
     getElementText,
+    readGeometry,
     resolveElement,
     serializeElement,
     state,
