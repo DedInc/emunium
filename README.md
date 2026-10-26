@@ -226,10 +226,20 @@ browser.wait("#results", condition=Wait().visible().text_not_empty().stable(500)
 
 `WaitStrategy` values: `PRESENCE`, `VISIBLE`, `CLICKABLE`, `STABLE`, `UNOBSCURED`.
 
-An unknown condition is rejected with `InvalidArgumentError` before waiting. A
-`custom_js` condition that the page's Content Security Policy refuses to compile
-raises `CSPBlockedError`; one that throws raises `ScriptError`. It never
-silently evaluates to `False`.
+An unknown condition is rejected with `InvalidArgumentError` before waiting.
+A `custom_js` condition is compiled once, before the wait starts, and then
+evaluated on every check:
+
+- A syntax error raises `ScriptError` immediately, without waiting out the
+  timeout.
+- Code that the page's Content Security Policy refuses to compile raises
+  `CSPBlockedError` (emunium first retries through the `userScripts` API, which
+  pages cannot block).
+- An exception thrown while the condition runs counts as `False` ("not yet"):
+  the wait keeps checking and, if the condition never holds, ends with
+  `WaitTimeoutError` (a `TimeoutError`) after the wait's timeout.
+- A condition that returns a promise or other thenable raises `ScriptError`;
+  `custom_js` must return synchronously.
 
 ```python
 # Either a success marker or a captcha box

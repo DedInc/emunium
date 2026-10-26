@@ -235,27 +235,39 @@ def test_wait_custom_js(browser: Browser, site_url: str) -> None:
     assert time.monotonic() - started < 4.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TimeoutError,
-    reason=(
-        "product defect: README 'Waiting' says a custom_js condition that throws "
-        "raises ScriptError and never silently evaluates to False, but the "
-        "MAIN-world evaluator (background_handlers.js 'runtime exceptions mean "
-        "\"not yet\"') treats a throw as False, so the wait runs into TimeoutError"
-    ),
-)
-def test_wait_custom_js_that_throws_raises_script_error(
+def test_wait_custom_js_that_throws_times_out(
     browser: Browser, site_url: str
 ) -> None:
+    """A runtime exception means "not yet": the wait runs out its timeout."""
     browser.goto(site_url + "/index.html")
 
-    with pytest.raises(ScriptError):
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as info:
         browser.wait(
             "#heading",
             condition=Wait().custom_js("throw new Error('condition broke')"),
             timeout=1.5,
         )
+    elapsed = time.monotonic() - started
+    assert not isinstance(info.value, ScriptError)
+    assert elapsed >= 1.4, elapsed
+
+
+def test_wait_custom_js_syntax_error_raises_script_error(
+    browser: Browser, site_url: str
+) -> None:
+    """A compile error is reported up front, not after the timeout."""
+    browser.goto(site_url + "/index.html")
+
+    started = time.monotonic()
+    with pytest.raises(ScriptError) as info:
+        browser.wait(
+            "#heading",
+            condition=Wait().custom_js("throw new Error('unterminated"),
+            timeout=8,
+        )
+    assert not isinstance(info.value, CSPBlockedError)
+    assert time.monotonic() - started < 4.0
 
 
 def test_wait_unknown_condition_rejected_before_waiting(
