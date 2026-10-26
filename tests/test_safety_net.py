@@ -26,6 +26,9 @@ from emunium._element_interactor import (
     keyboard_events,
 )
 
+# SECURITY_MANDATORY_MEDIUM_RID: a non-elevated process's integrity level.
+_MEDIUM_INTEGRITY = 0x2000
+
 
 @pytest.fixture
 def net(input_safety_net: SafetyNet | None) -> SafetyNet:
@@ -122,8 +125,14 @@ def test_ctypes_user32_input_functions_trapped(net):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="SendInput is Windows-only")
-def test_real_windows_keyboard_sender_hits_send_input_trap(net):
+def test_real_windows_keyboard_sender_hits_send_input_trap(net, monkeypatch):
     sender = WindowsKeyboardSender()
+    # The UIPI preflight reads the focused window's integrity level; stub both
+    # queries to the same medium level (0x2000) so the result depends only on
+    # the SendInput trap, not on whether an elevated window has focus.
+    monkeypatch.setattr(sender._api, "own_integrity", lambda: _MEDIUM_INTEGRITY)
+    monkeypatch.setattr(sender._api, "foreground_integrity", lambda: _MEDIUM_INTEGRITY)
+    sender._sender.preflight()
     assert net.is_trap(sender._user32.SendInput)
     with pytest.raises(RuntimeError, match=REAL_INPUT_MESSAGE):
         sender.send(keyboard_events("a"))
