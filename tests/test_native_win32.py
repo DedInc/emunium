@@ -8,10 +8,12 @@ APIs, and the injecting ones are shown to hit the conftest safety net.
 from __future__ import annotations
 
 import ctypes
+import os
 import random
 import subprocess
 import sys
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import pytest
 from conftest import REAL_INPUT_MESSAGE, REPO_ROOT, SafetyNet
@@ -45,6 +47,7 @@ from emunium._native.win32 import (
     MOUSEEVENTF_WHEEL,
     MOUSEINPUT,
     Win32Backend,
+    WindowInfo,
 )
 from emunium.errors import NativeInputError
 
@@ -988,3 +991,341 @@ def test_real_user32_injection_hits_safety_net(
     assert ctypes.get_last_error() == 0  # cleared right before SendInput
     with pytest.raises(RuntimeError, match=REAL_INPUT_MESSAGE):
         user32.set_cursor_pos(10, 10)
+
+
+# -- top-level windows and the foreground --------------------------------------------
+
+CHROME = win32.CHROME_WINDOW_CLASS
+OUR_THREAD = 7
+
+
+class FakeWindow(NamedTuple):
+    pid: int
+    thread_id: int
+    rect: tuple[int, int, int, int] | None = (0, 0, 800, 600)
+    class_name: str = CHROME
+    visible: bool = True
+    ex_style: int = 0
+    iconic: bool = False
+
+
+class FakeWindows:
+    """Stands in for ``win32.Win32Windows``; records every call by name."""
+
+    def __init__(
+        self,
+        windows: dict[int, FakeWindow] | None = None,
+        processes: list[tuple[int, int]] | None = None,
+        foreground: int = 0,
+    ) -> None:
+        self.windows = windows or {}
+        # EnumWindows order; defaults to the window table's order.
+        self.order: list[int] | None = None
+        self.processes = processes or []
+        self.foreground = foreground
+        self.calls: list[tuple[object, ...]] = []
+        self.attached: set[int] = set()
+        self.attach_ok = True
+        # Foreground lock: SetForegroundWindow only works while attached.
+        self.lock = True
+        self.fail_on: str | None = None
+
+    def _call(self, *call: object) -> None:
+        self.calls.append(call)
+        if call[0] == self.fail_on:
+            raise OSError(f"{call[0]} failed")
+
+    def enum_windows(self) -> list[int]:
+        return list(self.windows) if self.order is None else list(self.order)
+
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]:
+        window = self.windows.get(hwnd)
+        return (0, 0) if window is None else (window.thread_id, window.pid)
+
+    def is_window_visible(self, hwnd: int) -> bool:
+        return self.windows[hwnd].visible
+
+    def class_name(self, hwnd: int) -> str:
+        return self.windows[hwnd].class_name
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        return self.windows[hwnd].rect
+
+    def is_iconic(self, hwnd: int) -> bool:
+        return self.windows[hwnd].iconic
+
+    def ex_style(self, hwnd: int) -> int:
+        return self.windows[hwnd].ex_style
+
+    def process_parents(self) -> list[tuple[int, int]]:
+        return list(self.processes)
+
+    def foreground_window(self) -> int:
+        return self.foreground
+
+    def current_thread_id(self) -> int:
+        return OUR_THREAD
+
+    def attach_thread_input(self, attach: int, attach_to: int, on: bool) -> bool:
+        self._call("attach", attach, attach_to, on)
+        if not self.attach_ok:
+            return False
+        if on:
+            self.attached.add(attach_to)
+        else:
+            self.attached.discard(attach_to)
+        return True
+
+    def show_window(self, hwnd: int, command: int) -> bool:
+        self._call("show", hwnd, command)
+        self.windows[hwnd] = self.windows[hwnd]._replace(iconic=False)
+        return True
+
+    def set_foreground_window(self, hwnd: int) -> bool:
+        self._call("set_foreground", hwnd)
+        owner = self.windows[self.foreground].thread_id if self.foreground else 0
+        if self.lock and owner not in self.attached:
+            return False
+        self.foreground = hwnd
+        return True
+
+    def bring_window_to_top(self, hwnd: int) -> bool:
+        self._call("bring_to_top", hwnd)
+        return True
+
+    def set_focus(self, hwnd: int) -> int:
+        self._call("set_focus", hwnd)
+        return 0
+
+
+def info(
+    hwnd: int, rect: tuple[int, int, int, int], *, minimized: bool = False
+) -> WindowInfo:
+    return WindowInfo(hwnd, 10, 11, CHROME, *rect, minimized)
+
+
+def test_top_level_windows_keeps_visible_browser_windows_in_z_order() -> None:
+    api = FakeWindows(
+        {
+            0x10: FakeWindow(pid=10, thread_id=11, rect=(-8, -8, 1928, 1048)),
+            0x20: FakeWindow(pid=99, thread_id=91),  # another process
+            0x30: FakeWindow(pid=10, thread_id=11, visible=False),
+            0x40: FakeWindow(pid=10, thread_id=11, rect=(5, 5, 5, 300)),  # zero width
+            0x50: FakeWindow(pid=12, thread_id=13, ex_style=win32.WS_EX_TOOLWINDOW),
+            0x60: FakeWindow(pid=12, thread_id=13, class_name="Chrome_WidgetWin_0"),
+            0x70: FakeWindow(pid=12, thread_id=13, rect=None),  # vanished
+            0x80: FakeWindow(
+                pid=12, thread_id=13, rect=(-32000, -32000, -31840, -31972), iconic=True
+            ),
+            0x90: FakeWindow(pid=12, thread_id=14, rect=(100, 50, 900, 650)),
+        }
+    )
+    found = win32.top_level_windows({10, 12}, api)
+    assert [window.hwnd for window in found] == [0x10, 0x80, 0x90]
+    assert found[0] == WindowInfo(0x10, 10, 11, CHROME, -8, -8, 1928, 1048, False)
+    assert (found[0].width, found[0].height) == (1936, 1056)
+    assert found[1].minimized and not found[2].minimized
+    assert win32.top_level_windows(set(), api) == []
+
+
+def test_top_level_windows_skips_a_window_gone_mid_enumeration() -> None:
+    api = FakeWindows({0x10: FakeWindow(pid=10, thread_id=11)})
+    api.order = [0x99, 0x10]  # 0x99 closed before it was read
+    assert [window.hwnd for window in win32.top_level_windows([10], api)] == [0x10]
+
+
+def test_descendant_pids_walks_the_process_tree() -> None:
+    api = FakeWindows(
+        processes=[
+            (0, 0),  # System Idle Process is its own parent
+            (4, 0),
+            (100, 4),  # launcher
+            (200, 100),  # chrome browser
+            (201, 200),  # renderer
+            (202, 200),  # gpu
+            (300, 201),  # grandchild
+            (400, 4),  # unrelated
+            (500, 300),  # pid reuse closes a loop back to the root
+            (100, 500),
+        ]
+    )
+    assert win32.descendant_pids(100, api) == {100, 200, 201, 202, 300, 500}
+    assert win32.descendant_pids(200, api) == {200, 201, 202, 300, 500, 100}
+    assert win32.descendant_pids(400, api) == {400}
+    assert win32.descendant_pids(777, api) == {777}
+
+
+def test_pick_browser_window_matches_the_scaled_geometry() -> None:
+    windows = [
+        info(1, (0, 0, 1000, 800)),
+        info(2, (150, 75, 1350, 975)),  # 100,50 800x600 DIP at 1.5
+        info(3, (-12000, -12000, -11000, -11000)),
+    ]
+    assert win32.pick_browser_window(windows, (100, 50, 800, 600), 1.5) == windows[1]
+    # Invisible resize borders of a maximized frame stay within the tolerance.
+    maximized = [info(4, (-8, -8, 1928, 1048)), windows[0]]
+    assert (
+        win32.pick_browser_window(maximized, (0, 0, 1920, 1040), 1.0) == (maximized[0])
+    )
+
+
+def test_pick_browser_window_prefers_the_closest_then_the_topmost() -> None:
+    near = info(1, (10, 10, 810, 610))
+    exact = info(2, (0, 0, 800, 600))
+    twin = info(3, (0, 0, 800, 600))
+    assert win32.pick_browser_window([near, exact, twin], (0, 0, 800, 600), 1) == exact
+    assert win32.pick_browser_window([twin, exact], (0, 0, 800, 600), 1) == twin
+
+
+def test_pick_browser_window_without_a_match() -> None:
+    first = info(1, (0, 0, 800, 600))
+    second = info(2, (900, 0, 1700, 600))
+    parked = info(3, (-32000, -32000, -31840, -31972), minimized=True)
+    geometry = (300, 300, 400, 400)
+    assert win32.pick_browser_window([first, second], geometry, 1.0) is None
+    assert win32.pick_browser_window([first, second], None, 1.0) is None
+    assert win32.pick_browser_window([first], geometry, 1.0) == first
+    assert win32.pick_browser_window([parked], None, 2.0) == parked
+    # A minimized window never matches by geometry, even at the parking spot.
+    assert (
+        win32.pick_browser_window(
+            [parked, first], (-32000, -32000, 160, 28), 1.0, tolerance=1
+        )
+        is None
+    )
+    assert win32.pick_browser_window([], geometry, 1.0) is None
+    with pytest.raises(ValueError, match="scale"):
+        win32.pick_browser_window([first], geometry, 0)
+
+
+def test_is_foreground() -> None:
+    api = FakeWindows({0x10: FakeWindow(pid=1, thread_id=2)}, foreground=0x10)
+    assert win32.is_foreground(0x10, api)
+    assert not win32.is_foreground(0x20, api)
+    api.foreground = 0
+    assert not win32.is_foreground(0, api)
+
+
+def background_browser(*, iconic: bool = False) -> FakeWindows:
+    return FakeWindows(
+        {
+            0xA: FakeWindow(pid=50, thread_id=51),  # IDE in front
+            0xB: FakeWindow(pid=60, thread_id=61, iconic=iconic),  # the browser
+        },
+        foreground=0xA,
+    )
+
+
+MANAGEMENT_CALLS = {"attach", "show", "set_foreground", "bring_to_top", "set_focus"}
+
+
+def test_bring_to_foreground_lifts_the_lock_and_detaches() -> None:
+    api = background_browser()
+    assert win32.bring_to_foreground(0xB, api) is True
+    assert api.foreground == 0xB
+    assert api.calls == [
+        ("attach", OUR_THREAD, 51, True),
+        ("attach", OUR_THREAD, 61, True),
+        ("set_foreground", 0xB),
+        ("bring_to_top", 0xB),
+        ("set_focus", 0xB),
+        ("attach", OUR_THREAD, 61, False),
+        ("attach", OUR_THREAD, 51, False),
+    ]
+    assert api.attached == set()
+    # Window management only: no input of any kind.
+    assert {call[0] for call in api.calls} <= MANAGEMENT_CALLS
+    assert not hasattr(api, "send_input")
+
+
+def test_bring_to_foreground_restores_a_minimized_window_first() -> None:
+    api = background_browser(iconic=True)
+    assert win32.bring_to_foreground(0xB, api) is True
+    assert api.calls[0] == ("show", 0xB, win32.SW_RESTORE)
+    assert win32.SW_RESTORE == 9
+    assert not api.windows[0xB].iconic
+
+
+def test_bring_to_foreground_already_in_front() -> None:
+    api = background_browser()
+    api.foreground = 0xB
+    assert win32.bring_to_foreground(0xB, api) is True
+    # Only the window's own thread is attached; nothing else to lift.
+    assert api.calls[0] == ("attach", OUR_THREAD, 61, True)
+    assert api.calls[-1] == ("attach", OUR_THREAD, 61, False)
+    assert api.attached == set()
+
+
+def test_bring_to_foreground_reports_a_refused_lock() -> None:
+    api = background_browser()
+    api.attach_ok = False
+    assert win32.bring_to_foreground(0xB, api) is False
+    assert api.foreground == 0xA
+    # Without an attached queue SetFocus is not allowed and is not tried.
+    assert [call[0] for call in api.calls] == [
+        "attach",
+        "attach",
+        "set_foreground",
+        "bring_to_top",
+    ]
+
+
+@pytest.mark.parametrize("failing", ["set_foreground", "bring_to_top", "set_focus"])
+def test_bring_to_foreground_detaches_when_a_call_fails(failing: str) -> None:
+    api = background_browser()
+    api.fail_on = failing
+    with pytest.raises(OSError, match=failing):
+        win32.bring_to_foreground(0xB, api)
+    assert api.attached == set()
+    assert api.calls[-2:] == [
+        ("attach", OUR_THREAD, 61, False),
+        ("attach", OUR_THREAD, 51, False),
+    ]
+
+
+def test_bring_to_foreground_skips_our_own_thread_and_null() -> None:
+    api = FakeWindows(
+        {
+            0xA: FakeWindow(pid=50, thread_id=OUR_THREAD),
+            0xB: FakeWindow(pid=60, thread_id=61),
+        },
+        foreground=0xA,
+    )
+    api.lock = False
+    assert win32.bring_to_foreground(0xB, api) is True
+    assert ("attach", OUR_THREAD, OUR_THREAD, True) not in api.calls
+    assert win32.bring_to_foreground(0, api) is False
+
+
+@pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="x64 layout")
+def test_window_struct_sizes_x64() -> None:
+    assert ctypes.sizeof(win32.PROCESSENTRY32W) == 568
+    assert ctypes.sizeof(win32.RECT) == 16
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="user32 is Windows-only")
+def test_real_window_queries_are_read_only() -> None:
+    # Only enumeration and queries: nothing is shown, raised or focused.
+    windows = win32.Win32Windows()
+    own = os.getpid()
+    family = win32.descendant_pids(os.getppid(), windows)
+    assert own in family
+    assert own in win32.descendant_pids(own, windows)
+    assert windows.current_thread_id() > 0
+    assert isinstance(windows.foreground_window(), int)
+    handles = windows.enum_windows()
+    assert handles and all(isinstance(hwnd, int) for hwnd in handles)
+    for hwnd in handles[:20]:
+        thread_id, _pid = windows.window_thread_process_id(hwnd)
+        assert thread_id >= 0
+        assert isinstance(windows.class_name(hwnd), str)
+        assert isinstance(windows.ex_style(hwnd), int)
+        rect = windows.window_rect(hwnd)
+        assert rect is None or len(rect) == 4
+    assert win32.top_level_windows({own}, windows) == []
+    every_pid = {pid for pid, _parent in windows.process_parents()}
+    assert own in every_pid
+    assert all(
+        window.class_name == CHROME and window.width > 0 and window.height > 0
+        for window in win32.top_level_windows(every_pid, windows)
+    )

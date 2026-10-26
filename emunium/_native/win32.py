@@ -1,7 +1,8 @@
 """Windows input through user32, ctypes only.
 
 ``SetCursorPos`` / ``GetCursorPos`` move and read the pointer; ``SendInput``
-carries buttons, the wheel and keys. ``emunium._screen.input_backend`` makes the
+carries buttons, the wheel and keys. The window helpers at the end find the
+browser's top-level window and raise it without sending any input. ``emunium._screen.input_backend`` makes the
 process per-monitor-v2 DPI aware before building this backend, so coordinates
 are physical px and negative on monitors left of or above the primary one.
 
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias
 
 from emunium._native import check_failsafe
@@ -1030,3 +1031,427 @@ class Win32Backend:
         layout = self._layout(key)
         self._map_scan_codes(key, layout, with_shift=False)
         return key_events(key, up=up, scan_codes=self._scan_codes, layout=layout)
+
+
+# -- top-level windows and the foreground ------------------------------------------
+#
+# A browser launched from a background process opens behind other windows (the
+# foreground lock), and ``chrome.windows.update(focused)`` cannot override it.
+# These helpers find the browser's top-level window and raise it through window
+# management calls only: nothing here sends keyboard or mouse input.
+
+LPARAM = ctypes.c_ssize_t
+LONG_PTR = ctypes.c_ssize_t
+
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+SW_RESTORE = 9
+TH32CS_SNAPPROCESS = 0x00000002
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+CLASS_NAME_CHARS = 256
+
+# Class of Chrome's top-level browser windows (owned by the browser process).
+CHROME_WINDOW_CLASS = "Chrome_WidgetWin_1"
+# Largest edge distance, in physical px, at which a window still matches the
+# geometry Chrome reports: rounding of DIPs and the frame's invisible resize
+# borders (7-8 px on Windows 10/11) both fit inside it.
+WINDOW_MATCH_TOLERANCE = 16
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", LONG), ("top", LONG), ("right", LONG), ("bottom", LONG)]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    """568 bytes on x64, 556 on x86; ``dwSize`` must be set before use."""
+
+    _fields_ = [
+        ("dwSize", DWORD),
+        ("cntUsage", DWORD),
+        ("th32ProcessID", DWORD),
+        ("th32DefaultHeapID", ULONG_PTR),
+        ("th32ModuleID", DWORD),
+        ("cntThreads", DWORD),
+        ("th32ParentProcessID", DWORD),
+        ("pcPriClassBase", LONG),
+        ("dwFlags", DWORD),
+        ("szExeFile", WORD * 260),  # WCHAR[MAX_PATH]; never read here
+    ]
+
+
+class WindowInfo(NamedTuple):
+    """One visible top-level window; the rectangle is in physical px."""
+
+    hwnd: int
+    pid: int
+    thread_id: int
+    class_name: str
+    left: int
+    top: int
+    right: int
+    bottom: int
+    minimized: bool
+
+    @property
+    def width(self) -> int:
+        return self.right - self.left
+
+    @property
+    def height(self) -> int:
+        return self.bottom - self.top
+
+
+class WindowApi(Protocol):
+    """The window-management calls the helpers make (a fake in tests)."""
+
+    def enum_windows(self) -> list[int]: ...
+
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]: ...
+
+    def is_window_visible(self, hwnd: int) -> bool: ...
+
+    def class_name(self, hwnd: int) -> str: ...
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int] | None: ...
+
+    def is_iconic(self, hwnd: int) -> bool: ...
+
+    def ex_style(self, hwnd: int) -> int: ...
+
+    def process_parents(self) -> list[tuple[int, int]]: ...
+
+    def foreground_window(self) -> int: ...
+
+    def current_thread_id(self) -> int: ...
+
+    def attach_thread_input(self, attach: int, attach_to: int, on: bool) -> bool: ...
+
+    def show_window(self, hwnd: int, command: int) -> bool: ...
+
+    def set_foreground_window(self, hwnd: int) -> bool: ...
+
+    def bring_window_to_top(self, hwnd: int) -> bool: ...
+
+    def set_focus(self, hwnd: int) -> int: ...
+
+
+if TYPE_CHECKING:
+    _WindowCType: TypeAlias = (
+        _CType
+        | ctypes.c_ssize_t
+        | ctypes.c_wchar_p
+        | ctypes._CFunctionType
+        | ctypes._Pointer[RECT]
+        | ctypes._Pointer[PROCESSENTRY32W]
+    )
+
+
+class Win32Windows:
+    """``WindowApi`` over private user32/kernel32 ``WinDLL`` objects.
+
+    Like ``User32``, every call resolves its export afresh with explicit
+    argtypes and restype, so nothing leaks onto the shared ``windll``.
+    """
+
+    _library: ctypes.CDLL
+    _kernel32: ctypes.CDLL
+
+    def __init__(self) -> None:
+        if sys.platform != "win32":
+            raise NativeInputError("window management needs Windows")
+        self._library = ctypes.WinDLL("user32", use_last_error=True)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # WNDENUMPROC: BOOL CALLBACK (HWND, LPARAM).
+        self._enum_proc = ctypes.WINFUNCTYPE(BOOL, HANDLE, LPARAM)
+
+    @staticmethod
+    def _function(
+        library: ctypes.CDLL,
+        name: str,
+        restype: type[_WindowCType],
+        argtypes: list[type[_WindowCType]],
+    ) -> ctypes._NamedFuncPointer:
+        function = library[name]
+        function.restype = restype
+        function.argtypes = argtypes
+        return function
+
+    def _user32(
+        self,
+        name: str,
+        restype: type[_WindowCType],
+        argtypes: list[type[_WindowCType]],
+    ) -> ctypes._NamedFuncPointer:
+        return self._function(self._library, name, restype, argtypes)
+
+    def _kernel(
+        self,
+        name: str,
+        restype: type[_WindowCType],
+        argtypes: list[type[_WindowCType]],
+    ) -> ctypes._NamedFuncPointer:
+        return self._function(self._kernel32, name, restype, argtypes)
+
+    # -- reading ------------------------------------------------------------
+
+    def enum_windows(self) -> list[int]:
+        handles: list[int] = []
+
+        def collect(hwnd: int | None, _lparam: int) -> bool:
+            if hwnd:
+                handles.append(hwnd)
+            return True
+
+        callback = self._enum_proc(collect)
+        enum_windows = self._user32("EnumWindows", BOOL, [self._enum_proc, LPARAM])
+        if not enum_windows(callback, 0):
+            raise NativeInputError(f"EnumWindows failed (error {last_error()})")
+        return handles
+
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]:
+        """``(thread id, process id)``; ``(0, 0)`` for a vanished window."""
+        pid = DWORD(0)
+        get_window_thread_process_id = self._user32(
+            "GetWindowThreadProcessId", DWORD, [HANDLE, ctypes.POINTER(DWORD)]
+        )
+        thread_id = get_window_thread_process_id(hwnd, ctypes.byref(pid))
+        return int(thread_id), int(pid.value)
+
+    def is_window_visible(self, hwnd: int) -> bool:
+        return bool(self._user32("IsWindowVisible", BOOL, [HANDLE])(hwnd))
+
+    def class_name(self, hwnd: int) -> str:
+        buffer = ctypes.create_unicode_buffer(CLASS_NAME_CHARS)
+        get_class_name = self._user32(
+            "GetClassNameW", ctypes.c_int, [HANDLE, ctypes.c_wchar_p, ctypes.c_int]
+        )
+        if not get_class_name(hwnd, buffer, CLASS_NAME_CHARS):
+            return ""
+        return buffer.value
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        rect = RECT()
+        get_window_rect = self._user32(
+            "GetWindowRect", BOOL, [HANDLE, ctypes.POINTER(RECT)]
+        )
+        if not get_window_rect(hwnd, ctypes.byref(rect)):
+            return None
+        return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+    def is_iconic(self, hwnd: int) -> bool:
+        return bool(self._user32("IsIconic", BOOL, [HANDLE])(hwnd))
+
+    def ex_style(self, hwnd: int) -> int:
+        # GetWindowLongPtrW is a macro for GetWindowLongW in 32-bit user32.
+        name = (
+            "GetWindowLongPtrW"
+            if ctypes.sizeof(ctypes.c_void_p) == 8
+            else "GetWindowLongW"
+        )
+        get_window_long = self._user32(name, LONG_PTR, [HANDLE, ctypes.c_int])
+        return int(get_window_long(hwnd, GWL_EXSTYLE))
+
+    def process_parents(self) -> list[tuple[int, int]]:
+        """``(pid, parent pid)`` of every running process (a Toolhelp snapshot)."""
+        create_snapshot = self._kernel(
+            "CreateToolhelp32Snapshot", HANDLE, [DWORD, DWORD]
+        )
+        snapshot = create_snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+            raise NativeInputError(
+                f"CreateToolhelp32Snapshot failed (error {last_error()})"
+            )
+        try:
+            entry_pointer = ctypes.POINTER(PROCESSENTRY32W)
+            first = self._kernel("Process32FirstW", BOOL, [HANDLE, entry_pointer])
+            following = self._kernel("Process32NextW", BOOL, [HANDLE, entry_pointer])
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            pairs: list[tuple[int, int]] = []
+            more = first(snapshot, ctypes.byref(entry))
+            while more:
+                pairs.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+                more = following(snapshot, ctypes.byref(entry))
+            return pairs
+        finally:
+            self._kernel("CloseHandle", BOOL, [HANDLE])(snapshot)
+
+    def foreground_window(self) -> int:
+        return int(self._user32("GetForegroundWindow", HANDLE, [])() or 0)
+
+    def current_thread_id(self) -> int:
+        return int(self._kernel("GetCurrentThreadId", DWORD, [])())
+
+    # -- window management (no input) ----------------------------------------
+
+    def attach_thread_input(self, attach: int, attach_to: int, on: bool) -> bool:
+        attach_thread_input = self._user32(
+            "AttachThreadInput", BOOL, [DWORD, DWORD, BOOL]
+        )
+        return bool(attach_thread_input(attach, attach_to, on))
+
+    def show_window(self, hwnd: int, command: int) -> bool:
+        show_window = self._user32("ShowWindow", BOOL, [HANDLE, ctypes.c_int])
+        return bool(show_window(hwnd, command))
+
+    def set_foreground_window(self, hwnd: int) -> bool:
+        return bool(self._user32("SetForegroundWindow", BOOL, [HANDLE])(hwnd))
+
+    def bring_window_to_top(self, hwnd: int) -> bool:
+        return bool(self._user32("BringWindowToTop", BOOL, [HANDLE])(hwnd))
+
+    def set_focus(self, hwnd: int) -> int:
+        """The previously focused window; 0 when focus was refused."""
+        return int(self._user32("SetFocus", HANDLE, [HANDLE])(hwnd) or 0)
+
+
+def top_level_windows(
+    pid_set: Collection[int],
+    api: WindowApi | None = None,
+    *,
+    class_name: str = CHROME_WINDOW_CLASS,
+) -> list[WindowInfo]:
+    """Visible top-level ``class_name`` windows owned by ``pid_set``, in Z order.
+
+    Invisible, zero-size and tool windows are skipped, as is a window that
+    vanishes while it is being read. Minimized windows stay in the list.
+    """
+    windows = api if api is not None else Win32Windows()
+    wanted = frozenset(pid_set)
+    found: list[WindowInfo] = []
+    for hwnd in windows.enum_windows():
+        thread_id, pid = windows.window_thread_process_id(hwnd)
+        if not thread_id or pid not in wanted:
+            continue
+        if not windows.is_window_visible(hwnd):
+            continue
+        if windows.ex_style(hwnd) & WS_EX_TOOLWINDOW:
+            continue
+        name = windows.class_name(hwnd)
+        if name != class_name:
+            continue
+        rect = windows.window_rect(hwnd)
+        if rect is None:
+            continue
+        left, top, right, bottom = rect
+        if right <= left or bottom <= top:
+            continue
+        found.append(
+            WindowInfo(
+                hwnd=hwnd,
+                pid=pid,
+                thread_id=thread_id,
+                class_name=name,
+                left=left,
+                top=top,
+                right=right,
+                bottom=bottom,
+                minimized=windows.is_iconic(hwnd),
+            )
+        )
+    return found
+
+
+def descendant_pids(root_pid: int, api: WindowApi | None = None) -> frozenset[int]:
+    """``root_pid`` and every process below it in the parent chain.
+
+    Toolhelp reports a parent pid even after the parent exited, so a reused
+    pid can adopt strangers; the walk stays finite on such cycles.
+    """
+    windows = api if api is not None else Win32Windows()
+    children: dict[int, list[int]] = {}
+    for pid, parent in windows.process_parents():
+        if pid != parent:
+            children.setdefault(parent, []).append(pid)
+    found = {root_pid}
+    pending = [root_pid]
+    while pending:
+        for child in children.get(pending.pop(), ()):
+            if child not in found:
+                found.add(child)
+                pending.append(child)
+    return frozenset(found)
+
+
+def pick_browser_window(
+    windows: Sequence[WindowInfo],
+    dip_rect: tuple[float, float, float, float] | None,
+    scale: float,
+    *,
+    tolerance: float = WINDOW_MATCH_TOLERANCE,
+) -> WindowInfo | None:
+    """The window whose rectangle matches Chrome's window geometry.
+
+    ``dip_rect`` is ``(left, top, width, height)`` in DIPs as
+    ``chrome.windows`` reports it and ``scale`` the device pixel ratio. The
+    window with the smallest largest-edge distance within ``tolerance``
+    physical px wins (the topmost on a tie). Minimized windows sit at a parking
+    position, so they never match; without a match a single candidate is
+    unambiguous and returned, otherwise ``None``.
+    """
+    if scale <= 0:
+        raise ValueError(f"scale must be positive, got {scale!r}")
+    if dip_rect is not None:
+        left, top, width, height = dip_rect
+        expected = (
+            left * scale,
+            top * scale,
+            (left + width) * scale,
+            (top + height) * scale,
+        )
+        best: WindowInfo | None = None
+        best_error = 0.0
+        for window in windows:
+            if window.minimized:
+                continue
+            edges = (window.left, window.top, window.right, window.bottom)
+            error = max(abs(edge - want) for edge, want in zip(edges, expected))
+            if error <= tolerance and (best is None or error < best_error):
+                best, best_error = window, error
+        if best is not None:
+            return best
+    return windows[0] if len(windows) == 1 else None
+
+
+def is_foreground(hwnd: int, api: WindowApi | None = None) -> bool:
+    windows = api if api is not None else Win32Windows()
+    return bool(hwnd) and windows.foreground_window() == hwnd
+
+
+def bring_to_foreground(hwnd: int, api: WindowApi | None = None) -> bool:
+    """Raise ``hwnd`` above every window; True when it ends up in the foreground.
+
+    Restores a minimized window, then attaches this thread's input state to
+    the current foreground thread (and the window's own thread, so ``SetFocus``
+    is allowed) to lift the foreground lock, raises the window and always
+    detaches again. Sends no keyboard or mouse input.
+    """
+    windows = api if api is not None else Win32Windows()
+    if not hwnd:
+        return False
+    if windows.is_iconic(hwnd):
+        windows.show_window(hwnd, SW_RESTORE)
+    current = windows.current_thread_id()
+    foreground = windows.foreground_window()
+    targets: list[int] = []
+    if foreground and foreground != hwnd:
+        targets.append(windows.window_thread_process_id(foreground)[0])
+    targets.append(windows.window_thread_process_id(hwnd)[0])
+    attached: list[int] = []
+    try:
+        for thread_id in targets:
+            if (
+                thread_id
+                and thread_id != current
+                and thread_id not in attached
+                and windows.attach_thread_input(current, thread_id, True)
+            ):
+                attached.append(thread_id)
+        windows.set_foreground_window(hwnd)
+        windows.bring_window_to_top(hwnd)
+        if attached:
+            windows.set_focus(hwnd)
+    finally:
+        for thread_id in reversed(attached):
+            windows.attach_thread_input(current, thread_id, False)
+    return windows.foreground_window() == hwnd
