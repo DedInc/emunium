@@ -189,6 +189,10 @@ test("element payload carries rect, geometry and the legacy DIP estimate", async
     innerHeight: 900,
     devicePixelRatio: 1.875,
     visualViewport: { offsetLeft: 3, offsetTop: 4, scale: 2 },
+    scrollWidth: 1280,
+    scrollHeight: 900,
+    clientWidth: 1280,
+    clientHeight: 900,
   };
   assert.deepEqual(payload.geometry, geometry);
   // border 8, origin (108, 50 + 1000 - 900 - 8), centre (50, 35)
@@ -201,6 +205,26 @@ test("element payload carries rect, geometry and the legacy DIP estimate", async
   assert.equal(info.title, "Page");
   for (const key of ["readyState", "scrollX", "scrollY", "scrollWidth", "scrollHeight"]) {
     assert.ok(key in info, key);
+  }
+});
+
+test("geometry carries the scrolling element extent and the viewport without scrollbars", async (t) => {
+  const { doc, send } = makeContent(t);
+  button(doc);
+  // a 4000 px tall page: a 15 px vertical scrollbar narrows the root's client box
+  doc.documentElement.scrollWidth = 1265;
+  doc.documentElement.scrollHeight = 4000;
+  doc.documentElement.clientWidth = 1265;
+  doc.documentElement.clientHeight = 900;
+  for (const geometry of [
+    (await okResult(send("querySelector", { selector: "#go" }))).geometry,
+    (await okResult(send("pageInfo"))).geometry,
+  ]) {
+    assert.equal(geometry.scrollWidth, 1265);
+    assert.equal(geometry.scrollHeight, 4000);
+    assert.equal(geometry.clientWidth, 1265);
+    assert.equal(geometry.clientHeight, 900);
+    assert.equal(geometry.innerWidth, 1280);
   }
 });
 
@@ -279,6 +303,8 @@ test("re-injection keeps one listener, one ready message, one pointer listener a
   assert.equal(chrome.runtime.sendMessage.calls.length, 1, "no executeScript round-trip through the worker");
   assert.equal(win.__listeners.get("pointermove").length, 1);
   assert.equal(win.__listeners.get("mousemove").length, 1);
+  assert.equal(win.__listeners.get("dragover").length, 1);
+  assert.equal(win.__listeners.get("dragleave").length, 1);
   assert.equal((await okResult(send("describeElement", { elementId: before.elementId }))).elementId, before.elementId);
   assert.equal(scope.state.token, before.elementId.split(".")[0]);
 });
@@ -469,6 +495,77 @@ test("pointerProbe: a sample over a frame element is a hit only for that frame",
   assert.ok(wrapper.contains(frame));
 });
 
+// DragEvent is a MouseEvent; Chrome sends no pointermove/mousemove during a native drag.
+function drag(target, type, init) {
+  target.dispatchEvent(new h.FakeMouseEvent(type, Object.assign({ bubbles: true, isTrusted: true }, init)));
+}
+
+test("pointerProbe: trusted dragover samples stand in for pointermove during a drag", async (t) => {
+  const { doc, win, send } = makeContent(t);
+  const go = button(doc);
+  const id = (await okResult(send("querySelector", { selector: "#go" }))).elementId;
+  const since = Date.now();
+  await sleep(2);
+  const probe = send("pointerProbe", { elementId: id, since, quietMs: 10, waitMs: 1000 });
+  setTimeout(() => drag(go, "dragover", { clientX: 50, clientY: 35, screenX: 150, screenY: 135 }), 20);
+  const result = await okResult(probe);
+  assert.equal(win.__listeners.get("pointermove").length, 1, "pointer listeners stay installed");
+  assert.equal(result.hit, true);
+  assert.deepEqual(result.event, {
+    clientX: 50,
+    clientY: 35,
+    screenX: 150,
+    screenY: 135,
+    time: result.event.time,
+    type: "dragover",
+  });
+  assert.ok(result.event.time >= since);
+
+  drag(doc.body, "dragover", { clientX: 500, clientY: 500, screenX: 600, screenY: 600 });
+  const miss = await okResult(send("pointerProbe", { elementId: id, since, quietMs: 5 }));
+  assert.equal(miss.hit, false);
+  assert.equal(miss.event.clientX, 500);
+  assert.equal(miss.event.type, "dragover");
+});
+
+test("pointerProbe: untrusted dragover is not a sample", async (t) => {
+  const { doc, send } = makeContent(t);
+  const go = button(doc);
+  const id = (await okResult(send("querySelector", { selector: "#go" }))).elementId;
+  const since = Date.now();
+  await sleep(2);
+  drag(go, "dragover", { clientX: 50, clientY: 35, screenX: 50, screenY: 35, isTrusted: false });
+  const result = await okResult(send("pointerProbe", { elementId: id, since, quietMs: 5, waitMs: 40 }));
+  assert.deepEqual({ event: result.event, hit: result.hit }, { event: null, hit: false });
+});
+
+test("pointerProbe: dragleave into a frame or out of the window is a left sample", async (t) => {
+  const { go, frame, send } = frameScene(t);
+  const id = (await okResult(send("querySelector", { selector: "#go" }))).elementId;
+  const since = Date.now();
+  await sleep(2);
+  drag(go, "dragover", { clientX: 50, clientY: 35, screenX: 50, screenY: 35 });
+  drag(go, "dragleave", { clientX: 89, clientY: 35, screenX: 89, screenY: 35, relatedTarget: frame, isTrusted: false });
+  assert.equal((await okResult(send("pointerProbe", { elementId: id, since, quietMs: 5 }))).hit, true);
+  drag(go, "dragleave", { clientX: 89, clientY: 35, screenX: 89, screenY: 35, relatedTarget: frame });
+  const intoFrame = await okResult(send("pointerProbe", { elementId: id, since, quietMs: 5 }));
+  assert.equal(intoFrame.hit, false);
+  assert.equal(intoFrame.event.left, true);
+  assert.equal(intoFrame.event.clientX, 89);
+
+  // leaving the button for its parent keeps the dragover sample
+  drag(go, "dragover", { clientX: 50, clientY: 35, screenX: 50, screenY: 35 });
+  drag(go, "dragleave", { clientX: 50, clientY: 35, screenX: 50, screenY: 35, relatedTarget: go.parentNode });
+  const inside = await okResult(send("pointerProbe", { elementId: id, since, quietMs: 5 }));
+  assert.equal(inside.hit, true);
+  assert.equal(inside.event.left, undefined);
+
+  drag(go, "dragleave", { clientX: 50, clientY: 0, screenX: 50, screenY: 0, relatedTarget: null });
+  const outside = await okResult(send("pointerProbe", { elementId: id, since, quietMs: 5 }));
+  assert.equal(outside.hit, false);
+  assert.deepEqual(outside.event, { clientX: 50, clientY: 0, screenX: 50, screenY: 0, time: outside.event.time, left: true });
+});
+
 test("pointerProbe times samples on the wall clock even when performance.timeOrigin is skewed", async (t) => {
   const skewed = { timeOrigin: performance.timeOrigin - 120000, now: () => performance.now() };
   const { doc, send } = makeContent(t, { overrides: { performance: skewed } });
@@ -570,5 +667,8 @@ test("pageInfo and text queries survive a null documentElement or body", async (
   assert.equal(info.scrollWidth, 0);
   assert.equal(info.scrollHeight, 0);
   assert.equal(info.geometry.innerWidth, 1280);
+  for (const key of ["scrollWidth", "scrollHeight", "clientWidth", "clientHeight"]) {
+    assert.equal(info.geometry[key], 0, key);
+  }
   assert.deepEqual(await okResult(send("queryByText", { text: "x" })), []);
 });

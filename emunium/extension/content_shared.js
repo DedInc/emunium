@@ -99,9 +99,18 @@
 
   // Window geometry at call time: screenX/Y and outerWidth/Height are DIP,
   // innerWidth/Height CSS px, devicePixelRatio = OS scale x page zoom.
+  // scrollWidth/Height: extent of the scrolling element; clientWidth/Height: the viewport
+  // without scrollbars, so the gap to innerWidth/Height is the scrollbar band. Both are 0
+  // while the document has no root element.
   function readGeometry() {
     const viewport = window.visualViewport;
+    const scroller = document.scrollingElement ?? null;
+    const root = document.documentElement ?? null;
     return {
+      scrollWidth: scroller?.scrollWidth ?? 0,
+      scrollHeight: scroller?.scrollHeight ?? 0,
+      clientWidth: root?.clientWidth ?? 0,
+      clientHeight: root?.clientHeight ?? 0,
       screenX: window.screenX ?? 0,
       screenY: window.screenY ?? 0,
       outerWidth: window.outerWidth ?? 0,

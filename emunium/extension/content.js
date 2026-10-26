@@ -104,7 +104,7 @@
   const pointer = scope.pointer || { latest: null, waiters: new Set(), installed: false };
   scope.pointer = pointer;
 
-  function storeSample(event, left) {
+  function storeSample(event, left, type) {
     const sample = {
       clientX: event.clientX,
       clientY: event.clientY,
@@ -112,6 +112,7 @@
       screenY: event.screenY,
       time: eventWallTime(event),
     };
+    if (type) sample.type = type;
     if (left) sample.left = true;
     pointer.latest = sample;
     for (const wake of Array.from(pointer.waiters)) wake();
@@ -130,6 +131,12 @@
     if (related == null || isFrameElement(related)) storeSample(event, true);
   }
 
+  // During a native HTML5 drag Chrome sends only drag/dragover, no pointermove/mousemove:
+  // dragover is the cursor position over this document.
+  function recordDragOver(event) {
+    if (event && event.isTrusted === true) storeSample(event, false, "dragover");
+  }
+
   function installPointerTracking() {
     if (pointer.installed) return;
     pointer.installed = true;
@@ -138,6 +145,8 @@
     window.addEventListener("mousemove", recordPointer, options);
     window.addEventListener("pointerout", recordPointerLeave, options);
     window.addEventListener("mouseout", recordPointerLeave, options);
+    window.addEventListener("dragover", recordDragOver, options);
+    window.addEventListener("dragleave", recordPointerLeave, options);
   }
 
   function freshSample(since) {
@@ -198,6 +207,7 @@
       screenY: sample.screenY,
       time: sample.time,
     };
+    if (sample.type) event.type = sample.type;
     if (sample.left) event.left = true;
     return { event, hit: !sample.left && isHit(element, sample.clientX, sample.clientY), rect, geometry };
   }
