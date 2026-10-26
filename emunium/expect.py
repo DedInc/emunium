@@ -150,9 +150,9 @@ class _Assertions:
         if reading.note:
             message += f"; {reading.note}"
         error = ExpectationError(message, method=f"expect.{name}")
-        # Instance attributes (ExpectationError does not declare them); the
-        # error's __reduce__ carries __dict__, so pickling keeps both.
-        vars(error).update(actual=reading.actual, expected=value)
+        # The error's __reduce__ carries __dict__, so pickling keeps both.
+        error.actual = reading.actual
+        error.expected = value
         return error
 
     @staticmethod

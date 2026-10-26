@@ -169,7 +169,14 @@ class ElementNotFoundError(EmuniumError, LookupError):
 
 
 class ExpectationError(EmuniumError, AssertionError):
-    """An ``expect()`` assertion did not hold in time (still an ``AssertionError``)."""
+    """An ``expect()`` assertion did not hold in time (still an ``AssertionError``).
+
+    ``actual`` is the last value read (full, untruncated); ``expected`` is the
+    asserted value. Both are ``None`` on instances not raised by ``expect()``.
+    """
+
+    actual: Any = None
+    expected: Any = None
 
 
 # bridge-protocol.md section 3, "Error codes".
