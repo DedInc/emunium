@@ -11,13 +11,13 @@ import threading
 import time
 
 import pytest
+from fake_extension import FakeExtension, _connect_kwargs
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
 
 from emunium import errors
 from emunium._bridge import transport as transport_mod
 from emunium._bridge.transport import PINNED, Reply, Transport
-from fake_extension import FakeExtension, _connect_kwargs
 
 TOKEN = "test-token-0123456789"
 
@@ -35,6 +35,26 @@ def transport():
 def _connect(t, **kwargs):
     ext = FakeExtension(t.actual_port, kwargs.pop("token", TOKEN), **kwargs)
     return ext
+
+
+def _welcomed_conn(t, previous=None, timeout=5.0):
+    """The transport's active connection once the welcomed one is activated.
+
+    The server sends ``welcome`` before it publishes the connection as
+    ``_active``, so ``ext.wait_welcomed()`` alone races. Waits on the
+    transport's condition (notified on activation) until the active connection
+    is set, open, and not ``previous`` (the one it supersedes).
+    """
+
+    def activated():
+        active = t._active
+        return active is not None and not active.closed and active is not previous
+
+    with t._cond:
+        assert t._cond.wait_for(activated, timeout), (
+            "welcomed connection never activated"
+        )
+        return t._active
 
 
 def _in_thread(fn):
@@ -60,17 +80,28 @@ def _in_thread(fn):
 def test_valid_hello_is_welcomed_and_extra_fields_kept(transport):
     with _connect(transport, send_hello=False) as ext:
         assert ext.wait_connected(5)
-        ext.send_raw({
-            "type": "hello", "protocol": 2, "token": TOKEN,
-            "extensionVersion": "3.1.0", "userAgent": "UA",
-            "installId": "inst-1", "label": "work", "mode": "attached",
-        })
+        ext.send_raw(
+            {
+                "type": "hello",
+                "protocol": 2,
+                "token": TOKEN,
+                "extensionVersion": "3.1.0",
+                "userAgent": "UA",
+                "installId": "inst-1",
+                "label": "work",
+                "mode": "attached",
+            }
+        )
         assert ext.wait_welcomed(5)
         assert ext.welcome == {"type": "welcome", "protocol": 2}
         assert transport.wait_for_connection(5)
         assert transport.connected
-        hello = transport._active.hello
-        assert (hello["installId"], hello["label"], hello["mode"]) == ("inst-1", "work", "attached")
+        hello = _welcomed_conn(transport).hello
+        assert (hello["installId"], hello["label"], hello["mode"]) == (
+            "inst-1",
+            "work",
+            "attached",
+        )
 
 
 @pytest.mark.parametrize(
@@ -155,7 +186,9 @@ def test_silent_client_does_not_delay_valid_client(transport):
 
 def _raw_client(t, origin):
     """Plain client that can set an Origin header (FakeExtension sends none)."""
-    return ws_connect("ws://127.0.0.1:%d" % t.actual_port, origin=origin, **_connect_kwargs())
+    return ws_connect(
+        f"ws://127.0.0.1:{t.actual_port}", origin=origin, **_connect_kwargs()
+    )
 
 
 def test_foreign_origin_rejected_with_4003(transport):
@@ -213,7 +246,9 @@ def test_new_connection_supersedes_old_and_old_close_keeps_new(transport):
 
 
 def test_request_frame_shape_and_reply_envelope(transport):
-    with _connect(transport, handler=lambda r: {"result": {"n": 1}, "tabId": 9, "zoom": 1.25}) as ext:
+    with _connect(
+        transport, handler=lambda r: {"result": {"n": 1}, "tabId": 9, "zoom": 1.25}
+    ) as ext:
         assert ext.wait_welcomed(5)
         reply = transport.request("pageInfo", timeout=5)
         assert reply == Reply(result={"n": 1}, tab_id=9, zoom=1.25)
@@ -287,14 +322,18 @@ def test_timeout_raises_bridge_timeout_and_cleans_pending(transport):
         with pytest.raises(errors.BridgeTimeoutError):
             transport.request("ping", timeout=0.3)
         assert time.monotonic() - start < 2
-        assert transport._active._pending == {}
+        assert _welcomed_conn(transport)._pending == {}
 
 
 def test_five_megabyte_payloads_both_directions(transport):
     big = "x" * (5 * 1024 * 1024)
-    with _connect(transport, handler=lambda r: {"result": big + r["params"]["tail"]}) as ext:
+    with _connect(
+        transport, handler=lambda r: {"result": big + r["params"]["tail"]}
+    ) as ext:
         assert ext.wait_welcomed(5)
-        reply = transport.request("executeScript", {"tail": "!", "code": big}, timeout=20)
+        reply = transport.request(
+            "executeScript", {"tail": "!", "code": big}, timeout=20
+        )
         assert len(reply.result) == len(big) + 1
         assert len(ext.requests[0]["params"]["code"]) == len(big)
 
@@ -380,7 +419,7 @@ def test_failed_send_fails_request_at_once(transport):
         async def broken_send(_text):
             raise OSError("socket write failed")
 
-        transport._active.ws.send = broken_send
+        _welcomed_conn(transport).ws.send = broken_send
         start = time.monotonic()
         with pytest.raises(errors.BridgeDisconnectedError):
             transport.request("navigate", timeout=20)
@@ -397,12 +436,14 @@ def test_failed_send_idempotent_request_succeeds_on_new_connection(transport):
         async def broken_send(_text):
             raise OSError("socket write failed")
 
-        transport._active.ws.send = broken_send
+        _welcomed_conn(transport).ws.send = broken_send
         thread, box = _in_thread(
             lambda: transport.request("pageInfo", timeout=10, idempotent=True)
         )
         assert first.wait_closed(5)
-        assert thread.is_alive()  # waiting for a reconnect, not failed on the dying conn
+        assert (
+            thread.is_alive()
+        )  # waiting for a reconnect, not failed on the dying conn
         with _connect(transport, handler=lambda r: {"result": "fresh"}) as second:
             thread.join(5)
             assert box.get("value") is not None, box.get("error")
@@ -417,7 +458,7 @@ def test_failed_send_retires_conn_before_waking_retry(transport):
     first = _connect(transport)
     try:
         assert first.wait_welcomed(5)
-        conn = transport._active
+        conn = _welcomed_conn(transport)
 
         async def broken_send(_text):
             raise OSError("socket write failed")
@@ -460,7 +501,7 @@ def test_failed_send_retires_conn_before_waking_retry(transport):
 def test_concurrent_failed_sends_retire_once(transport, caplog):
     with _connect(transport) as ext:
         assert ext.wait_welcomed(5)
-        conn = transport._active
+        conn = _welcomed_conn(transport)
         closes = []
         real_close = conn._close_socket
 
@@ -476,12 +517,15 @@ def test_concurrent_failed_sends_retire_once(transport, caplog):
         conn._close_socket = counting_close
         caplog.set_level(logging.WARNING, logger="emunium.bridge")
         threads = [
-            _in_thread(lambda: transport.request("navigate", timeout=1))[0] for _ in range(4)
+            _in_thread(lambda: transport.request("navigate", timeout=1))[0]
+            for _ in range(4)
         ]
         for thread in threads:
             thread.join(5)
         assert ext.wait_closed(5)
-        warnings = [r for r in caplog.records if "Socket write failed" in r.getMessage()]
+        warnings = [
+            r for r in caplog.records if "Socket write failed" in r.getMessage()
+        ]
         assert len(warnings) == 1
         assert closes == [1011]
 
@@ -489,8 +533,7 @@ def test_concurrent_failed_sends_retire_once(transport, caplog):
 def test_cancelled_send_fails_quietly(transport, caplog):
     with _connect(transport) as ext:
         assert ext.wait_welcomed(5)
-        assert transport.wait_for_connection(5)  # welcome precedes activation
-        conn = transport._active
+        conn = _welcomed_conn(transport)
         pending = concurrent.futures.Future()
         conn._pending[999] = pending
         cancelled = concurrent.futures.Future()
@@ -499,7 +542,9 @@ def test_cancelled_send_fails_quietly(transport, caplog):
         conn._after_send(999, cancelled)
         assert conn.closed and not transport.connected
         assert isinstance(pending.exception(0), errors.BridgeDisconnectedError)
-        assert not [r for r in caplog.records if "Socket write failed" in r.getMessage()]
+        assert not [
+            r for r in caplog.records if "Socket write failed" in r.getMessage()
+        ]
         assert not ext.wait_closed(0.3)  # no close(1011) scheduled
 
 
