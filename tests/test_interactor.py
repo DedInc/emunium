@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import math
 import random
+import statistics
 import sys
 import threading
 from typing import cast
@@ -32,6 +33,8 @@ from emunium._motion import (
     MotionStep,
     ScreenBounds,
     SigmaDriftPlanner,
+    TypingRhythm,
+    resolve_typing,
 )
 from emunium._native import win32
 from emunium._native.win32 import MonitorRect, Win32Backend
@@ -405,7 +408,8 @@ def test_windows_human_typing_keeps_rhythm_per_character():
     interactor.type_text("a\U0001f600\r\n", characters_per_minute=600, offset=20)
     assert [len(b) for b in sender.batches] == [2, 4, 2]
     assert len(sleep.calls) == 3
-    assert all(0.08 <= s <= 0.12 for s in sleep.calls)
+    low, high = interactor.typing.adjusted(600, 20).bounds()
+    assert all(low <= s <= high for s in sleep.calls)
 
 
 @pytest.mark.parametrize("cpm", [0, -5])
@@ -420,6 +424,273 @@ def test_type_text_rejects_non_str():
     interactor, _, _, _ = make("win32", unicode_sender=FakeSender())
     with pytest.raises(TypeError):
         interactor.type_text(b"abc")  # type: ignore[arg-type]
+
+
+# -- typing rhythm -------------------------------------------------------------
+
+# Cyrillic keys get neutral bigram and shift factors.
+NEUTRAL = "ж"
+# Only the lognormal base: no micro-pauses, no jitter.
+PLAIN = TypingRhythm(micro_pause_probability=0.0, jitter_ms=0.0)
+
+
+def draws(rhythm, typed, upcoming, count=4000, seed=1):
+    rng = random.Random(seed)
+    return [rhythm.interval(typed, upcoming, rng) for _ in range(count)]
+
+
+@pytest.mark.parametrize("cpm", [60, 280, 900])
+def test_rhythm_base_is_lognormal_around_the_requested_speed(cpm):
+    rhythm = PLAIN.adjusted(cpm, 0)
+    intervals = draws(rhythm, NEUTRAL, NEUTRAL)
+    assert statistics.median(intervals) == pytest.approx(60.0 / cpm, rel=0.03)
+    logs = [math.log(s) for s in intervals]
+    assert statistics.stdev(logs) == pytest.approx(rhythm.sigma, rel=0.08)
+    cut = 3.0 * rhythm.sigma
+    assert min(intervals) >= 60.0 / cpm * math.exp(-cut) - 1e-12
+    assert max(intervals) <= 60.0 / cpm * math.exp(cut) + 1e-12
+
+
+def test_natural_defaults_feel_human():
+    rhythm = TypingRhythm.preset("natural")
+    assert rhythm == TypingRhythm()
+    assert 0.25 <= rhythm.sigma <= 0.45
+    assert rhythm.characters_per_minute == 280
+    intervals = draws(rhythm, NEUTRAL, NEUTRAL)
+    assert statistics.median(intervals) == pytest.approx(60.0 / 280, rel=0.05)
+    assert 70 <= rhythm.dwell * 1000 <= 110
+
+
+def test_pause_after_space_and_sentence_punctuation():
+    base = statistics.median(draws(PLAIN, NEUTRAL, NEUTRAL))
+    word = statistics.median(draws(PLAIN, " ", NEUTRAL)) / base
+    sentence = statistics.median(draws(PLAIN, ".", " ")) / base
+    line = statistics.median(draws(PLAIN, "\n", NEUTRAL)) / base
+    assert 1.6 <= word <= 2.5 and 2.5 <= sentence <= 4.0 and 2.5 <= line <= 4.0
+    assert sentence > word * 1.2
+    end = statistics.median(draws(PLAIN, "!", None)) / base
+    assert 2.5 <= end <= 4.0
+
+
+def test_decimal_point_is_not_a_sentence_end():
+    rng = random.Random(3)
+    assert PLAIN.factor(".", "1", rng) == PLAIN.alternate_hand  # right ring, left pinky
+
+
+def test_pause_before_capitals_and_shifted_symbols_only():
+    rng = random.Random(4)
+    for upcoming in ("A", "?", '"'):
+        assert 1.2 <= PLAIN.factor(NEUTRAL, upcoming, rng) <= 1.5
+    for upcoming in ("a", "/", NEUTRAL, "Ж"):
+        assert PLAIN.factor(NEUTRAL, upcoming, rng) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("typed", "upcoming", "kind"),
+    [
+        ("a", "j", "alternate_hand"),
+        ("T", "h", "alternate_hand"),
+        ("!", "p", "alternate_hand"),
+        ("a", "s", "roll"),
+        ("k", "j", "roll"),
+        ("e", "d", "same_finger"),
+        ("l", "l", "same_finger"),
+        ("f", "t", "same_finger"),
+        ("a", "d", None),
+        (NEUTRAL, "a", None),
+        ("a", " ", None),
+    ],
+)
+def test_bigram_factor_follows_a_qwerty_finger_map(typed, upcoming, kind):
+    expected = 1.0 if kind is None else getattr(PLAIN, kind)
+    assert PLAIN.bigram(typed, upcoming) == expected
+    assert PLAIN.alternate_hand < 1.0 < PLAIN.same_finger
+
+
+def test_micro_pauses_are_rare_and_bounded():
+    rhythm = TypingRhythm(
+        characters_per_minute=600,
+        sigma=0.1,
+        micro_pause_probability=0.03,
+        micro_pause=(0.4, 0.6),
+        jitter_ms=0.0,
+    )
+    intervals = draws(rhythm, NEUTRAL, NEUTRAL, count=8000)
+    # Base intervals stay below 0.1 * e^0.3 s; a micro-pause adds 0.4-0.6 s.
+    paused = [s for s in intervals if s > 0.3]
+    assert 0.02 <= len(paused) / len(intervals) <= 0.04
+    assert all(0.4 <= s <= 0.6 + 0.1 * math.exp(0.3) for s in paused)
+
+
+@pytest.mark.parametrize("name", ["natural", "careful", "brisk"])
+def test_every_interval_stays_inside_the_rhythm_bounds(name):
+    rhythm = TypingRhythm.preset(name)
+    low, high = rhythm.bounds()
+    rng = random.Random(5)
+    text = "The Quick, brown fox! Jumps over 3.14 lazy dogs?\nЖж ж.\t"
+    for _ in range(60):
+        for index, typed in enumerate(text):
+            upcoming = text[index + 1] if index + 1 < len(text) else None
+            assert low <= rhythm.interval(typed, upcoming, rng) <= high
+    assert low >= 0.015
+
+
+def test_presets_order_by_speed_and_resolve():
+    careful, natural, brisk = (
+        TypingRhythm.preset(name) for name in ("careful", "natural", "brisk")
+    )
+    assert careful.median_ms > natural.median_ms > brisk.median_ms
+    assert resolve_typing(None) == natural
+    assert resolve_typing("brisk") == brisk
+    assert resolve_typing(careful) is careful
+    with pytest.raises(InvalidArgumentError, match="preset must be one of"):
+        TypingRhythm.preset("sloppy")
+
+
+@pytest.mark.parametrize("bad", ["sloppy", 3, SigmaDriftPlanner()])
+def test_resolve_typing_rejects_unknown_values(bad):
+    with pytest.raises(InvalidArgumentError, match="typing must be one of"):
+        resolve_typing(bad)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("characters_per_minute", 59),
+        ("characters_per_minute", 901),
+        ("characters_per_minute", True),
+        ("sigma", 0.05),
+        ("sigma", float("nan")),
+        ("word_pause", (2.5, 1.6)),
+        ("sentence_pause", (2.5,)),
+        ("shift_pause", (1.2, 2.5)),
+        ("alternate_hand", 1.1),
+        ("same_finger", 0.9),
+        ("micro_pause_probability", 0.2),
+        ("micro_pause", (-0.1, 0.5)),
+        ("jitter_ms", -1),
+        ("dwell", 0.5),
+    ],
+)
+def test_rhythm_rejects_out_of_range_parameters(field, value):
+    with pytest.raises(InvalidArgumentError, match=f"TypingRhythm.{field}"):
+        TypingRhythm(**{field: value})
+
+
+def test_jitter_must_stay_below_the_median_interval():
+    TypingRhythm(characters_per_minute=600, jitter_ms=99)
+    with pytest.raises(InvalidArgumentError, match="below the median interval"):
+        TypingRhythm(characters_per_minute=600, jitter_ms=100)
+
+
+def test_legacy_arguments_map_onto_the_model():
+    natural = TypingRhythm.preset("natural")
+    assert natural.adjusted() is natural
+    mapped = natural.adjusted(600, 40)
+    assert (mapped.characters_per_minute, mapped.jitter_ms) == (600, 40)
+    assert mapped.sigma == natural.sigma and mapped.word_pause == natural.word_pause
+
+
+@pytest.mark.parametrize(
+    ("cpm", "offset", "match"),
+    [
+        (59, 20, "characters_per_minute"),
+        (901, 20, "characters_per_minute"),
+        ("fast", 20, "characters_per_minute"),
+        (600, 100, "offset must stay below"),
+        (600, -1, "offset"),
+    ],
+)
+def test_legacy_arguments_are_validated(cpm, offset, match):
+    with pytest.raises(InvalidArgumentError, match=match):
+        TypingRhythm.preset("natural").adjusted(cpm, offset)
+
+
+def test_type_text_validates_before_sending_anything():
+    sender = FakeSender()
+    interactor, _, sleep, _ = make("win32", unicode_sender=sender)
+    with pytest.raises(InvalidArgumentError, match="characters_per_minute"):
+        interactor.type_text("abc", characters_per_minute=1000)
+    with pytest.raises(InvalidArgumentError, match="offset"):
+        interactor.type_text("abc", characters_per_minute=600, offset=150)
+    assert sender.batches == [] and sleep.calls == []
+    interactor.type_text("abc", characters_per_minute=1000, offset=500, human=False)
+    assert len(sender.batches) == 1 and sleep.calls == []
+
+
+def test_type_text_uses_the_interactor_rhythm_and_its_overrides():
+    slow = TypingRhythm(characters_per_minute=120, micro_pause_probability=0.0)
+    sender = FakeSender()
+    interactor, _, sleep, _ = make("win32", unicode_sender=sender, typing=slow)
+    assert interactor.typing is slow
+    interactor.type_text(NEUTRAL * 1500)
+    assert statistics.median(sleep.calls) == pytest.approx(0.5, rel=0.05)
+    sleep.calls.clear()
+    interactor.type_text(NEUTRAL * 1500, characters_per_minute=600, offset=0)
+    assert statistics.median(sleep.calls) == pytest.approx(0.1, rel=0.05)
+    interactor, _, _, _ = make("win32", unicode_sender=FakeSender(), typing="brisk")
+    assert interactor.typing == TypingRhythm.preset("brisk")
+    assert make("win32", unicode_sender=FakeSender())[0].typing == TypingRhythm()
+
+
+def test_windows_typing_pauses_at_word_and_sentence_ends():
+    sender = FakeSender()
+    interactor, _, sleep, _ = make("win32", unicode_sender=sender, typing=PLAIN)
+    unit = NEUTRAL * 2 + ". " + NEUTRAL * 2 + " "
+    interactor.type_text(unit * 300)
+    # Sleep i follows stroke i of the unit: zh zh . space zh zh space.
+    by_stroke = [sleep.calls[i :: len(unit)] for i in range(len(unit))]
+    base = statistics.median(by_stroke[0])
+    assert 2.5 <= statistics.median(by_stroke[2]) / base <= 4.0
+    assert 1.6 <= statistics.median(by_stroke[3]) / base <= 2.5
+    assert 1.6 <= statistics.median(by_stroke[6]) / base <= 2.5
+
+
+def test_posix_typing_passes_the_next_keystroke_to_the_rhythm():
+    seen = []
+
+    class Recording(TypingRhythm):
+        def interval(self, typed, upcoming, rng):
+            seen.append((typed, upcoming))
+            return 0.1
+
+    keyboard_log = []
+    interactor, _, _, _ = make(
+        "linux",
+        keyboard=FakeKeyboard(keyboard_log),
+        clipboard=FakeClipboard(),
+        typing=Recording(),
+    )
+    interactor.type_text("aéü\nb")
+    assert seen == [
+        ("a", "é"),
+        ("é", "ü"),
+        ("ü", "\n"),
+        ("\n", "b"),
+        ("b", None),
+    ]
+
+
+def test_rhythm_is_deterministic_for_a_seed():
+    def run():
+        sender = FakeSender()
+        interactor, _, sleep, _ = make("win32", unicode_sender=sender)
+        interactor.type_text("Hello, World. Again!")
+        return sleep.calls
+
+    assert run() == run()
+
+
+def test_dwell_is_lognormal_around_the_preset_hold():
+    rhythm = TypingRhythm.preset("natural")
+    rng = random.Random(6)
+    holds = [rhythm.hold(rng) for _ in range(4000)]
+    assert statistics.median(holds) == pytest.approx(rhythm.dwell, rel=0.03)
+    cut = 3.0 * rhythm.dwell_sigma
+    assert min(holds) >= rhythm.dwell * math.exp(-cut) - 1e-12
+    assert max(holds) <= rhythm.dwell * math.exp(cut) + 1e-12
+    middle = sorted(holds)[400:3600]
+    assert 0.065 <= middle[0] and middle[-1] <= 0.115
 
 
 class FakeUser32:
@@ -575,7 +846,8 @@ def test_keyboard_failure_falls_back_to_paste_for_the_rest():
 def test_posix_human_typing_paces_and_plain_typing_does_not():
     interactor, _, sleep, _ = make("linux", keyboard=None, clipboard=FakeClipboard())
     interactor.type_text("abc", characters_per_minute=300, offset=0)
-    assert sleep.calls == [pytest.approx(0.2)] * 3
+    low, high = interactor.typing.adjusted(300, 0).bounds()
+    assert len(sleep.calls) == 3 and all(low <= s <= high for s in sleep.calls)
     interactor, _, sleep, _ = make("linux", keyboard=None, clipboard=FakeClipboard())
     interactor.type_text("abc", characters_per_minute=300, human=False)
     assert sleep.calls == []

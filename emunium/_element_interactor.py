@@ -27,7 +27,9 @@ from emunium._motion import (
     MotionPlanner,
     MotionStep,
     ScreenBounds,
+    TypingRhythm,
     resolve_motion,
+    resolve_typing,
 )
 from emunium._native.win32 import (
     INPUT,
@@ -215,9 +217,11 @@ class ElementInteractor:
 
     ``motion`` is a preset name (``natural``, ``careful``, ``brisk``), a
     ``MotionPlanner`` or None (``SigmaDriftPlanner.preset("natural")``); see
-    ``emunium._motion``. ``rng`` feeds every random choice, the planner's too.
-    ``clock`` (default ``time.perf_counter``, also when only ``sleep`` is
-    injected) times the playback of a planned move.
+    ``emunium._motion``. ``typing`` is a preset name, a ``TypingRhythm`` or
+    None (``TypingRhythm.preset("natural")``); it paces
+    ``type_text(human=True)``. ``rng`` feeds every random choice, the
+    planner's and the rhythm's too. ``clock`` (default ``time.perf_counter``,
+    also when only ``sleep`` is injected) times the playback of a planned move.
     """
 
     def __init__(
@@ -233,8 +237,10 @@ class ElementInteractor:
         rng: random.Random | None = None,
         motion: MotionPlanner | str | None = None,
         clock: Callable[[], float] | None = None,
+        typing: TypingRhythm | str | None = None,
     ) -> None:
         self._motion = resolve_motion(motion)
+        self._typing = resolve_typing(typing)
         self._backend = backend
         self._platform = platform or sys.platform
         self._unicode_sender = unicode_sender
@@ -294,6 +300,11 @@ class ElementInteractor:
     def motion(self) -> MotionPlanner:
         """The planner ``move(human=True)`` follows."""
         return self._motion
+
+    @property
+    def typing(self) -> TypingRhythm:
+        """The rhythm ``type_text(human=True)`` follows."""
+        return self._typing
 
     def move(
         self,
@@ -598,22 +609,35 @@ class ElementInteractor:
         self,
         text: str,
         *,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         human: bool = True,
     ) -> None:
+        """Type ``text``; with ``human`` each keystroke waits ``typing.interval``.
+
+        ``characters_per_minute`` (60-900) sets the rhythm's median speed and
+        ``offset`` (ms, below the median interval) its ``jitter_ms``; None
+        keeps the rhythm's own value. Out-of-range values raise
+        ``InvalidArgumentError``. A ``characters_per_minute`` of 0 or less
+        still types without delay, as ``human=False`` does.
+        """
         if not isinstance(text, str):
             raise TypeError(f"text must be str, got {type(text).__name__!r}")
+        rhythm: TypingRhythm | None = None
+        instant = (
+            isinstance(characters_per_minute, (int, float))
+            and not isinstance(characters_per_minute, bool)
+            and characters_per_minute <= 0
+        )
+        if human and not instant:
+            rhythm = self._typing.adjusted(characters_per_minute, offset)
         if not text:
             return
-        delay = (
-            60.0 / characters_per_minute if human and characters_per_minute > 0 else 0.0
-        )
         with NATIVE_INPUT_LOCK:
             if self._platform == "win32":
-                self._type_windows(text, delay, offset)
+                self._type_windows(text, rhythm)
             else:
-                self._type_posix(text, delay, offset)
+                self._type_posix(text, rhythm)
 
     def paste_text(self, text: str) -> None:
         if not text:
@@ -665,10 +689,18 @@ class ElementInteractor:
                 ),
             )
 
-    def _pace(self, delay: float, offset: int) -> None:
-        if delay <= 0:
+    def _pace(
+        self, rhythm: TypingRhythm | None, typed: str, upcoming: str | None
+    ) -> None:
+        """Wait the rhythm's interval from ``typed`` to ``upcoming``.
+
+        After the last keystroke (``upcoming`` None) the wait still runs: a
+        long text reaches here in chunks, and the next chunk must not follow
+        without a pause.
+        """
+        if rhythm is None:
             return
-        self._sleep(max(0.0, delay + self._rng.uniform(-offset, offset) / 1000.0))
+        self._sleep(rhythm.interval(typed, upcoming, self._rng))
 
     @staticmethod
     def _check_modifiers(sender: Any) -> None:
@@ -682,35 +714,40 @@ class ElementInteractor:
                 "shortcuts, release it and retry".format(", ".join(held))
             )
 
-    def _type_windows(self, text: str, delay: float, offset: int) -> None:
+    def _type_windows(self, text: str, rhythm: TypingRhythm | None) -> None:
         sender = self._sender()
-        if delay <= 0:
+        if rhythm is None:
             self._check_modifiers(sender)
             sender.send(keyboard_events(text))
             return
-        for stroke in split_strokes(text):
+        strokes = split_strokes(text)
+        for index, stroke in enumerate(strokes):
             self._check_modifiers(sender)
+            # Down and up go out in one SendInput batch: no dwell between them.
             sender.send(stroke_events(stroke))
-            self._pace(delay, offset)
+            upcoming = strokes[index + 1] if index + 1 < len(strokes) else None
+            self._pace(rhythm, stroke, upcoming)
 
     @staticmethod
     def _is_pyautogui_stroke(stroke: str) -> bool:
         return stroke in ("\n", "\t") or (stroke.isascii() and stroke.isprintable())
 
-    def _type_posix(self, text: str, delay: float, offset: int) -> None:
+    def _type_posix(self, text: str, rhythm: TypingRhythm | None) -> None:
         gui = self._gui()
         strokes = split_strokes(text)
         index = 0
         while index < len(strokes):
             stroke = strokes[index]
             if self._is_pyautogui_stroke(stroke):
+                # pyautogui presses and releases in one call: no dwell between.
                 if stroke == "\n":
                     gui.press("enter", _pause=False)
                 elif stroke == "\t":
                     gui.press("tab", _pause=False)
                 else:
                     gui.write(stroke, _pause=False)
-                self._pace(delay, offset)
+                upcoming = strokes[index + 1] if index + 1 < len(strokes) else None
+                self._pace(rhythm, stroke, upcoming)
                 index += 1
                 continue
             run_end = index
@@ -718,11 +755,17 @@ class ElementInteractor:
                 strokes[run_end]
             ):
                 run_end += 1
-            self._type_other("".join(strokes[index:run_end]), delay, offset)
+            following = strokes[run_end] if run_end < len(strokes) else None
+            self._type_other("".join(strokes[index:run_end]), rhythm, following)
             index = run_end
 
-    def _type_other(self, chunk: str, delay: float, offset: int) -> None:
-        """Characters pyautogui cannot type: ``keyboard`` package, else paste."""
+    def _type_other(
+        self, chunk: str, rhythm: TypingRhythm | None, following: str | None
+    ) -> None:
+        """Characters pyautogui cannot type: ``keyboard`` package, else paste.
+
+        ``following`` is the keystroke after ``chunk`` (None at the end).
+        """
         keyboard = self._keyboard_module()
         if keyboard is not None:
             for position, character in enumerate(chunk):
@@ -730,10 +773,11 @@ class ElementInteractor:
                     keyboard.write(character)
                 except Exception:
                     self.paste_text(chunk[position:])
-                    self._pace(delay, offset)
+                    self._pace(rhythm, chunk, following)
                     return
-                self._pace(delay, offset)
+                upcoming = chunk[position + 1 : position + 2] or following
+                self._pace(rhythm, character, upcoming)
             return
         # One paste per run: a paste per character would cost a settle each.
         self.paste_text(chunk)
-        self._pace(delay, offset)
+        self._pace(rhythm, chunk, following)

@@ -28,6 +28,10 @@ Each non-linear planner has the presets ``natural``, ``careful`` and
 ``brisk`` (``Planner.preset(name)``). Every parameter is checked against a
 documented range on construction and raises ``InvalidArgumentError`` naming
 the parameter and the range.
+
+Keyboard timing follows the same conventions: ``TypingRhythm`` (presets
+``natural``, ``careful``, ``brisk``; ``resolve_typing``) draws the wait
+between two keystrokes.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from __future__ import annotations
 import math
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 from emunium.errors import InvalidArgumentError
@@ -56,8 +60,10 @@ __all__ = [
     "SigmaDriftPlanner",
     "Trajectory",
     "Tremor",
+    "TypingRhythm",
     "WindMousePlanner",
     "resolve_motion",
+    "resolve_typing",
     "tremor_envelope",
 ]
 
@@ -1272,4 +1278,307 @@ def resolve_motion(motion: MotionPlanner | str | None) -> MotionPlanner:
     raise InvalidArgumentError(
         f"motion must be one of {PRESET_NAMES}, a MotionPlanner or None, "
         f"got {type(motion).__name__}"
+    )
+
+
+# -- typing rhythm --------------------------------------------------------------
+
+# Inter-key draws are cut at +-3 sigma of the lognormal, so no single base
+# interval is absurdly short or long.
+_KEY_SIGMAS = 3.0
+# No wait between two keystrokes is ever shorter than this (s): the fastest
+# human rollovers are about 20-30 ms apart.
+_MIN_KEY_INTERVAL = 0.015
+_CPM_RANGE = (60.0, 900.0)
+_WORD_BREAKS = frozenset(" \t ")
+# Ends a sentence when followed by whitespace or the end of the text.
+_SENTENCE_MARKS = frozenset(".!?…")
+# Shifted US-QWERTY symbols and the key that carries them.
+_SHIFTED_SYMBOLS = dict(zip('~!@#$%^&*()_+{}|:"<>?', "`1234567890-=[]\\;',./"))
+# US-QWERTY touch-typing fingers: (hand, finger), hand 0 left / 1 right,
+# finger 0 pinky .. 3 index on either hand.
+_KEY_FINGERS: dict[str, tuple[int, int]] = {
+    key: (hand, finger)
+    for hand, finger, keys in (
+        (0, 0, "`1qaz"),
+        (0, 1, "2wsx"),
+        (0, 2, "3edc"),
+        (0, 3, "4rfv5tgb"),
+        (1, 3, "6yhn7ujm"),
+        (1, 2, "8ik,"),
+        (1, 1, "9ol."),
+        (1, 0, "0p;/-[]'=\\"),
+    )
+    for key in keys
+}
+
+
+def _finger(character: str) -> tuple[int, int] | None:
+    """QWERTY ``(hand, finger)`` of an ASCII key; None for any other character."""
+    if not character.isascii():
+        return None
+    key = _SHIFTED_SYMBOLS.get(character, character.lower())
+    return _KEY_FINGERS.get(key)
+
+
+def _needs_shift(character: str) -> bool:
+    return character.isascii() and (
+        character.isupper() or character in _SHIFTED_SYMBOLS
+    )
+
+
+@dataclass(frozen=True)
+class TypingRhythm:
+    """Wait between two keystrokes of humanized typing.
+
+    ``interval(typed, upcoming, rng)`` is the time from the keystroke
+    ``typed`` to ``upcoming`` (None at the end of the text):
+
+    1. base: lognormal with median ``60 / characters_per_minute`` s and
+       ``sigma``, cut at +-3 sigma;
+    2. times ``U(word_pause)`` after a space or tab, or ``U(sentence_pause)``
+       after a line break or after ``. ! ? ...`` followed by whitespace or the
+       end of the text;
+    3. times ``U(shift_pause)`` before an ASCII capital or shifted symbol;
+    4. times a bigram factor from a US-QWERTY finger map: ``alternate_hand``
+       when the two keys use different hands, ``roll`` for neighbouring
+       fingers of one hand, ``same_finger`` when one finger types both
+       (repeats included); 1.0 for any other pair and for non-ASCII
+       characters (no layout is assumed for them);
+    5. plus ``U(micro_pause)`` s with probability ``micro_pause_probability``
+       (a glance, a hesitation);
+    6. plus ``U(-jitter_ms, jitter_ms)`` ms, the legacy ``offset`` argument;
+    7. at least 15 ms.
+
+    ``dwell`` / ``dwell_sigma`` give the key hold time (``hold(rng)``,
+    lognormal, cut at +-3 sigma). It only applies where a key is pressed and
+    released by separate calls; the typing backends send each keystroke's
+    down and up events together (one ``SendInput`` batch on Windows, one
+    pyautogui / ``keyboard`` call elsewhere), so ``type_text`` uses only
+    ``interval``.
+
+    Ranges: ``characters_per_minute`` [60, 900], ``sigma`` [0.1, 0.6],
+    ``word_pause`` [1, 4], ``sentence_pause`` [1, 6], ``shift_pause`` [1, 2],
+    ``alternate_hand`` [0.5, 1], ``roll`` [0.5, 1], ``same_finger`` [1, 2],
+    ``micro_pause_probability`` [0, 0.1], ``micro_pause`` [0, 2] s,
+    ``jitter_ms`` [0, 1000] ms, ``dwell`` [0.03, 0.25] s, ``dwell_sigma``
+    [0, 0.5]. Cross-check: ``jitter_ms`` stays below the median interval
+    ``60000 / characters_per_minute`` ms.
+    """
+
+    characters_per_minute: float = 280.0
+    sigma: float = 0.35
+    word_pause: tuple[float, float] = (1.6, 2.5)
+    sentence_pause: tuple[float, float] = (2.5, 4.0)
+    shift_pause: tuple[float, float] = (1.2, 1.5)
+    alternate_hand: float = 0.85
+    roll: float = 0.92
+    same_finger: float = 1.25
+    micro_pause_probability: float = 0.03
+    micro_pause: tuple[float, float] = (0.15, 0.6)
+    jitter_ms: float = 20.0
+    dwell: float = 0.09
+    dwell_sigma: float = 0.18
+
+    def __post_init__(self) -> None:
+        name = "TypingRhythm"
+        _store(
+            self,
+            "characters_per_minute",
+            _number(
+                f"{name}.characters_per_minute",
+                self.characters_per_minute,
+                *_CPM_RANGE,
+            ),
+        )
+        _store(self, "sigma", _number(f"{name}.sigma", self.sigma, 0.1, 0.6))
+        for field_name, high in (
+            ("word_pause", 4.0),
+            ("sentence_pause", 6.0),
+            ("shift_pause", 2.0),
+        ):
+            value = getattr(self, field_name)
+            _store(self, field_name, _span(f"{name}.{field_name}", value, 1.0, high))
+        for field_name, low, high in (
+            ("alternate_hand", 0.5, 1.0),
+            ("roll", 0.5, 1.0),
+            ("same_finger", 1.0, 2.0),
+            ("micro_pause_probability", 0.0, 0.1),
+            ("dwell_sigma", 0.0, 0.5),
+        ):
+            value = getattr(self, field_name)
+            _store(self, field_name, _number(f"{name}.{field_name}", value, low, high))
+        _store(
+            self,
+            "micro_pause",
+            _span(f"{name}.micro_pause", self.micro_pause, 0.0, 2.0, " s"),
+        )
+        _store(
+            self,
+            "jitter_ms",
+            _number(f"{name}.jitter_ms", self.jitter_ms, 0.0, 1000.0, " ms"),
+        )
+        _store(self, "dwell", _number(f"{name}.dwell", self.dwell, 0.03, 0.25, " s"))
+        if self.jitter_ms >= self.median_ms:
+            raise InvalidArgumentError(
+                f"{name}.jitter_ms must stay below the median interval "
+                f"{self.median_ms:.1f} ms, got {self.jitter_ms}"
+            )
+
+    @classmethod
+    def preset(cls, name: str) -> TypingRhythm:
+        """``natural`` (default), ``careful`` (slower, longer pauses), ``brisk``."""
+        name = _preset_name(name, "TypingRhythm")
+        if name == "careful":
+            return cls(
+                characters_per_minute=200.0,
+                sigma=0.3,
+                word_pause=(1.9, 2.5),
+                sentence_pause=(3.0, 4.0),
+                shift_pause=(1.3, 1.5),
+                alternate_hand=0.88,
+                roll=0.94,
+                same_finger=1.3,
+                micro_pause_probability=0.04,
+                micro_pause=(0.2, 0.6),
+                jitter_ms=15.0,
+                dwell=0.1,
+                dwell_sigma=0.15,
+            )
+        if name == "brisk":
+            return cls(
+                characters_per_minute=420.0,
+                sigma=0.4,
+                word_pause=(1.6, 2.0),
+                sentence_pause=(2.5, 3.2),
+                shift_pause=(1.2, 1.35),
+                alternate_hand=0.8,
+                roll=0.9,
+                same_finger=1.2,
+                micro_pause_probability=0.02,
+                micro_pause=(0.15, 0.4),
+                jitter_ms=10.0,
+                dwell=0.075,
+                dwell_sigma=0.2,
+            )
+        return cls()
+
+    @property
+    def median_ms(self) -> float:
+        """Median of the base interval, ``60000 / characters_per_minute`` ms."""
+        return 60000.0 / self.characters_per_minute
+
+    def adjusted(
+        self,
+        characters_per_minute: float | None = None,
+        offset: float | None = None,
+    ) -> TypingRhythm:
+        """This rhythm at another speed and/or ``jitter_ms`` (None keeps it).
+
+        Maps the legacy ``type_text(characters_per_minute=, offset=)``
+        arguments onto the model; out-of-range values raise
+        ``InvalidArgumentError`` naming the argument.
+        """
+        cpm = self.characters_per_minute
+        if characters_per_minute is not None:
+            cpm = _number("characters_per_minute", characters_per_minute, *_CPM_RANGE)
+        jitter = self.jitter_ms
+        if offset is not None:
+            limit = 60000.0 / cpm
+            jitter = _number("offset", offset, 0.0, 1000.0, " ms")
+            if jitter >= limit:
+                raise InvalidArgumentError(
+                    f"offset must stay below the median interval {limit:.1f} ms at "
+                    f"{cpm:g} characters per minute, got {offset!r}"
+                )
+        if cpm == self.characters_per_minute and jitter == self.jitter_ms:
+            return self
+        return replace(self, characters_per_minute=cpm, jitter_ms=jitter)
+
+    def factor(self, typed: str, upcoming: str | None, rng: random.Random) -> float:
+        """Product of the pause, shift and bigram factors (steps 2-4)."""
+        last = typed[-1:]
+        following = upcoming[:1] if upcoming else ""
+        factor = 1.0
+        if last == "\n" or (
+            last in _SENTENCE_MARKS and (not following or following.isspace())
+        ):
+            factor *= rng.uniform(*self.sentence_pause)
+        elif last in _WORD_BREAKS:
+            factor *= rng.uniform(*self.word_pause)
+        if following and _needs_shift(following):
+            factor *= rng.uniform(*self.shift_pause)
+        return factor * self.bigram(last, following)
+
+    def bigram(self, typed: str, upcoming: str) -> float:
+        """Bigram factor of two characters (step 4); 1.0 when either is unmapped."""
+        first, second = _finger(typed[:1]), _finger(upcoming[:1])
+        if first is None or second is None:
+            return 1.0
+        if first[0] != second[0]:
+            return self.alternate_hand
+        if first[1] == second[1]:
+            return self.same_finger
+        if abs(first[1] - second[1]) == 1:
+            return self.roll
+        return 1.0
+
+    def interval(self, typed: str, upcoming: str | None, rng: random.Random) -> float:
+        """Seconds from the keystroke ``typed`` to ``upcoming`` (steps 1-7)."""
+        cut = _KEY_SIGMAS * self.sigma
+        seconds = (self.median_ms / 1000.0) * math.exp(
+            min(max(rng.gauss(0.0, self.sigma), -cut), cut)
+        )
+        seconds *= self.factor(typed, upcoming, rng)
+        if rng.random() < self.micro_pause_probability:
+            seconds += rng.uniform(*self.micro_pause)
+        if self.jitter_ms > 0.0:
+            seconds += rng.uniform(-self.jitter_ms, self.jitter_ms) / 1000.0
+        return max(seconds, _MIN_KEY_INTERVAL)
+
+    def bounds(self) -> tuple[float, float]:
+        """Shortest and longest interval ``interval`` can return (s)."""
+        median = self.median_ms / 1000.0
+        cut = _KEY_SIGMAS * self.sigma
+        jitter = self.jitter_ms / 1000.0
+        fastest = median * math.exp(-cut) * min(self.alternate_hand, self.roll)
+        slowest = (
+            median
+            * math.exp(cut)
+            * max(self.word_pause[1], self.sentence_pause[1])
+            * self.shift_pause[1]
+            * self.same_finger
+            + self.micro_pause[1]
+            + jitter
+        )
+        return max(fastest - jitter, _MIN_KEY_INTERVAL), slowest
+
+    def hold(self, rng: random.Random) -> float:
+        """Key hold (dwell) time in seconds."""
+        cut = _KEY_SIGMAS * self.dwell_sigma
+        return self.dwell * math.exp(
+            min(max(rng.gauss(0.0, self.dwell_sigma), -cut), cut)
+        )
+
+
+def resolve_typing(typing: TypingRhythm | str | None) -> TypingRhythm:
+    """The rhythm for a ``typing=`` argument.
+
+    ``None`` -> ``TypingRhythm.preset("natural")``; a preset name -> that
+    preset; a ``TypingRhythm`` -> itself.
+    """
+    if typing is None:
+        return TypingRhythm.preset("natural")
+    if isinstance(typing, str):
+        if typing not in PRESET_NAMES:
+            raise InvalidArgumentError(
+                f"typing must be one of {PRESET_NAMES}, a TypingRhythm or None, "
+                f"got {typing!r}"
+            )
+        return TypingRhythm.preset(typing)
+    if isinstance(typing, TypingRhythm):
+        return typing
+    raise InvalidArgumentError(
+        f"typing must be one of {PRESET_NAMES}, a TypingRhythm or None, "
+        f"got {type(typing).__name__}"
     )
