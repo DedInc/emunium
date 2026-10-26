@@ -16,7 +16,7 @@ from typing import Protocol
 
 from emunium._bridge.facade import Bridge
 from emunium._element_interactor import ElementInteractor
-from emunium._motion import DEFAULT_TARGET_SIZE, MotionPlanner
+from emunium._motion import DEFAULT_TARGET_SIZE, MotionPlanner, TypingRhythm
 from emunium._native.win32 import (
     Win32Windows,
     WindowApi,
@@ -78,10 +78,12 @@ class Interactor(Protocol):
         self,
         text: str,
         *,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         human: bool = True,
-    ) -> None: ...
+    ) -> None:
+        """Type ``text``; None keeps the interactor's typing rhythm speed and jitter."""
+        ...
 
 
 def _corner_of(point: tuple[int, int], box: tuple[int, int, int, int]) -> bool:
@@ -174,14 +176,22 @@ class BrowserContext:
         pid: int | None = None,
         windows: WindowApi | None = None,
         motion: MotionPlanner | str | None = None,
+        typing: TypingRhythm | str | None = None,
     ) -> None:
         """``motion`` picks the human pointer planner of the default interactor
         (a preset name, a ``MotionPlanner`` or None for the ``natural``
-        ``SigmaDriftPlanner``); it cannot be combined with ``interactor``.
+        ``SigmaDriftPlanner``); ``typing`` picks its typing rhythm (a preset
+        name, a ``TypingRhythm`` or None for the ``natural`` preset). Neither
+        can be combined with ``interactor``.
         """
         if motion is not None and interactor is not None:
             raise InvalidArgumentError(
                 "motion configures the default interactor; pass motion or "
+                "interactor, not both"
+            )
+        if typing is not None and interactor is not None:
+            raise InvalidArgumentError(
+                "typing configures the default interactor; pass typing or "
                 "interactor, not both"
             )
         self.bridge = bridge
@@ -190,7 +200,9 @@ class BrowserContext:
         self.calibration = calibration if calibration is not None else Calibration()
         # The interactor resolves its OS backend lazily, on the first event.
         self.interactor: Interactor = (
-            interactor if interactor is not None else DragInteractor(motion=motion)
+            interactor
+            if interactor is not None
+            else DragInteractor(motion=motion, typing=typing)
         )
         self.last_action_ms: float | None = None
         # The browser process launched for this context (set by Browser.launch);

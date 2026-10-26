@@ -1138,7 +1138,7 @@ def test_type_checks_focus_before_typing(world: World) -> None:
         if step in ("press", "type", "focusState", "focus")
     ]
     assert tail == ["press", "focusState", "focus", "focusState", "type"]
-    assert world.kinds("type") == [("type", "hello", 280, 20, False)]
+    assert world.kinds("type") == [("type", "hello", None, None, False)]
 
 
 def test_type_sends_chunks_with_a_focus_check_before_each(world: World) -> None:

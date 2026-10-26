@@ -17,7 +17,7 @@ from emunium._browser import tabs as tab_ops
 from emunium._browser.context import BrowserContext
 from emunium._browser.launcher import BrowserSession, close, launch
 from emunium._browser.page import ResponseExpectation
-from emunium._motion import MotionPlanner
+from emunium._motion import MotionPlanner, TypingRhythm
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.element import Element
@@ -44,10 +44,13 @@ class Browser:
         extra_args: list[str] | None = None,
         verify_input: bool = True,
         motion: MotionPlanner | str | None = None,
+        typing: TypingRhythm | str | None = None,
     ) -> None:
         """``motion``: human pointer planner, a preset name (``natural``,
         ``careful``, ``brisk``), a ``MotionPlanner`` or None (``natural``
-        ``SigmaDriftPlanner``); ``human=False`` actions stay instant.
+        ``SigmaDriftPlanner``); ``typing``: human typing rhythm, a preset name,
+        a ``TypingRhythm`` or None (``natural``); ``human=False`` actions stay
+        instant.
         """
         bridge = Bridge(port=bridge_port)
         self._session = BrowserSession()
@@ -59,7 +62,11 @@ class Browser:
         self._session.extra_args = [] if extra_args is None else extra_args
         self._bridge_timeout = bridge_timeout
         self._ctx = BrowserContext(
-            bridge, headless=bool(headless), verify_input=verify_input, motion=motion
+            bridge,
+            headless=bool(headless),
+            verify_input=verify_input,
+            motion=motion,
+            typing=typing,
         )
 
     @property
@@ -240,11 +247,12 @@ class Browser:
         selector: str | Element,
         text: str,
         *,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         human: bool = True,
         timeout: float = 10.0,
     ) -> Element:
+        """``type_at`` with a left click; None keeps the typing rhythm's speed."""
         return self.type_at(
             selector,
             text,
@@ -259,12 +267,17 @@ class Browser:
         target: str | Element,
         text: str,
         *,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         human: bool = True,
         click_type: ClickType = ClickType.LEFT,
         timeout: float = 10.0,
     ) -> Element:
+        """Click ``target`` and type ``text`` (``Element.type``).
+
+        ``characters_per_minute`` and ``offset`` (ms of jitter) override the
+        browser's typing rhythm; None keeps the rhythm's own values.
+        """
         self._ctx.require_native_input()
         el = self._resolve_element(target, timeout=timeout)
         self._ctx.mark_action()

@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 
 from emunium import _screen
 from emunium._element_interactor import ElementInteractor
-from emunium._motion import MotionPlanner
+from emunium._motion import MotionPlanner, TypingRhythm
 from emunium._screen import NATIVE_INPUT_LOCK
 from emunium._standalone import ocr as _ocr
 from emunium._standalone import vision
@@ -96,10 +96,12 @@ class Emunium:
         *,
         ocr: bool | None = None,
         motion: MotionPlanner | str | None = None,
+        typing: TypingRhythm | str | None = None,
     ) -> None:
         """``motion``: human pointer planner, a preset name (``natural``,
         ``careful``, ``brisk``), a ``MotionPlanner`` or None (``natural``);
-        resolved like ``Browser(motion=)``.
+        resolved like ``Browser(motion=)``. ``typing``: typing rhythm, a preset
+        name, a ``TypingRhythm`` or None (``natural``), as ``Browser(typing=)``.
         """
         if ocr is not None and ocr_enabled and not ocr:
             raise ValueError("conflicting arguments: ocr_enabled=True and ocr=False")
@@ -107,7 +109,7 @@ class Emunium:
         self.ocr = enabled
         self.ocr_reader: _ocr.OcrReader | None = None
         self.monitor_region: tuple[int, int, int, int] | None = None
-        self.interactor = ElementInteractor(motion=motion)
+        self.interactor = ElementInteractor(motion=motion, typing=typing)
         self._cursor: SystemCursor | None = None
 
         if enabled:
@@ -242,8 +244,8 @@ class Emunium:
         self,
         element_center: dict[str, int],
         text: str,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         click_type: ClickType = ClickType.LEFT,
     ) -> None:
         # One lock span: no other native input lands between the click and the text.
@@ -252,9 +254,16 @@ class Emunium:
             self.type_text(text, characters_per_minute, offset)
 
     def type_text(
-        self, text: str, characters_per_minute: int = 280, offset: int = 20
+        self,
+        text: str,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
     ) -> None:
-        """Layout-independent typing through ``ElementInteractor``."""
+        """Layout-independent typing through ``ElementInteractor``.
+
+        ``characters_per_minute`` and ``offset`` (ms of jitter) override the
+        ``typing`` rhythm; None keeps the rhythm's own values.
+        """
         self.interactor.type_text(
             text, characters_per_minute=characters_per_minute, offset=offset
         )

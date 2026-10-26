@@ -843,15 +843,17 @@ class Element:
         self,
         text: str,
         *,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         human: bool = True,
         click_type: ClickType = ClickType.LEFT,
         settle: bool = True,
     ) -> None:
         """Verified click, focus check (one ``focus`` retry), then keystrokes.
 
-        Text goes out in chunks of ``TYPE_CHUNK`` characters; focus is checked
+        The context's typing rhythm paces the keys; ``characters_per_minute``
+        and ``offset`` (ms of jitter) override its speed and jitter, None
+        keeps the rhythm's own. Text goes out in chunks of ``TYPE_CHUNK`` characters; focus is checked
         again before every chunk, so keys stop the moment focus is lost. With
         ``settle`` the call then waits (up to ``TYPE_SETTLE_TIMEOUT_S``) until
         the page has received the keystrokes still queued in the OS; a timeout

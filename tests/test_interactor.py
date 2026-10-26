@@ -18,7 +18,10 @@ import pytest
 
 from emunium import _element_interactor as ei
 from emunium._bridge.facade import Bridge
+from emunium._browser import context as browser_context
+from emunium._browser import facade as browser_facade
 from emunium._browser.context import BrowserContext, DragInteractor
+from emunium._browser.facade import Browser
 from emunium._element_interactor import (
     KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE,
@@ -39,8 +42,9 @@ from emunium._motion import (
 from emunium._native import win32
 from emunium._native.win32 import MonitorRect, Win32Backend
 from emunium._screen import NATIVE_INPUT_LOCK, Geometry, input_per_dip
+from emunium._standalone import facade as standalone_facade
 from emunium._standalone.config import ClickType
-from emunium.element import Element
+from emunium.element import TYPE_CHUNK, Element
 from emunium.errors import InvalidArgumentError, NativeInputError
 from emunium.standalone import Emunium
 
@@ -1340,3 +1344,190 @@ def test_standalone_motion_keyword():
     assert Emunium(motion=planner).interactor.motion is planner
     with pytest.raises(InvalidArgumentError, match="motion"):
         Emunium(motion="warp")
+
+
+# -- typing rhythm through the public API ---------------------------------------
+
+# Capitals, a word break and a sentence end: shift, word and sentence pauses.
+TYPED_TEXT = "Ad hoc. Done now"
+TYPING_RECT = {"x": 100.0, "y": 50.0, "width": 200.0, "height": 30.0}
+# The interactor's rng is reseeded with this as the first key goes out, so the
+# expected waits can be drawn from the same seed whatever the click consumed.
+TYPING_SEED = 11
+
+
+class TypingGui(FakeGui):
+    def __init__(self, rng, log):
+        super().__init__(log=log)
+        self.rng = rng
+        self.typed = []
+
+    def write(self, message, _pause=True):
+        if not self.typed:
+            self.rng.seed(TYPING_SEED)
+        self.typed.append(message)
+        super().write(message, _pause)
+
+
+class TypingRig:
+    """Fake OS input for every interactor a facade builds: no real input."""
+
+    def __init__(self):
+        self.log = []
+        self.rng = random.Random(3)
+        self.gui = TypingGui(self.rng, self.log)
+        self.sleep = FakeSleep(self.log)
+
+    def build(self, cls):
+        def factory(**kwargs):
+            return cls(
+                backend=self.gui,
+                platform="linux",
+                keyboard=None,
+                clipboard=FakeClipboard(),
+                sleep=self.sleep,
+                clock=self.sleep.clock,
+                rng=self.rng,
+                double_click_time=0.5,
+                **kwargs,
+            )
+
+        return factory
+
+    def key_waits(self):
+        first = next(i for i, e in enumerate(self.log) if e[0] == "write")
+        return [e[1] for e in self.log[first:] if e[0] == "sleep"]
+
+
+class TypingBridge(PageBridge):
+    """A focused input whose value is whatever the rig has typed."""
+
+    def __init__(self, gui):
+        super().__init__(TYPING_RECT)
+        self.gui = gui
+
+    def focus_state(self, element_id, timeout=10.0, *, tab_id=None):
+        return {"documentHasFocus": True, "activeIsElement": True}
+
+    def describe_element(self, element_id, timeout=10.0, *, tab_id=None):
+        return {"elementId": element_id, "value": "".join(self.gui.typed)}
+
+
+@pytest.fixture
+def rig(monkeypatch):
+    rig = TypingRig()
+    monkeypatch.setattr(browser_context, "DragInteractor", rig.build(DragInteractor))
+    monkeypatch.setattr(browser_facade, "Bridge", lambda port=0: TypingBridge(rig.gui))
+    monkeypatch.setattr(
+        standalone_facade, "ElementInteractor", rig.build(ElementInteractor)
+    )
+    return rig
+
+
+def typing_target(ctx):
+    return Element(ctx, "e1", rect=TYPING_RECT, tab_id=7, geometry=ELEMENT_GEOMETRY)
+
+
+def via_element(rig, typing, overrides):
+    ctx = BrowserContext(TypingBridge(rig.gui), verify_input=False, typing=typing)
+    typing_target(ctx).type(TYPED_TEXT, **overrides)
+    return TYPE_CHUNK
+
+
+def via_browser_type(rig, typing, overrides):
+    browser = Browser(verify_input=False, typing=typing)
+    browser.type(typing_target(browser.context), TYPED_TEXT, **overrides)
+    return TYPE_CHUNK
+
+
+def via_browser_type_at(rig, typing, overrides):
+    browser = Browser(verify_input=False, typing=typing)
+    browser.type_at(typing_target(browser.context), TYPED_TEXT, **overrides)
+    return TYPE_CHUNK
+
+
+def via_emunium_type_text(rig, typing, overrides):
+    Emunium(typing=typing).type_text(TYPED_TEXT, **overrides)
+    return len(TYPED_TEXT)
+
+
+def via_emunium_type_at(rig, typing, overrides):
+    Emunium(typing=typing).type_at({"x": 300, "y": 200}, TYPED_TEXT, **overrides)
+    return len(TYPED_TEXT)
+
+
+TYPING_PATHS = [
+    via_element,
+    via_browser_type,
+    via_browser_type_at,
+    via_emunium_type_text,
+    via_emunium_type_at,
+]
+
+
+def expected_waits(rhythm, chunk):
+    """The waits ``rhythm`` draws for TYPED_TEXT sent in ``chunk``-sized parts."""
+    rng = random.Random(TYPING_SEED)
+    waits = []
+    for start in range(0, len(TYPED_TEXT), chunk):
+        part = TYPED_TEXT[start : start + chunk]
+        for index, typed in enumerate(part):
+            upcoming = part[index + 1 : index + 2] or None
+            waits.append(rhythm.interval(typed, upcoming, rng))
+    return waits
+
+
+@pytest.mark.parametrize("path", TYPING_PATHS, ids=lambda path: path.__name__)
+@pytest.mark.parametrize("name", ["careful", "brisk"])
+def test_typing_preset_sets_speed_and_pauses_on_every_public_path(rig, path, name):
+    chunk = path(rig, name, {})
+    preset = TypingRhythm.preset(name)
+    assert "".join(rig.gui.typed) == TYPED_TEXT
+    assert rig.key_waits() == expected_waits(preset, chunk)
+    # The pre-3.1 defaults (280 cpm, 20 ms) no longer override the preset.
+    assert rig.key_waits() != expected_waits(preset.adjusted(280, 20), chunk)
+
+
+@pytest.mark.parametrize("path", TYPING_PATHS, ids=lambda path: path.__name__)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"characters_per_minute": 600, "offset": 0},
+        {"characters_per_minute": 600},
+        {"offset": 5},
+    ],
+)
+def test_explicit_typing_arguments_override_the_preset(rig, path, overrides):
+    chunk = path(rig, "careful", overrides)
+    rhythm = TypingRhythm.preset("careful").adjusted(
+        overrides.get("characters_per_minute"), overrides.get("offset")
+    )
+    assert rhythm != TypingRhythm.preset("careful")
+    assert rig.key_waits() == expected_waits(rhythm, chunk)
+
+
+def context_interactor(ctx):
+    interactor = ctx.interactor
+    assert isinstance(interactor, DragInteractor)
+    return interactor
+
+
+def test_typing_keyword_reaches_each_default_interactor():
+    own = TypingRhythm(characters_per_minute=150)
+    builders = [
+        lambda typing: context_interactor(
+            BrowserContext(PageBridge(TYPING_RECT), typing=typing)
+        ),
+        lambda typing: context_interactor(Browser(typing=typing).context),
+        lambda typing: Emunium(typing=typing).interactor,
+    ]
+    for build in builders:
+        assert build(None).typing == TypingRhythm.preset("natural")
+        assert build("brisk").typing == TypingRhythm.preset("brisk")
+        assert build(own).typing is own
+        with pytest.raises(InvalidArgumentError, match="typing must be one of"):
+            build("sloppy")
+    with pytest.raises(InvalidArgumentError, match="not both"):
+        BrowserContext(
+            PageBridge(TYPING_RECT), interactor=DragInteractor(), typing="brisk"
+        )
