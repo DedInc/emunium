@@ -1,139 +1,114 @@
+"""Helpers for the ``Bridge`` facade: method table and result shaping.
+
+Contracts: ``docs/architecture/bridge-protocol.md`` section 6 (methods, params,
+result shapes, idempotency) and ``docs/architecture/python-internals.md``
+(Bridge facade).
+"""
+
 from __future__ import annotations
 
-from emunium._bridge.transport import Transport
+from typing import Any, Dict, FrozenSet, List, Optional
+
+from emunium._bridge.transport import Reply
+from emunium.errors import BridgeProtocolError
+
+__all__ = [
+    "IDEMPOTENT_METHODS",
+    "WAIT_GRACE",
+    "is_idempotent",
+    "to_ms",
+    "enrich_element",
+    "element_or_none",
+    "element_list",
+    "expect_dict",
+    "expect_list",
+]
+
+# bridge-protocol.md section 6, column "idempotent" = yes. Only these are
+# re-sent once after a reconnect.
+IDEMPOTENT_METHODS: FrozenSet[str] = frozenset(
+    {
+        "getTabInfo",
+        "listTabs",
+        "activateTab",
+        "waitForResponse",
+        "getRecentResponses",
+        "ping",
+        "pageInfo",
+        "querySelector",
+        "querySelectorAll",
+        "queryXPath",
+        "queryByText",
+        "getAllInteractive",
+        "describeElement",
+        "scrollIntoView",
+        "scrollTo",
+        "focus",
+        "focusState",
+        "pointerProbe",
+        "getAttribute",
+        "getComputedStyle",
+    }
+)
+
+# Commands that wait send ``timeoutMs``; the transport waits this much longer so
+# the extension's own ``timeout`` reply arrives before the local deadline.
+WAIT_GRACE = 5.0
 
 
-class DomCommands:
-    def __init__(self, transport: Transport) -> None:
-        self._t = transport
-
-    def query_selector(self, selector: str, timeout: float = 10.0) -> dict | None:
-        return self._t._send_optional(
-            "querySelector", {"selector": selector}, timeout=timeout
-        )
-
-    def query_selector_all(self, selector: str, timeout: float = 10.0) -> list[dict]:
-        return self._t._send_list(
-            "querySelectorAll", {"selector": selector}, timeout=timeout
-        )
-
-    def get_all_interactive(self, timeout: float = 10.0) -> list[dict]:
-        return self._t._send_list("getAllInteractive", timeout=timeout)
-
-    def get_element_by_text(
-        self, text: str, exact: bool = False, timeout: float = 10.0
-    ) -> list[dict]:
-        return self._t._send_list(
-            "queryByText", {"text": text, "exact": exact}, timeout=timeout
-        )
-
-    def query_xpath(self, xpath: str, timeout: float = 10.0) -> list[dict]:
-        return self._t._send_list("queryXPath", {"xpath": xpath}, timeout=timeout)
-
-    def get_element_coords(self, element_id: str, timeout: float = 10.0) -> dict | None:
-        return self._t._send_optional(
-            "getElementCoords", {"elementId": element_id}, timeout=timeout
-        )
-
-    def scroll_into_view(self, element_id: str, timeout: float = 10.0) -> dict:
-        return self._t._send_with_retry(
-            "scrollIntoView", {"elementId": element_id}, timeout=timeout
-        )
-
-    def wait_for_selector(
-        self,
-        selector: str,
-        type: str = "css",
-        timeout: float = 10.0,
-        state: str | None = None,
-        conditions: list[dict] | None = None,
-    ) -> dict | None:
-        params = {"selector": selector, "type": type, "timeout": int(timeout * 1000)}
-        if state is not None:
-            params["state"] = state
-        if conditions is not None:
-            params["conditions"] = conditions
-        return self._t._send_optional(
-            "waitForSelector",
-            params,
-            timeout=timeout + 5,
-        )
-
-    def focus(self, element_id: str, timeout: float = 10.0) -> dict:
-        return self._t._send_with_retry(
-            "focus", {"elementId": element_id}, timeout=timeout
-        )
-
-    def get_attribute(
-        self, element_id: str, name: str, timeout: float = 10.0
-    ) -> str | None:
-        result = self._t._send_with_retry(
-            "getAttribute", {"elementId": element_id, "name": name}, timeout=timeout
-        )
-        return result.get("value") if result else None
-
-    def get_computed_style(
-        self, element_id: str, prop: str, timeout: float = 10.0
-    ) -> str | None:
-        result = self._t._send_with_retry(
-            "getComputedStyle",
-            {"elementId": element_id, "property": prop},
-            timeout=timeout,
-        )
-        return result.get("value") if result else None
+def is_idempotent(method: str) -> bool:
+    return method in IDEMPOTENT_METHODS
 
 
-class PageCommands:
-    def __init__(self, transport: Transport) -> None:
-        self._t = transport
-
-    def navigate(self, url: str, timeout: float = 30.0) -> dict:
-        return self._t.send(
-            "navigate",
-            {"url": url, "timeout": int(timeout * 1000)},
-            timeout=timeout + 5,
-        )
-
-    def page_info(self, timeout: float = 10.0) -> dict:
-        return self._t._send_with_retry("pageInfo", timeout=timeout)
-
-    def scroll_to(self, x: int, y: int, timeout: float = 10.0) -> dict:
-        return self._t._send_with_retry("scrollTo", {"x": x, "y": y}, timeout=timeout)
-
-    def execute_script(self, code: str, timeout: float = 10.0) -> dict:
-        return self._t.send("executeScript", {"code": code}, timeout=timeout)
-
-    def ping(self, timeout: float = 5.0) -> bool:
-        try:
-            result = self._t._send_with_retry("ping", timeout=timeout)
-            return result.get("pong", False) if result else False
-        except Exception:
-            return False
+def to_ms(seconds: float) -> int:
+    return int(round(seconds * 1000))
 
 
-class TabCommands:
-    def __init__(self, transport: Transport) -> None:
-        self._t = transport
-
-    def get_tab_info(self, timeout: float = 10.0) -> dict:
-        return self._t.send("getTabInfo", timeout=timeout)
-
-    def create_tab(self, url: str = "about:blank", timeout: float = 10.0) -> dict:
-        return self._t.send("createTab", {"url": url}, timeout=timeout)
-
-    def close_tab(self, tab_id: int | None = None, timeout: float = 10.0) -> dict:
-        params = {"tabId": tab_id} if tab_id else {}
-        return self._t.send("closeTab", params, timeout=timeout)
+def enrich_element(element: Dict[str, Any], reply: Reply) -> Dict[str, Any]:
+    """Copy of ``element`` with the reply envelope's ``tabId`` and ``zoom``."""
+    enriched = dict(element)
+    enriched["tabId"] = reply.tab_id
+    enriched["zoom"] = reply.zoom
+    return enriched
 
 
-class NetworkCommands:
-    def __init__(self, transport: Transport) -> None:
-        self._t = transport
+def element_or_none(method: str, reply: Reply) -> Optional[Dict[str, Any]]:
+    result = reply.result
+    if result is None:
+        return None
+    if not isinstance(result, dict):
+        raise _shape_error(method, "an element or null", result)
+    return enrich_element(result, reply)
 
-    def wait_for_response(self, pattern: str, timeout: float = 10.0) -> dict | None:
-        params = {"pattern": pattern, "timeout": int(timeout * 1000)}
-        return self._t._send_optional("waitForResponse", params, timeout=timeout + 5)
 
-    def get_recent_responses(self, timeout: float = 10.0) -> list[dict]:
-        result = self._t._send_with_retry("getRecentResponses", timeout=timeout)
-        return result.get("responses", []) if result else []
+def element_list(method: str, reply: Reply) -> List[Dict[str, Any]]:
+    elements = expect_list(method, reply)
+    out = []
+    for element in elements:
+        if not isinstance(element, dict):
+            raise _shape_error(method, "a list of elements", element)
+        out.append(enrich_element(element, reply))
+    return out
+
+
+def expect_dict(method: str, reply: Reply) -> Dict[str, Any]:
+    result = reply.result
+    if not isinstance(result, dict):
+        raise _shape_error(method, "an object", result)
+    return result
+
+
+def expect_list(method: str, reply: Reply) -> List[Any]:
+    result = reply.result
+    if result is None:
+        return []
+    if not isinstance(result, list):
+        raise _shape_error(method, "a list", result)
+    return result
+
+
+def _shape_error(method: str, expected: str, got: Any) -> BridgeProtocolError:
+    return BridgeProtocolError(
+        "%s returned %s, expected %s" % (method, type(got).__name__, expected),
+        method=method,
+    )
