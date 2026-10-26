@@ -853,14 +853,47 @@ def test_css_nth_polls_when_the_matches_shrank_after_the_wait(
     assert len(transport.sent("waitForSelector")) == 2
 
 
-def test_has_text_on_truncated_css_text_matches_only_the_prefix(
+def test_has_text_on_a_long_css_text_reads_the_full_text(
     ctx: BrowserContext, transport: FakeTransport
 ) -> None:
-    long_text = "needle " + "x" * TEXT_CAP
-    transport.handlers["querySelectorAll"] = [element("p", long_text[:TEXT_CAP])]
+    long_text = "needle " + "x" * TEXT_CAP + " Tail  End"
+    transport.handlers["querySelectorAll"] = [
+        element("p", long_text[:TEXT_CAP]),
+        element("q", "short tail end"),
+        element("r", "y" * TEXT_CAP),
+    ]
+    full = {"p": long_text, "r": "y" * 1500}
+
+    def element_text(params: dict[str, Any]) -> dict[str, Any]:
+        text = full[params["elementId"]]
+        return {"text": text, "length": len(text), "truncated": False}
+
+    transport.handlers["elementText"] = element_text
     paragraphs = locator(ctx, "p")
 
     assert TEXT_CAP == 500
     assert paragraphs.filter(has_text="needle").count() == 1
-    # The rest of the text is unknown: a needle beyond the cut does not match.
-    assert paragraphs.filter(has_text="tail").count() == 0
+    found = paragraphs.filter(has_text="tail end").all()
+    assert [el.element_id for el in found] == ["p", "q"]
+    # Only previews at the cap are read in full; Element.text stays the preview.
+    assert sorted(params["elementId"] for params in transport.sent("elementText")) == [
+        "p",
+        "p",
+        "r",
+        "r",
+    ]
+    assert found[0].text == long_text[:TEXT_CAP]
+
+
+def test_has_text_skips_an_element_that_goes_stale_before_its_full_read(
+    ctx: BrowserContext, transport: FakeTransport
+) -> None:
+    transport.handlers["querySelectorAll"] = [
+        element("p", "z" * TEXT_CAP),
+        element("q", "has the needle"),
+    ]
+    transport.handlers["elementText"] = StaleElementError("gone", method="elementText")
+
+    found = locator(ctx, "p").filter(has_text="needle").all()
+
+    assert [el.element_id for el in found] == ["q"]

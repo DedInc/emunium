@@ -241,6 +241,10 @@
     return scope.serializeElement(scope.resolveElement(elementId));
   }
 
+  function elementText({ elementId }) {
+    return scope.getFullElementText(scope.resolveElement(elementId));
+  }
+
   function scrollIntoView({ elementId }) {
     const element = scope.resolveElement(elementId);
     element.scrollIntoView({ behavior: "instant", block: "center" });
@@ -291,6 +295,7 @@
     queryByText: (params) => scope.queryByText(params),
     getAllInteractive: (params) => scope.getAllInteractive(params),
     describeElement,
+    elementText,
     scrollIntoView,
     scrollTo: scrollToPosition,
     focus: focusElement,

@@ -23,7 +23,10 @@ from emunium._bridge.commands import (
 from emunium._bridge.transport import PINNED, Reply, Transport
 from emunium.errors import BridgeProtocolError
 
-__all__ = ["Bridge"]
+__all__ = ["FULL_TEXT_CAP", "Bridge"]
+
+# content_shared.js FULL_TEXT_CAP: ``elementText`` cuts longer texts at this length.
+FULL_TEXT_CAP = 1048576
 
 
 class Bridge:
@@ -172,6 +175,27 @@ class Bridge:
     ) -> Dict[str, Any]:
         reply = self._call("describeElement", {"elementId": element_id}, tab_id, timeout)
         return enrich_element(expect_dict("describeElement", reply), reply)
+
+    def element_text(
+        self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
+    ) -> str:
+        """Full rendered text (``innerText``, else ``textContent``), at most
+        ``FULL_TEXT_CAP`` (1 048 576) chars; ``Element.text`` is the 500-char preview."""
+        # A read like describeElement, so it is re-sent once after a reconnect.
+        reply = self._transport.request(
+            "elementText",
+            {"elementId": element_id},
+            tab_id=tab_id,
+            timeout=timeout,
+            idempotent=True,
+        )
+        text = expect_dict("elementText", reply).get("text")
+        if not isinstance(text, str):
+            raise BridgeProtocolError(
+                f"elementText returned {type(text).__name__} text, expected a string",
+                method="elementText",
+            )
+        return text
 
     def scroll_into_view(
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED

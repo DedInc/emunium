@@ -137,7 +137,7 @@ def test_nth_first_last_and_filters(browser: Browser) -> None:
         assert kind.filter(has_text="t").nth(1).text() == "Three"
         assert kind.nth(5).count() == 0
     assert ids(browser.locator("p").filter(visible=False)) == ["hidden-p"]
-    assert ids(browser.locator("p").filter(visible=True)) == ["status"]
+    assert ids(browser.locator("p").filter(visible=True)) == ["status", "long-text"]
     assert browser.locator("#missing").exists() is False
     assert browser.locator("#status").is_visible() is True
     assert browser.locator("#hidden-p").is_visible() is False
@@ -316,6 +316,52 @@ def test_text_assertions(browser: Browser) -> None:
     )
     later(browser, "document.getElementById('status').textContent = 'Status: busy';")
     expect(status).to_contain_text("busy")
+
+
+LONG_TEXT = (
+    "Opening of the long paragraph. "
+    + "filler words in a row. " * 85
+    + "The quokka waits near the end. Closing line."
+)
+
+
+def assert_long_text(target: ElementLocator) -> None:
+    """Text assertions on ``LONG_TEXT``, every needle past char 500."""
+    fast = FAIL_TIMEOUT
+    passes_and_fails(
+        lambda: expect(target).to_have_text(LONG_TEXT),
+        lambda: expect(target, timeout=fast).to_have_text(LONG_TEXT[:500]),
+    )
+    passes_and_fails(
+        lambda: expect(target).to_contain_text("quokka waits"),
+        lambda: expect(target, timeout=fast).to_contain_text("platypus"),
+    )
+    passes_and_fails(
+        lambda: expect(target).to_contain_text("QUOKKA", ignore_case=True),
+        lambda: expect(target, timeout=fast).not_.to_contain_text(
+            "closing LINE", ignore_case=True
+        ),
+    )
+    error = passes_and_fails(
+        lambda: expect(target).not_.to_contain_text("platypus"),
+        lambda: expect(target, timeout=fast).not_.to_contain_text("quokka"),
+    )
+    assert "truncated" not in str(error)
+
+
+def test_long_text_compares_in_full_past_the_preview(browser: Browser) -> None:
+    long_p = browser.locator("#long-text")
+    assert LONG_TEXT.index("quokka") > 1900
+
+    element = long_p.element(timeout=5)
+    assert element.text == LONG_TEXT[:500]
+    assert " ".join(element.inner_text().split()) == LONG_TEXT
+    assert_long_text(long_p)
+    # A Python-side refinement: the assertions poll and read the text themselves.
+    assert_long_text(browser.locator("p").filter(visible=True).last)
+    assert ids(browser.locator("p").filter(has_text="quokka waits")) == ["long-text"]
+    assert ids(browser.locator("p").filter(has_text="platypus")) == []
+    assert browser.locator("p").filter(has_text="QUOKKA").count() == 1
 
 
 def test_attribute_assertions(browser: Browser) -> None:

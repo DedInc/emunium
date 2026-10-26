@@ -161,11 +161,20 @@ observe; they are listed first.
   `to_contain_text`, `to_have_attribute`, `to_have_count`, `to_have_url`,
   `to_have_title`, each negated with `.not_`. They retry until the condition
   holds or the timeout (5 s) runs out, then raise `ExpectationError`. Text and
-  title assertions are case-sensitive (`ignore_case=True` to fold); text read
-  from a 500-character-capped `Element.text` that cannot be fully compared
-  never passes. Navigations during a locator wait or an assertion are retried
+  title assertions are case-sensitive (`ignore_case=True` to fold); long
+  texts compare in full (see the full element text read below).
+  Navigations during a locator wait or an assertion are retried
   within the same deadline. `ElementLocator` and `expect` are exported from
   `emunium`.
+- Full element text: `Element.inner_text()` and
+  `Bridge.element_text(element_id, timeout=10.0, *, tab_id=...)` read the
+  whole rendered text (`innerText`, else `textContent`, up to 1 048 576
+  characters) through the new content method `elementText`. `Element.text`
+  stays the 500-character preview. When that preview is at 500 characters,
+  `expect` text assertions and `filter(has_text=...)` on CSS and `text=`
+  locators read the full text, so needles past character 500 match and
+  `to_have_text` / `not_.to_contain_text` decide on long texts. Only a text
+  cut at 1 048 576 characters is still known just up to the cut.
 
 ### Changed
 

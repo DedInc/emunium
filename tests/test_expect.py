@@ -22,11 +22,12 @@ from emunium._bridge.transport import PINNED, Reply
 from emunium._browser import facade
 from emunium._browser.context import BrowserContext
 from emunium._browser.facade import Browser
-from emunium._browser.locators import TEXT_CAP, ElementLocator, locator
+from emunium._browser.locators import FULL_TEXT_CAP, TEXT_CAP, ElementLocator, locator
 from emunium.errors import (
     BridgeTimeoutError,
     ContentUnavailableError,
     InvalidArgumentError,
+    StaleElementError,
     WaitTimeoutError,
 )
 from emunium.expect import TRUNCATED_NOTE, LocatorAssertions, PageAssertions
@@ -331,52 +332,92 @@ def test_contain_text_case(
     assert len(transport.sent("waitForSelector")) == sent_before
 
 
-# -- text cut at TEXT_CAP characters ----------------------------------------------------------
+# -- texts longer than the TEXT_CAP preview ---------------------------------------------------
 
 LONG = "prefix words " + "x" * (TEXT_CAP - 13)
+FULL = LONG + " middle " + "y" * 1400 + " tail end"
 
 
-def test_truncated_contains_found_in_the_prefix_passes(
+def full_text_reply(text: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def reply(params: dict[str, Any]) -> dict[str, Any]:
+        assert params == {"elementId": "doc1.1"}
+        return {"text": text, "length": len(text), "truncated": False}
+
+    return reply
+
+
+def test_long_text_is_read_in_full_and_compared_in_full(
     ctx: BrowserContext, transport: FakeTransport, clock: list[float]
 ) -> None:
     transport.handlers["querySelectorAll"] = [element(LONG)]
-    polled = expect(locator(ctx, "p").filter(visible=True), timeout=0)
+    transport.handlers["elementText"] = full_text_reply(FULL)
+    quick = expect(locator(ctx, "p").filter(visible=True), timeout=0)
 
-    assert len(LONG) == TEXT_CAP
-    polled.to_contain_text("words")
-    error = fails(lambda: polled.not_.to_contain_text("words"))
+    assert len(LONG) == TEXT_CAP and len(FULL) > 1900
+    quick.to_have_text(FULL)
+    quick.to_have_text(re.compile("tail end$"))
+    quick.to_contain_text("tail end")
+    quick.to_contain_text("TAIL", ignore_case=True)
+    quick.not_.to_contain_text("absent")
+    quick.not_.to_have_text(LONG)
+    error = fails(lambda: quick.to_have_text(LONG))
+    negated = fails(lambda: quick.not_.to_contain_text("tail end"))
 
-    assert TRUNCATED_NOTE not in str(error)
+    for message in (str(error), str(negated)):
+        assert "truncated" not in message
+    assert transport.sent("elementText")
 
 
-def test_truncated_contains_not_in_the_prefix_is_unknown(
+def test_long_text_assertions_fail_on_a_missing_needle_without_a_note(
     ctx: BrowserContext, transport: FakeTransport, clock: list[float]
 ) -> None:
     transport.handlers["querySelectorAll"] = [element(LONG)]
+    transport.handlers["elementText"] = full_text_reply(FULL)
     polled = expect(locator(ctx, "p").filter(visible=True), timeout=1)
 
-    plain = fails(lambda: polled.to_contain_text("tail"))
-    negated = fails(lambda: polled.not_.to_contain_text("tail"))
+    error = fails(lambda: polled.to_contain_text("absent"))
 
-    for error in (plain, negated):
-        assert str(error).endswith(
-            "; the text was truncated at 500 chars and cannot be fully compared"
+    assert "last actual" in str(error) and "tail end" in str(error)
+    assert TRUNCATED_NOTE not in str(error)
+    assert clock[0] == pytest.approx(51.0)
+
+
+def test_text_cut_at_the_full_text_cap_is_unknown_beyond_the_cut(
+    ctx: BrowserContext, transport: FakeTransport, clock: list[float]
+) -> None:
+    huge = "head " + "z" * (FULL_TEXT_CAP - 5)
+    transport.handlers["querySelectorAll"] = [element(huge[:TEXT_CAP])]
+    transport.handlers["elementText"] = {
+        "text": huge,
+        "length": FULL_TEXT_CAP + 10,
+        "truncated": True,
+    }
+    quick = expect(locator(ctx, "p").filter(visible=True), timeout=0)
+
+    quick.to_contain_text("head")
+    for check in (
+        lambda: quick.to_contain_text("tail"),
+        lambda: quick.not_.to_contain_text("tail"),
+        lambda: quick.to_have_text(huge),
+        lambda: quick.not_.to_have_text("other"),
+    ):
+        assert str(fails(check)).endswith(
+            "; the text was truncated at 1048576 chars and cannot be fully compared"
         )
-    assert clock[0] == pytest.approx(52.0)
 
 
-def test_truncated_text_never_passes_to_have_text(
+def test_stale_element_during_the_full_read_is_retried(
     ctx: BrowserContext, transport: FakeTransport, clock: list[float]
 ) -> None:
     transport.handlers["querySelectorAll"] = [element(LONG)]
-    quick = expect(locator(ctx, "p"), timeout=0)
+    transport.handlers["elementText"] = Steps(
+        StaleElementError("gone", method="elementText"),
+        {"text": FULL, "length": len(FULL), "truncated": False},
+    )
 
-    for check in (
-        lambda: quick.to_have_text(LONG),
-        lambda: quick.not_.to_have_text("other"),
-        lambda: quick.to_have_text(re.compile("^prefix")),
-    ):
-        assert TRUNCATED_NOTE in str(fails(check))
+    expect(locator(ctx, "p").filter(visible=True), timeout=1).to_have_text(FULL)
+
+    assert len(transport.sent("elementText")) == 2
 
 
 def test_text_shorter_than_the_cap_is_complete(
@@ -387,6 +428,7 @@ def test_text_shorter_than_the_cap_is_complete(
 
     quick.to_have_text(LONG[:-1])
     quick.not_.to_contain_text("tail")
+    assert transport.sent("elementText") == []
 
 
 def test_missing_element_fails_text_and_passes_its_negation(

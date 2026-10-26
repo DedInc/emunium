@@ -502,6 +502,12 @@ class FakeBridge(Bridge):
         self._record("getComputedStyle", element_id, tab_id)
         return "block"
 
+    def element_text(
+        self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
+    ) -> str:
+        self._record("elementText", element_id, tab_id)
+        return "w" * 1999 + "!"
+
     def activate_tab(
         self, timeout: float = 10.0, *, tab_id: Any = PINNED
     ) -> dict[str, Any]:
@@ -632,6 +638,7 @@ def test_every_bridge_call_uses_the_handle_tab(world: World) -> None:
     el.type("hi")
     el.get_attribute("id")
     el.get_computed_style("display")
+    el.inner_text()
     el.focus()
     el.refresh()
     item = dom.query_selector_all(ctx, ".item")[1]
@@ -641,12 +648,32 @@ def test_every_bridge_call_uses_the_handle_tab(world: World) -> None:
     handle(ctx, "src").drag_to(handle(ctx, "dst"))
 
     methods = set(world.bridge_methods())
-    assert {"pointerProbe", "focusState", "getComputedStyle", "focus"} <= methods
+    assert {
+        "pointerProbe",
+        "focusState",
+        "getComputedStyle",
+        "elementText",
+        "focus",
+    } <= methods
     assert {"querySelectorAll", "describeElement", "scrollIntoView"} <= methods
     element_calls = [e for e in world.kinds("bridge") if e[1] != "querySelectorAll"]
     assert {entry[3] for entry in element_calls} == {TAB}
     requery = [e for e in world.kinds("bridge") if e[1] == "querySelectorAll"]
     assert requery[-1][3] == TAB
+
+
+def test_inner_text_reads_the_full_text_and_text_keeps_the_preview(
+    world: World,
+) -> None:
+    ctx = make_ctx(world)
+    el = handle(ctx)
+    preview = el.text
+    assert el.inner_text() == "w" * 1999 + "!"
+    assert el.text == preview  # the snapshot preview is untouched
+    assert world.kinds("bridge")[-1] == ("bridge", "elementText", el.element_id, TAB)
+    world.stale.add(el.element_id)
+    with pytest.raises(StaleElementError):
+        el.inner_text()
 
 
 def test_stale_element_aborts_without_input(world: World) -> None:

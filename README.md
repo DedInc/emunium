@@ -401,6 +401,7 @@ element.scroll_into_view()
 element.focus()
 element.get_attribute(name)
 element.get_computed_style(prop)
+element.inner_text()            # full rendered text; element.text is a 500-char preview
 element.refresh(requery=True)
 ```
 
@@ -501,10 +502,8 @@ rows.first.get_attribute("data-id")
   elements (`Element.text`, `Element.visible`) and waits poll every 100 ms.
 - `has_text` therefore reads different text per locator kind: on XPath-based
   locators the element's full string value (`textContent`, hidden text
-  included); on CSS and `text=` locators `Element.text`, the rendered text,
-  which the extension cuts at 500 characters. Known limitation: on CSS and
-  `text=` locators, a longer text whose first 500 characters lack the needle
-  does not match.
+  included); on CSS and `text=` locators the full rendered text (`Element.text`,
+  or `Element.inner_text()` when that 500-character preview is at its cap).
 - `.last` is decided at the time of each call.
 - A call uses one deadline for everything it waits for, retries included. A
   navigation or document swap during a wait (`ContentUnavailableError`, a
@@ -560,12 +559,11 @@ expect(browser).to_have_title("Checkout")          # or a re.Pattern; ignore_cas
 - `to_have_text` collapses whitespace on both sides; `exact=True` compares the
   rendered text as it is, which is brittle: the whitespace of rendered text
   depends on layout.
-- Text assertions read `Element.text`, which the extension cuts at 500
-  characters. On a text that long only the first 500 characters are known:
-  `to_contain_text` passes when the substring is found there and
-  `not_.to_contain_text` fails then; otherwise the result is unknown and
-  neither passes. `to_have_text` never passes on such a text, plain or
-  negated. The failure message says the text was truncated.
+- Text assertions compare the full rendered text: when the 500-character
+  `Element.text` preview is at its cap they read the whole text with
+  `Element.inner_text()`. Only a text longer than 1 048 576 characters, which
+  the extension cuts, is known just up to the cut; a result that depends on
+  the rest never passes, and the failure message says the text was truncated.
 - `emunium.expect` is the function. To import the module itself (for
   `LocatorAssertions`, `PageAssertions`), use
   `importlib.import_module("emunium.expect")` or

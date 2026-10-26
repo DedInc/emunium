@@ -75,6 +75,7 @@ ERROR_CASES = [
     (lambda b: b.get_element_by_text("Go"), "queryByText", "internal", errors.CommandError),
     (lambda b: b.query_xpath("//a"), "queryXPath", "invalid_argument", errors.InvalidArgumentError),
     (lambda b: b.describe_element("doc1.1"), "describeElement", "stale_element", errors.StaleElementError),
+    (lambda b: b.element_text("doc1.1"), "elementText", "stale_element", errors.StaleElementError),
     (lambda b: b.scroll_into_view("doc1.1"), "scrollIntoView", "stale_element", errors.StaleElementError),
     (lambda b: b.get_element_coords("doc1.1"), "scrollIntoView", "target_closed", errors.TargetClosedError),
     (lambda b: b.wait_for_selector("#x", timeout=0.1), "waitForSelector", "wait_timeout", errors.WaitTimeoutError),
@@ -203,6 +204,29 @@ def test_waiting_commands_send_timeout_ms_and_exact_params(bridge, ext):
     assert _last(ext)["params"] == {
         "pattern": "*/api/*", "since": 1700000000000, "anyTab": True, "timeoutMs": 500,
     }
+
+
+def test_element_text_returns_the_full_text_for_the_given_tab(bridge, ext):
+    full = "x" * 1999 + "Z"
+    ext.responder.bodies["elementText"] = {
+        "result": {"text": full, "length": 2000, "truncated": False},
+        "tabId": 7,
+    }
+    assert bridge.element_text("doc1.1", timeout=2.5, tab_id=7) == full
+    request = _last(ext)
+    assert request["method"] == "elementText"
+    assert request["params"] == {"elementId": "doc1.1"}
+    assert request["target"]["tabId"] == 7
+
+
+@pytest.mark.parametrize(
+    "result", [None, "raw", {"length": 3}, {"text": None}, {"text": 5}]
+)
+def test_element_text_rejects_a_malformed_result(bridge, ext, result):
+    ext.responder.bodies["elementText"] = {"result": result}
+    with pytest.raises(errors.BridgeProtocolError) as info:
+        bridge.element_text("doc1.1")
+    assert info.value.method == "elementText"
 
 
 def test_wait_transport_deadline_exceeds_timeout_ms(bridge, ext):
@@ -338,6 +362,8 @@ def _shaped(method):
         return dict(ELEMENT)
     if method == "ping":
         return {"pong": True}
+    if method == "elementText":
+        return {"text": "", "length": 0, "truncated": False}
     return {"value": None, "elementId": "doc1.1"}
 
 
@@ -348,6 +374,7 @@ IDEMPOTENCY_CASES = [
     (lambda b: b.get_element_by_text("a"), "queryByText", True),
     (lambda b: b.query_xpath("//a"), "queryXPath", True),
     (lambda b: b.describe_element("e"), "describeElement", True),
+    (lambda b: b.element_text("e"), "elementText", True),
     (lambda b: b.scroll_into_view("e"), "scrollIntoView", True),
     (lambda b: b.get_element_coords("e"), "scrollIntoView", True),
     (lambda b: b.focus("e"), "focus", True),

@@ -27,10 +27,10 @@ Cyrillic capitals U+0400-U+042F (``Ѐ-Џ``, ``А-Я``: Ё, Є, І, Ї, Ў, Ђ, .
 lower case (``translate`` in XPath, the same table in Python); other letters
 (``Ґ``, Latin with diacritics) are compared as they are.
 
-Known limitation: ``has_text`` on XPath-family locators tests the element's
-full string value (``textContent``); on CSS and ``text=`` locators it tests
-``Element.text``, the rendered text the extension caps at ``TEXT_CAP``
-characters, so a longer text whose prefix lacks the needle does not match.
+``has_text`` on XPath-family locators tests the element's full string value
+(``textContent``); on CSS and ``text=`` locators it tests the rendered text:
+``Element.text``, or, when that 500-char preview is at ``TEXT_CAP``, the full
+text from ``Element.inner_text`` (``full_text``, dx-api.md section 7).
 
 Every wait uses one deadline. A document swap during a wait or a query
 (``ContentUnavailableError``, a stale element, a bridge timeout before the
@@ -51,6 +51,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
+from emunium._bridge.facade import FULL_TEXT_CAP
 from emunium._browser import dom
 from emunium._browser.context import BrowserContext
 from emunium._browser.page import TRANSIENT_IDLE_ERRORS
@@ -69,8 +70,10 @@ from emunium.wait import Wait
 
 __all__ = [
     "DEFAULT_TIMEOUT",
+    "FULL_TEXT_CAP",
     "TEXT_CAP",
     "ElementLocator",
+    "full_text",
     "get_by_label",
     "get_by_placeholder",
     "get_by_role",
@@ -96,7 +99,8 @@ _monotonic = time.monotonic
 _sleep = time.sleep
 
 # ``Element.text`` length cap: content_shared.js ``getElementText(element,
-# maxLength = 500)``. A text this long may be a truncated prefix.
+# maxLength = 500)``. A preview this long may be a prefix: ``full_text`` then
+# reads the whole text with ``elementText``.
 TEXT_CAP = 500
 # Errors of a page between documents (and a stale handle): retried in waits.
 _TRANSIENT: tuple[type[EmuniumError], ...] = (*TRANSIENT_IDLE_ERRORS, StaleElementError)
@@ -366,16 +370,35 @@ def is_transient(exc: BaseException, *, time_left: bool) -> bool:
     return isinstance(exc, _TRANSIENT)
 
 
+def full_text(el: Element) -> str:
+    """The rendered text of ``el``: its ``text`` preview when shorter than
+    ``TEXT_CAP``, else the full text read now (``Element.inner_text``)."""
+    preview = el.text
+    if len(preview) < TEXT_CAP:
+        return preview
+    return el.inner_text()
+
+
 def is_truncated(text: str) -> bool:
-    """True when ``text`` (an ``Element.text``) may be cut at ``TEXT_CAP``."""
-    return len(text) >= TEXT_CAP
+    """True when ``text`` (a ``full_text``) may be cut at ``FULL_TEXT_CAP``."""
+    return len(text) >= FULL_TEXT_CAP
+
+
+def _has_text(el: Element, needle: str) -> bool:
+    """``needle`` (folded, normalised) is in the full text of ``el``; an element
+    that went stale before its full text was read does not match."""
+    try:
+        text = full_text(el)
+    except StaleElementError:
+        return False
+    return needle in fold(normalize_space(text))
 
 
 def _apply(step: Step, elements: list[Element]) -> list[Element]:
     name, value = step
     if name == "has_text":
         needle = fold(normalize_space(value))
-        return [el for el in elements if needle in fold(normalize_space(el.text))]
+        return [el for el in elements if _has_text(el, needle)]
     if name == "visible":
         return [el for el in elements if el.visible is value]
     if value < 0:
@@ -479,10 +502,10 @@ class ElementLocator:
         """Matches whose text contains ``has_text`` (case-insensitive) and/or
         whose rendered box is (``True``) or is not (``False``) visible.
 
-        Known limitation: on CSS and ``text=`` locators ``has_text`` reads
-        ``Element.text``, which the extension cuts at ``TEXT_CAP`` (500)
-        characters; a longer text whose prefix lacks ``has_text`` does not
-        match. XPath-based locators test the full ``textContent``.
+        On CSS and ``text=`` locators ``has_text`` tests the full rendered
+        text (read with ``Element.inner_text`` when the ``Element.text``
+        preview is at ``TEXT_CAP``); XPath-based locators test the full
+        ``textContent``.
         """
         result = self
         if has_text is not None:

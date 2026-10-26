@@ -13,10 +13,12 @@ assertion: a document swap (``ContentUnavailableError``, a stale element, a
 bridge timeout) is retried with the time left, and a timeout always ends in
 ``ExpectationError`` chained from the last such error.
 
-Text is ``Element.text``, the rendered text the extension cuts at
-``TEXT_CAP`` (500) characters. A text that long is known only up to the cut:
-a substring found in it counts, anything else is unknown and never passes
-(the failure message says the text was truncated).
+Text is the full rendered text: ``Element.text``, or, when that 500-char
+preview is at ``TEXT_CAP``, ``Element.inner_text`` (dx-api.md section 7), so
+long texts compare in full. Only a text at ``FULL_TEXT_CAP`` (1 048 576)
+characters, where ``elementText`` itself cuts, is known up to the cut: a
+substring found in it counts, anything else is unknown and never passes (the
+failure message says the text was truncated).
 
 The module is shadowed by the function: ``emunium.expect`` is ``expect``; use
 ``importlib.import_module("emunium.expect")`` to reach the module itself.
@@ -31,9 +33,10 @@ from typing import Any, NamedTuple, Union, overload
 
 from emunium._browser.facade import Browser
 from emunium._browser.locators import (
+    FULL_TEXT_CAP,
     RETRYABLE,
-    TEXT_CAP,
     ElementLocator,
+    full_text,
     is_truncated,
     normalize_space,
 )
@@ -52,7 +55,7 @@ __all__ = ["LocatorAssertions", "PageAssertions", "expect"]
 DEFAULT_TIMEOUT = 5.0
 POLL_S = 0.1
 TRUNCATED_NOTE = (
-    f"the text was truncated at {TEXT_CAP} chars and cannot be fully compared"
+    f"the text was truncated at {FULL_TEXT_CAP} chars and cannot be fully compared"
 )
 
 _monotonic = time.monotonic
@@ -316,8 +319,9 @@ class LocatorAssertions(_Assertions):
 
         ``exact=False`` collapses whitespace on both sides first;
         ``exact=True`` compares the text as it is, which is brittle: the
-        rendered text's whitespace depends on layout. A text cut at
-        ``TEXT_CAP`` characters never passes, plain or negated.
+        rendered text's whitespace depends on layout. Long texts compare in
+        full; only a text cut at ``FULL_TEXT_CAP`` characters never passes,
+        plain or negated.
         """
         expected = _text_or_pattern(text, "text")
 
@@ -325,7 +329,7 @@ class LocatorAssertions(_Assertions):
             element = self._first()
             if element is None:
                 return Reading(False, _MISSING)
-            actual = element.text
+            actual = full_text(element)
             if is_truncated(actual):
                 return Reading(None, actual, TRUNCATED_NOTE)
             holds = _matches(
@@ -340,9 +344,10 @@ class LocatorAssertions(_Assertions):
         """The target's text contains ``text``; case-sensitive unless
         ``ignore_case`` (which polls instead of waiting in the page).
 
-        On a text cut at ``TEXT_CAP`` characters only the kept prefix is known:
-        found there it holds, otherwise the result is unknown and the
-        assertion (plain or negated) does not pass.
+        Long texts are searched in full. Only on a text cut at
+        ``FULL_TEXT_CAP`` characters is just the kept prefix known: found
+        there it holds, otherwise the result is unknown and the assertion
+        (plain or negated) does not pass.
         """
         if not isinstance(text, str):
             raise InvalidArgumentError(f"text must be a str, got {text!r}")
@@ -351,7 +356,7 @@ class LocatorAssertions(_Assertions):
             element = self._first()
             if element is None:
                 return Reading(False, _MISSING)
-            actual = element.text
+            actual = full_text(element)
             needle, haystack = text, actual
             if ignore_case:
                 needle, haystack = needle.casefold(), haystack.casefold()

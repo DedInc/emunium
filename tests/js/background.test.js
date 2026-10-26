@@ -681,6 +681,21 @@ test("content-routed: injects the five content files once when the receiving end
   });
 });
 
+test("content-routed: elementText is forwarded to the top frame", async (t) => {
+  const w = makeWorker(t, { tabs: [{ id: 1, windowId: 1, active: true, url: "https://example.test/", zoom: 1 }] });
+  const ws = await welcomed();
+  const full = { text: "x".repeat(2000), length: 2000, truncated: false };
+  w.chrome.tabs.sendMessage = h.spy(async () => ({ ok: true, result: full }));
+  const reply = await request(ws, "elementText", { elementId: "abc.1" });
+  assert.equal(reply.ok, true, JSON.stringify(reply.error));
+  assert.deepEqual(reply.result, full);
+  assert.equal(reply.tabId, 1);
+  const [tabId, message, options] = plain(w.chrome.tabs.sendMessage.calls[0]);
+  assert.equal(tabId, 1);
+  assert.deepEqual(message, { __emunium__: 2, id: reply.id, method: "elementText", params: { elementId: "abc.1" } });
+  assert.deepEqual(options, { frameId: 0 });
+});
+
 test("content-routed: content_unavailable without a ~10 s retry loop", async (t) => {
   const w = makeWorker(t);
   const ws = await welcomed();

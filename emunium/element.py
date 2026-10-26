@@ -1069,6 +1069,10 @@ class Element:
             self._element_id, prop, tab_id=self._tab()
         )
 
+    def inner_text(self) -> str:
+        """Full rendered text, read now (``text`` is the 500-char snapshot preview)."""
+        return self._ctx.bridge.element_text(self._element_id, tab_id=self._tab())
+
     def __repr__(self) -> str:
         return (
             f"Element(id={self._element_id!r}, tab={self._tab_id!r}, "

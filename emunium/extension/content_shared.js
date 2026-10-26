@@ -12,6 +12,9 @@
   // Without FinalizationRegistry the id map is swept of collected entries this often.
   const SWEEP_EVERY = 1000;
   const LARGE_TEXT_LENGTH = 5000;
+  // elementText cap (dx-api.md section 7): 1 MiB of chars keeps the reply far below
+  // the 64 MiB frame limit even at 4 UTF-8 bytes per char plus JSON escaping.
+  const FULL_TEXT_CAP = 1048576;
 
   function codedError(code, message) {
     const error = new Error(message);
@@ -154,6 +157,14 @@
     return (element.innerText || raw).slice(0, maxLength);
   }
 
+  /** Full rendered text: innerText, else textContent, cut at FULL_TEXT_CAP chars. */
+  function getFullElementText(element) {
+    const rendered = element.innerText;
+    const full = typeof rendered === "string" && rendered ? rendered : element.textContent || "";
+    const truncated = full.length > FULL_TEXT_CAP;
+    return { text: truncated ? full.slice(0, FULL_TEXT_CAP) : full, length: full.length, truncated };
+  }
+
   function collectAttributes(element) {
     const attrs = {};
     for (const attr of element.attributes || []) {
@@ -228,6 +239,7 @@
     getAbsoluteCoords,
     getElementId,
     getElementText,
+    getFullElementText,
     readGeometry,
     resolveElement,
     serializeElement,

@@ -23,6 +23,7 @@
     "queryByText",
     "getAllInteractive",
     "describeElement",
+    "elementText",
     "scrollIntoView",
     "scrollTo",
     "focus",

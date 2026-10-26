@@ -659,6 +659,59 @@ test("getElementText uses a textContent prefix for huge containers", async (t) =
   assert.equal((await okResult(send("querySelector", { selector: "#small" }))).text, "rendered y");
 });
 
+// ── elementText (dx-api.md section 7) ─────────────────────────────────────
+
+test("elementText returns the full innerText past the 500-char preview", async (t) => {
+  const { doc, send } = makeContent(t);
+  const long = h.el(doc, "p", { id: "long" }, "raw");
+  long.__innerText = `${"a".repeat(1999)}Z`;
+  doc.body.append(long);
+  const payload = await okResult(send("querySelector", { selector: "#long" }));
+  assert.equal(payload.text, "a".repeat(500));
+  assert.deepEqual(await okResult(send("elementText", { elementId: payload.elementId })), {
+    text: `${"a".repeat(1999)}Z`,
+    length: 2000,
+    truncated: false,
+  });
+});
+
+test("elementText falls back to textContent when innerText is empty or missing", async (t) => {
+  const { doc, scope, send } = makeContent(t);
+  const hidden = h.el(doc, "div", { id: "hidden" }, "b".repeat(800));
+  hidden.__innerText = "";
+  const bare = h.el(doc, "div", { id: "bare" }, "plain");
+  Object.defineProperty(bare, "innerText", { configurable: true, get: () => undefined });
+  doc.body.append(hidden, bare);
+  const hiddenText = await okResult(send("elementText", { elementId: scope.getElementId(hidden) }));
+  assert.deepEqual(hiddenText, { text: "b".repeat(800), length: 800, truncated: false });
+  assert.equal((await okResult(send("elementText", { elementId: scope.getElementId(bare) }))).text, "plain");
+});
+
+test("elementText caps at 1 048 576 chars and reports truncated", async (t) => {
+  const { doc, scope, send } = makeContent(t);
+  const atCap = h.el(doc, "pre", {}, "c".repeat(1048576));
+  const beyond = h.el(doc, "pre", {}, `${"d".repeat(1048576)}tail`);
+  doc.body.append(atCap, beyond);
+  const exact = await okResult(send("elementText", { elementId: scope.getElementId(atCap) }));
+  assert.equal(exact.length, 1048576);
+  assert.equal(exact.truncated, false);
+  const cut = await okResult(send("elementText", { elementId: scope.getElementId(beyond) }));
+  assert.equal(cut.text, "d".repeat(1048576));
+  assert.equal(cut.length, 1048580);
+  assert.equal(cut.truncated, true);
+});
+
+test("elementText on a stale or unknown id is stale_element, a bad id invalid_argument", async (t) => {
+  const { doc, scope, send } = makeContent(t);
+  const gone = button(doc, { id: "gone" });
+  const goneId = scope.getElementId(gone);
+  gone.remove();
+  assert.equal(await errorCode(send("elementText", { elementId: goneId })), "stale_element");
+  assert.equal(await errorCode(send("elementText", { elementId: "zz.1" })), "stale_element");
+  assert.equal(await errorCode(send("elementText", { elementId: `${goneId.split(".")[0]}.999` })), "stale_element");
+  assert.equal(await errorCode(send("elementText", { elementId: 7 })), "invalid_argument");
+});
+
 test("pageInfo and text queries survive a null documentElement or body", async (t) => {
   const { doc, send } = makeContent(t);
   doc.documentElement = null;
