@@ -1,13 +1,42 @@
+"""Standalone (screen) automation: template matching, OCR and native input.
+
+Coordinates returned by ``find_*`` and accepted by the input methods are INPUT
+units (what ``pyautogui.moveTo`` uses); screenshot pixels are converted with
+``emunium._screen.screenshot_scale``. pyautogui and HumanCursor are imported
+lazily so DPI awareness is chosen first (see ``docs/architecture/native-input.md``).
+"""
+
 from __future__ import annotations
 
 import random
+import sys
 import time
+from typing import TYPE_CHECKING, Sequence, Tuple
 
-import pyautogui
-from humancursor import SystemCursor
-
-from emunium._standalone import ocr, vision
+from emunium import _screen
+from emunium._element_interactor import ElementInteractor
+from emunium._screen import NATIVE_INPUT_LOCK
+from emunium._standalone import ocr as _ocr
+from emunium._standalone import vision
 from emunium._standalone.config import ClickType, Config, StandaloneConfig
+
+if TYPE_CHECKING:
+    from humancursor import SystemCursor
+
+Region = Tuple[int, int, int, int]
+
+
+def _platform() -> str:
+    return sys.platform
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def wheel_units_per_notch(platform: str) -> int:
+    """Amount ``pyautogui.scroll`` needs for one wheel notch on ``platform``."""
+    return Config.WINDOWS_WHEEL_DELTA if platform == "win32" else 1
 
 
 class Emunium:
@@ -16,16 +45,40 @@ class Emunium:
         ocr_enabled: bool = False,
         use_gpu: bool = True,
         langs: list[str] | None = None,
+        *,
+        ocr: bool | None = None,
     ) -> None:
-        self.cursor = SystemCursor()
-        self.ocr = ocr_enabled
-        self.ocr_reader = None
+        if ocr is not None and ocr_enabled and not ocr:
+            raise ValueError("conflicting arguments: ocr_enabled=True and ocr=False")
+        enabled = bool(ocr_enabled or ocr)
+        self.ocr = enabled
+        self.ocr_reader: _ocr.OcrReader | None = None
         self.monitor_region: tuple[int, int, int, int] | None = None
+        self.interactor = ElementInteractor()
+        self._cursor: SystemCursor | None = None
 
-        if self.ocr:
-            screen_width, screen_height = pyautogui.size()
-            self.monitor_region = (0, 0, screen_width, screen_height)
-            self.ocr_reader = ocr.initialize_ocr(langs or ["en"], use_gpu)
+        if enabled:
+            # Fails here, not at the first find_text_elements call.
+            self.ocr_reader = _ocr.initialize_ocr(
+                list(langs) if langs else ["en"], use_gpu
+            )
+            screen_width, screen_height = _screen.pyautogui().size()
+            self.monitor_region = (0, 0, int(screen_width), int(screen_height))
+
+    @property
+    def cursor(self) -> SystemCursor:
+        """HumanCursor ``SystemCursor``, created on first access.
+
+        Input methods go through ``self.interactor``; this stays for callers
+        that drive HumanCursor directly.
+        """
+        if self._cursor is None:
+            # HumanCursor imports pyautogui; DPI awareness must be chosen first.
+            _screen.pyautogui()
+            from humancursor import SystemCursor
+
+            self._cursor = SystemCursor()
+        return self._cursor
 
     def find_elements(
         self,
@@ -34,9 +87,19 @@ class Emunium:
         target_height: int | None = None,
         target_width: int | None = None,
         max_elements: int = StandaloneConfig.DEFAULT_MAX_ELEMENTS,
+        region: Region | None = None,
     ) -> list[dict[str, int]]:
+        """Template match centers in INPUT units, best score first.
+
+        ``region`` is ``(left, top, width, height)`` in INPUT units.
+        """
         return vision.find_elements(
-            image_path, min_confidence, target_height, target_width, max_elements
+            image_path,
+            min_confidence,
+            target_height,
+            target_width,
+            max_elements,
+            region,
         )
 
     def find_text_elements(
@@ -44,11 +107,14 @@ class Emunium:
         query: str,
         min_confidence: float = StandaloneConfig.DEFAULT_MIN_CONFIDENCE,
         max_elements: int = StandaloneConfig.DEFAULT_MAX_ELEMENTS,
-        region: tuple[int, int, int, int] | None = None,
+        region: Region | None = None,
     ) -> list[dict[str, int]]:
-        if not self.ocr:
-            raise RuntimeError("OCR disabled. Initialize with Emunium(ocr=True).")
-        return ocr.find_text_elements(
+        """OCR text match centers in INPUT units; ``region`` as in ``find_elements``."""
+        if not self.ocr or self.ocr_reader is None:
+            raise RuntimeError(
+                "OCR disabled. Initialize with Emunium(ocr_enabled=True) (alias: ocr=True)."
+            )
+        return _ocr.find_text_elements(
             self.ocr_reader, query, min_confidence, max_elements, region
         )
 
@@ -112,27 +178,17 @@ class Emunium:
             if offset_y is not None
             else random.uniform(*Config.DEFAULT_OFFSET_RANGE)
         )
-        target_x = round(element_center["x"] + ox)
-        target_y = round(element_center["y"] + oy)
-        self.cursor.move_to([target_x, target_y])
+        self.interactor.move(element_center["x"] + ox, element_center["y"] + oy)
 
     def click_at(
         self,
         element_center: dict[str, int],
         click_type: ClickType = ClickType.LEFT,
     ) -> None:
-        x, y = int(element_center["x"]), int(element_center["y"])
-        coord = (x, y)
-
-        if click_type == ClickType.LEFT:
-            self.cursor.click_on(coord)
-        elif click_type == ClickType.DOUBLE:
-            self.cursor.click_on(coord)
-            time.sleep(Config.DOUBLE_CLICK_DELAY)
-            self.cursor.click_on(coord)
-        else:
-            button_map = {ClickType.RIGHT: "right", ClickType.MIDDLE: "middle"}
-            pyautogui.click(x=x, y=y, button=button_map[click_type])
+        """One move, then the button press(es); a double click is never two moves."""
+        self.interactor.click(
+            element_center["x"], element_center["y"], click_type=click_type
+        )
 
     def type_at(
         self,
@@ -142,48 +198,37 @@ class Emunium:
         offset: int = 20,
         click_type: ClickType = ClickType.LEFT,
     ) -> None:
-        self.click_at(element_center, click_type)
-        self.type_text(text, characters_per_minute, offset)
+        # One lock span: no other native input lands between the click and the text.
+        with NATIVE_INPUT_LOCK:
+            self.click_at(element_center, click_type)
+            self.type_text(text, characters_per_minute, offset)
 
-    @staticmethod
     def type_text(
-        text: str, characters_per_minute: int = 280, offset: int = 20
+        self, text: str, characters_per_minute: int = 280, offset: int = 20
     ) -> None:
-        try:
-            import keyboard as _keyboard
-        except ImportError:
-            _keyboard = None
-
-        time_per_char = 60 / characters_per_minute
-        for char in text:
-            delay = time_per_char + random.uniform(-offset, offset) / 1000
-            if _keyboard:
-                _keyboard.write(char)
-            else:
-                pyautogui.typewrite(char, interval=0)
-            time.sleep(max(0, delay))
+        """Layout-independent typing through ``ElementInteractor``."""
+        self.interactor.type_text(
+            text, characters_per_minute=characters_per_minute, offset=offset
+        )
 
     def scroll_to(self, element_center: dict[str, int]) -> None:
-        window_height = pyautogui.size().height
-        scroll_amount = element_center["y"] - window_height // 2
+        """Scroll the wheel until ``element_center`` is near the vertical middle.
 
-        if scroll_amount == 0:
+        The pixel distance becomes wheel notches of ``Config.SCROLL_STEP_SIZE`` px.
+        """
+        gui = _screen.pyautogui()
+        distance = element_center["y"] - int(gui.size()[1]) // 2
+        notches = round(abs(distance) / float(Config.SCROLL_STEP_SIZE))
+        if notches == 0:
             return
-
-        scroll_direction = -1 if scroll_amount > 0 else 1
-        abs_scroll = abs(scroll_amount)
-
-        scroll_steps = int(abs_scroll // Config.SCROLL_STEP_SIZE)
-        for _ in range(scroll_steps):
-            pyautogui.scroll(scroll_direction * Config.SCROLL_STEP_SIZE)
-            time.sleep(random.uniform(*Config.SCROLL_DELAY_RANGE))
-
-        remaining = int(abs_scroll % Config.SCROLL_STEP_SIZE)
-        if remaining:
-            pyautogui.scroll(scroll_direction * remaining)
-            time.sleep(random.uniform(*Config.SCROLL_DELAY_RANGE))
+        direction = -1 if distance > 0 else 1
+        amount = direction * wheel_units_per_notch(_platform())
+        with NATIVE_INPUT_LOCK:
+            for _ in range(notches):
+                gui.scroll(amount, _pause=False)
+                _sleep(random.uniform(*Config.SCROLL_DELAY_RANGE))
 
     def drag_and_drop(
-        self, start_coords: tuple[int, int], end_coords: tuple[int, int]
+        self, start_coords: Sequence[float], end_coords: Sequence[float]
     ) -> None:
-        self.cursor.drag_and_drop(start_coords, end_coords)
+        self.interactor.drag(start_coords, end_coords)

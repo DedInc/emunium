@@ -1,62 +1,81 @@
+"""EasyOCR text search for standalone mode (results in INPUT units)."""
+
 from __future__ import annotations
 
-from typing import Protocol
+import importlib
+from typing import TYPE_CHECKING, Protocol
 
-import pyautogui
-
+from emunium._standalone import vision
 from emunium._standalone.config import StandaloneConfig
+
+if TYPE_CHECKING:
+    import numpy as np
+
+MISSING_EASYOCR = (
+    "OCR was requested (Emunium(ocr_enabled=True)) but easyocr is not installed. "
+    'Run: pip install "emunium[ocr]"'
+)
 
 
 class OcrReader(Protocol):
     def readtext(self, image: object) -> list[tuple[object, str, float]]: ...
 
 
-def initialize_ocr(langs: list[str], use_gpu: bool) -> OcrReader | None:
+def initialize_ocr(langs: list[str], use_gpu: bool) -> OcrReader:
+    """Build an EasyOCR reader; raises ``ImportError`` when easyocr is missing.
+
+    easyocr and torch are optional backends (``emunium[ocr]``), loaded by name
+    at call time; the reader is typed by the ``OcrReader`` protocol.
+    """
     try:
-        from easyocr import Reader
-    except ImportError:
-        return None
+        easyocr = importlib.import_module("easyocr")
+    except ImportError as exc:
+        raise ImportError(MISSING_EASYOCR) from exc
 
     gpu_available = False
     if use_gpu:
         try:
-            from torch import cuda
-
-            gpu_available = cuda.is_available()
+            torch = importlib.import_module("torch")
         except ImportError:
-            pass
+            torch = None
+        if torch is not None:
+            gpu_available = bool(torch.cuda.is_available())
 
-    return Reader(langs, gpu=gpu_available)
+    reader: OcrReader = easyocr.Reader(langs, gpu=gpu_available)
+    return reader
+
+
+def to_bgr(image: np.ndarray) -> np.ndarray:
+    import cv2
+
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
+    return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
 
 def find_text_elements(
-    ocr_reader: OcrReader | None,
+    ocr_reader: OcrReader,
     query: str,
     min_confidence: float = StandaloneConfig.DEFAULT_MIN_CONFIDENCE,
     max_elements: int = StandaloneConfig.DEFAULT_MAX_ELEMENTS,
-    region: tuple[int, int, int, int] | None = None,
+    region: vision.Region | None = None,
 ) -> list[dict[str, int]]:
-    import cv2
+    """Centers (INPUT units) of OCR boxes whose text contains ``query``."""
     import numpy as np
 
-    if ocr_reader is None:
-        raise ImportError("EasyOCR not installed. Run: pip install easyocr")
-
-    region_offset = (region[0], region[1]) if region else (0, 0)
-    img = pyautogui.screenshot(region=region) if region else pyautogui.screenshot()
-    img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-    results = ocr_reader.readtext(img_bgr)
+    capture = vision.capture_screen(region)
+    results = ocr_reader.readtext(to_bgr(capture.image))
     found: list[dict[str, int]] = []
     query_lower = query.lower()
 
     for bbox, text, conf in results:
         if conf >= min_confidence and query_lower in text.lower():
-            pts = np.array(bbox, dtype="int")
-            center_x = int(np.mean(pts[:, 0])) + region_offset[0]
-            center_y = int(np.mean(pts[:, 1])) + region_offset[1]
-            found.append({"x": center_x, "y": center_y})
-
+            points = np.asarray(bbox, dtype=np.float64).reshape(-1, 2)
+            found.append(
+                capture.to_input(float(points[:, 0].mean()), float(points[:, 1].mean()))
+            )
             if max_elements and len(found) >= max_elements:
                 break
 
