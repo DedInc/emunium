@@ -11,8 +11,13 @@ import threading
 import time
 
 import pytest
+
+# The transport is built on websockets.asyncio.server; websockets < 14 (such as
+# a global interpreter pinned for other software) is not a supported target.
+pytest.importorskip("websockets", minversion="14.0")
+
 from fake_extension import FakeExtension, _connect_kwargs
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import connect as ws_connect
 
 from emunium import errors
@@ -65,7 +70,8 @@ def _in_thread(fn):
         start = time.monotonic()
         try:
             box["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - inspected by the test
+        except BaseException as exc:  # inspected by the test
+            logging.getLogger(__name__).debug("_in_thread call raised", exc_info=True)
             box["error"] = exc
         box["elapsed"] = time.monotonic() - start
 
@@ -204,6 +210,29 @@ def test_extension_origin_accepted(transport):
         ws.send(json.dumps({"type": "hello", "protocol": 2, "token": TOKEN}))
         assert json.loads(ws.recv(timeout=5)) == {"type": "welcome", "protocol": 2}
         assert transport.wait_for_connection(5)
+
+
+def test_repeated_origin_headers_refused_at_handshake(transport):
+    """Two Origin headers never reach allow_origin as one picked value."""
+    seen = []
+
+    def record(origin):
+        seen.append(origin)
+        return True
+
+    transport.allow_origin = record
+    with pytest.raises(InvalidStatus) as info:
+        ws_connect(
+            f"ws://127.0.0.1:{transport.actual_port}",
+            additional_headers=[
+                ("Origin", "chrome-extension://abc"),
+                ("Origin", "http://evil.example"),
+            ],
+            **_connect_kwargs(),
+        )
+    assert info.value.response.status_code == 400
+    assert seen == []
+    assert not transport.connected
 
 
 def test_allow_origin_is_replaceable(transport):
@@ -569,9 +598,14 @@ def test_unsent_request_retried_on_next_connection_even_if_not_idempotent(
 ):
     with _connect(transport, handler=lambda r: {"result": "ok"}) as ext:
         assert ext.wait_welcomed(5)
-        # A connection that closed between _wait_active() and submit().
+        # A connection that closed between _wait_active() and submit(); its
+        # socket is never touched because submit() refuses before writing.
         stale = transport_mod._Connection(
-            None, {}, transport._loop, lambda c, f: None, lambda c: None
+            _welcomed_conn(transport).ws,
+            {},
+            transport._loop,
+            lambda c, f: None,
+            lambda c: None,
         )
         stale.fail_all(errors.BridgeDisconnectedError("gone"))
         real_wait = transport._wait_active

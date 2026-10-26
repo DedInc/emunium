@@ -25,18 +25,24 @@ recorded but never answered.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
+import logging
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any, final
 
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.sync.client import ClientConnection
 from websockets.sync.client import connect as ws_connect
 
 __all__ = ["FakeExtension", "build_reply", "default_handler"]
 
-Handler = Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+Handler = Callable[[dict[str, Any]], dict[str, Any] | None]
+
+logger = logging.getLogger("fake_extension")
 
 MAX_SIZE = 64 * 1024 * 1024
 EXTENSION_VERSION = "3.1.0"
@@ -44,18 +50,18 @@ USER_AGENT = "Mozilla/5.0 (FakeExtension) Chrome/130.0.0.0"
 CONNECT_RETRY_INTERVAL = 0.05
 
 
-def _target_tab_id(request: Dict[str, Any]) -> Any:
+def _target_tab_id(request: dict[str, Any]) -> Any:
     target = request.get("target")
     if isinstance(target, dict):
         return target.get("tabId")
     return None
 
 
-def default_handler(request: Dict[str, Any]) -> Dict[str, Any]:
+def default_handler(request: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "result": None, "tabId": _target_tab_id(request)}
 
 
-def build_reply(request: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+def build_reply(request: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     """Reply frame per bridge-protocol section 3.
 
     Success: ``{"type","id","ok":true,"result","tabId"[,"zoom"]}``.
@@ -65,7 +71,7 @@ def build_reply(request: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]
     if ok is None:
         ok = "error" not in body
     ok = bool(ok)
-    reply: Dict[str, Any] = {"type": "reply", "id": request.get("id"), "ok": ok}
+    reply: dict[str, Any] = {"type": "reply", "id": request.get("id"), "ok": ok}
     if ok:
         reply["result"] = body.get("result")
     else:
@@ -81,14 +87,15 @@ def build_reply(request: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]
     return reply
 
 
-def _connect_kwargs() -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {"max_size": MAX_SIZE, "open_timeout": 5}
+def _connect_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"max_size": MAX_SIZE, "open_timeout": 5}
     # websockets >= 15 honours HTTP(S)_PROXY by default; the bridge is loopback only.
     if "proxy" in inspect.signature(ws_connect).parameters:
         kwargs["proxy"] = None
     return kwargs
 
 
+@final
 class FakeExtension:
     """Fake extension client. Starts connecting on construction.
 
@@ -105,7 +112,7 @@ class FakeExtension:
         token: str,
         *,
         protocol: int = 2,
-        handler: Optional[Handler] = None,
+        handler: Handler | None = None,
         send_hello: bool = True,
         host: str = "127.0.0.1",
         connect_timeout: float = 10.0,
@@ -115,36 +122,36 @@ class FakeExtension:
         self.protocol = protocol
         self.handler: Handler = handler or default_handler
         self.send_hello = send_hello
-        self.url = "ws://%s:%d" % (host, port)
+        self.url = f"ws://{host}:{port:d}"
         self.connect_timeout = connect_timeout
 
-        self.requests: List[Dict[str, Any]] = []
-        self.frames: List[Any] = []
-        self.sent: List[Any] = []
-        self.handler_errors: List[BaseException] = []
-        self.welcome: Optional[Dict[str, Any]] = None
-        self.closed_code: Optional[int] = None
-        self.closed_reason: Optional[str] = None
-        self.connect_error: Optional[BaseException] = None
+        self.requests: list[dict[str, Any]] = []
+        self.frames: list[Any] = []
+        self.sent: list[Any] = []
+        self.handler_errors: list[BaseException] = []
+        self.welcome: dict[str, Any] | None = None
+        self.closed_code: int | None = None
+        self.closed_reason: str | None = None
+        self.connect_error: BaseException | None = None
 
         self._lock = threading.Lock()
-        self._ws = None
+        self._ws: ClientConnection | None = None
         self._connected = threading.Event()
         self._welcomed = threading.Event()
         self._closed = threading.Event()
         self._stopping = threading.Event()
         self._request_seen = threading.Condition(self._lock)
         self._thread = threading.Thread(
-            target=self._run, name="FakeExtension-%d" % port, daemon=True
+            target=self._run, name=f"FakeExtension-{port:d}", daemon=True
         )
         self._thread.start()
 
     # -- context manager -------------------------------------------------
 
-    def __enter__(self) -> "FakeExtension":
+    def __enter__(self) -> FakeExtension:
         return self
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         self.close()
 
     # -- waiting ---------------------------------------------------------
@@ -182,7 +189,7 @@ class FakeExtension:
     def send_raw(self, obj: Any, timeout: float = 5.0) -> None:
         """Send ``obj`` as-is: ``str``/``bytes`` verbatim, anything else as JSON."""
         if not self._connected.wait(timeout):
-            raise ConnectionError("FakeExtension is not connected to %s" % self.url)
+            raise ConnectionError(f"FakeExtension is not connected to {self.url}")
         if isinstance(obj, (str, bytes)):
             payload = obj
         else:
@@ -195,7 +202,7 @@ class FakeExtension:
             self.sent.append(obj)
 
     def send_event(self, name: str, **fields: Any) -> None:
-        frame: Dict[str, Any] = {"type": "event", "event": name}
+        frame: dict[str, Any] = {"type": "event", "event": name}
         frame.update(fields)
         self.send_raw(frame)
 
@@ -203,27 +210,26 @@ class FakeExtension:
         self._stopping.set()
         ws = self._ws
         if ws is not None and not self._closed.is_set():
-            try:
+            # The server may have dropped the socket already; closing is best effort.
+            with contextlib.suppress(OSError, WebSocketException):
                 ws.close(code, reason)
-            except Exception:
-                pass
         self._thread.join(timeout)
 
     # -- reader thread ---------------------------------------------------
 
-    def _open(self):
+    def _open(self) -> ClientConnection:
         deadline = time.monotonic() + self.connect_timeout
         kwargs = _connect_kwargs()
         while True:
             try:
                 return ws_connect(self.url, **kwargs)
-            except (OSError, TimeoutError) as exc:
+            except (OSError, TimeoutError):
                 # The server under test may not be listening yet.
                 if self._stopping.is_set() or time.monotonic() >= deadline:
-                    raise exc
+                    raise
                 time.sleep(CONNECT_RETRY_INTERVAL)
 
-    def _hello(self) -> Dict[str, Any]:
+    def _hello(self) -> dict[str, Any]:
         return {
             "type": "hello",
             "protocol": self.protocol,
@@ -235,7 +241,10 @@ class FakeExtension:
     def _run(self) -> None:
         try:
             ws = self._open()
-        except BaseException as exc:
+        except (
+            OSError,
+            WebSocketException,
+        ) as exc:  # refused, timed out, bad handshake
             self.connect_error = exc
             self.closed_code = 1006
             self._closed.set()
@@ -248,26 +257,23 @@ class FakeExtension:
             for message in ws:
                 self._dispatch(message)
             # Iteration ends quietly on a 1000/1001 close; the sans-I/O protocol
-            # object (websockets >= 11) holds the close frame details.
-            protocol = getattr(ws, "protocol", None)
-            self._record_close(
-                getattr(protocol, "close_code", None),
-                getattr(protocol, "close_reason", None),
-            )
+            # object holds the close frame details.
+            self._record_close(ws.protocol.close_code, ws.protocol.close_reason)
         except ConnectionClosed as exc:
             frame = exc.rcvd or exc.sent
             if frame is None:
                 self._record_close(1006, "")
             else:
                 self._record_close(frame.code, frame.reason)
-        except Exception as exc:  # noqa: BLE001 - surfaced through handler_errors
+        except Exception as exc:  # surfaced through handler_errors
+            logger.debug("FakeExtension reader failed", exc_info=True)
             with self._lock:
                 self.handler_errors.append(exc)
             self._record_close(1006, "")
         finally:
             self._closed.set()
 
-    def _record_close(self, code: Optional[int], reason: Optional[str]) -> None:
+    def _record_close(self, code: int | None, reason: str | None) -> None:
         if self.closed_code is None:
             self.closed_code = 1006 if code is None else code
             self.closed_reason = reason or ""
@@ -294,12 +300,13 @@ class FakeExtension:
             if self._welcomed.is_set():
                 self._answer(frame)
 
-    def _answer(self, request: Dict[str, Any]) -> None:
+    def _answer(self, request: dict[str, Any]) -> None:
         try:
             body = self.handler(request)
             if body is None:
                 body = default_handler(request)
-        except Exception as exc:  # noqa: BLE001 - mirrors the worker's `internal` reply
+        except Exception as exc:  # mirrors the worker's `internal` reply
+            logger.debug("FakeExtension handler raised", exc_info=True)
             with self._lock:
                 self.handler_errors.append(exc)
             body = {"ok": False, "error": {"code": "internal", "message": str(exc)}}

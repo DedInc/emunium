@@ -4,6 +4,9 @@ Contracts: ``docs/architecture/bridge-protocol.md`` sections 1-5 (wire format)
 and ``docs/architecture/python-internals.md`` (``Transport``, ``Reply``,
 ``PINNED``).
 
+Requires websockets 14+ (``websockets.asyncio.server``); the legacy server API
+is not supported.
+
 Threading model: one asyncio loop thread owns the server and every socket; one
 event thread runs user event handlers so a handler that calls ``request()`` can
 never block the loop that would deliver its reply. Callers block on
@@ -27,11 +30,13 @@ import queue
 import secrets
 import threading
 import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
-import websockets
+from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
+from websockets.typing import Data
 
 from emunium.errors import (
     BridgeDisconnectedError,
@@ -41,7 +46,7 @@ from emunium.errors import (
     error_from_reply,
 )
 
-__all__ = ["PINNED", "Reply", "Transport", "PROTOCOL_VERSION", "MAX_SIZE"]
+__all__ = ["MAX_SIZE", "PINNED", "PROTOCOL_VERSION", "Reply", "Transport"]
 
 logger = logging.getLogger("emunium.bridge")
 
@@ -63,39 +68,40 @@ EXTENSION_ORIGIN_PREFIX = "chrome-extension://"
 
 PINNED: Any = object()  # sentinel: use Transport.pinned_tab_id
 
+EventHandler = Callable[[dict], None]
 
-def _default_allow_origin(origin: Optional[str]) -> bool:
+
+def _default_allow_origin(origin: str | None) -> bool:
     """No Origin (CLI tools, tests) or an extension origin is allowed; web pages are not."""
     return origin is None or origin.startswith(EXTENSION_ORIGIN_PREFIX)
 
 
-def _request_origin(ws: Any) -> Optional[str]:
-    """Origin header on websockets 12-15 (legacy ``request_headers``, new ``request.headers``)."""
-    headers = getattr(ws, "request_headers", None)
-    if headers is None:
-        headers = getattr(getattr(ws, "request", None), "headers", None)
-    if headers is None:
+def _request_origin(ws: ServerConnection) -> str | None:
+    """The handshake's Origin header, ``None`` when absent.
+
+    websockets already refused a handshake with repeated Origin headers
+    (HTTP 400), so at most one value reaches the handler.
+    """
+    request = ws.request
+    if request is None:  # the handler only runs after the handshake
         return None
-    try:
-        return headers.get("Origin")
-    except Exception:  # noqa: BLE001 - unexpected headers type
-        return None
+    return request.headers.get("Origin")
 
 
 @dataclass(frozen=True)
 class Reply:
     result: Any
-    tab_id: Optional[int]
-    zoom: Optional[float]
+    tab_id: int | None
+    zoom: float | None
 
 
-def _as_tab_id(value: Any) -> Optional[int]:
+def _as_tab_id(value: Any) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     return None
 
 
-def _as_zoom(value: Any) -> Optional[float]:
+def _as_zoom(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return None
@@ -110,11 +116,11 @@ class _Connection:
 
     def __init__(
         self,
-        ws: Any,
-        hello: Dict[str, Any],
+        ws: ServerConnection,
+        hello: dict[str, Any],
         loop: asyncio.AbstractEventLoop,
-        on_event: Callable[["_Connection", Dict[str, Any]], None],
-        on_close: Callable[["_Connection"], None],
+        on_event: Callable[[_Connection, dict[str, Any]], None],
+        on_close: Callable[[_Connection], None],
     ) -> None:
         self.ws = ws
         self.hello = hello
@@ -122,7 +128,7 @@ class _Connection:
         self._on_event = on_event
         self._on_close = on_close
         self._lock = threading.Lock()
-        self._pending: Dict[int, concurrent.futures.Future] = {}
+        self._pending: dict[int, concurrent.futures.Future[dict[str, Any]]] = {}
         self._closed = False
 
     @property
@@ -131,14 +137,16 @@ class _Connection:
 
     # -- requests (any thread) -------------------------------------------
 
-    def submit(self, request_id: int, frame: Dict[str, Any]) -> concurrent.futures.Future:
+    def submit(
+        self, request_id: int, frame: dict[str, Any]
+    ) -> concurrent.futures.Future[dict[str, Any]]:
         """Register ``request_id`` and schedule the write; the future gets the reply frame.
 
         Raises ``_NotSent`` when the frame was neither registered nor written,
         so the caller may retry on another connection regardless of idempotency.
         """
         text = json.dumps(frame)
-        future: concurrent.futures.Future = concurrent.futures.Future()
+        future: concurrent.futures.Future[dict[str, Any]] = concurrent.futures.Future()
         with self._lock:
             if self._closed:
                 raise _NotSent("extension connection is closed")
@@ -148,11 +156,13 @@ class _Connection:
         except RuntimeError as exc:  # loop already closed: this socket is unusable
             self.discard(request_id)
             self.fail_all(BridgeDisconnectedError("bridge loop is not running"))
-            raise _NotSent("bridge loop is not running: %s" % exc)
+            raise _NotSent(f"bridge loop is not running: {exc}") from exc
         sent.add_done_callback(lambda done: self._after_send(request_id, done))
         return future
 
-    def _after_send(self, request_id: int, done: concurrent.futures.Future) -> None:
+    def _after_send(
+        self, request_id: int, done: concurrent.futures.Future[None]
+    ) -> None:
         # ``request_id`` is failed by fail_all together with the rest: failing it
         # first would wake a retrying caller while this conn still looks open.
         if done.cancelled():  # loop shutting down; nothing to log or close
@@ -163,13 +173,15 @@ class _Connection:
             return
         # A failed write means the socket is dying: retire the whole connection so
         # retries wait for a new one instead of reusing it.
-        if not self.fail_all(BridgeDisconnectedError("send failed: %s" % exc)):
+        if not self.fail_all(BridgeDisconnectedError(f"send failed: {exc}")):
             return  # already retired by an earlier failure or close
         logger.warning("Socket write failed; dropping connection: %s", exc)
         try:
-            asyncio.run_coroutine_threadsafe(self._close_socket(1011, "send failed"), self._loop)
+            asyncio.run_coroutine_threadsafe(
+                self._close_socket(1011, "send failed"), self._loop
+            )
         except RuntimeError:
-            pass  # loop already closed
+            logger.debug("Bridge loop closed before close(1011) could be scheduled")
 
     def discard(self, request_id: int) -> None:
         with self._lock:
@@ -193,27 +205,24 @@ class _Connection:
 
     # -- loop side -------------------------------------------------------
 
-    async def run(self, frames: Any) -> None:
+    async def run(self, frames: AsyncIterator[Data]) -> None:
         """Read frames until the socket closes, then fail everything pending."""
         try:
             async for raw in frames:
                 self._handle_frame(raw)
         except ConnectionClosed:
-            pass
+            logger.debug("Extension socket closed with an error")
         finally:
             self.fail_all(BridgeDisconnectedError("extension disconnected"))
 
     async def _close_socket(self, code: int, reason: str) -> None:
-        try:
-            await self.ws.close(code, reason)
-        except Exception as exc:  # noqa: BLE001 - socket may already be gone
-            logger.debug("close(%d) failed: %s", code, exc)
+        await _close_quietly(self.ws, code, reason)
 
     async def close(self, code: int, reason: str) -> None:
-        self.fail_all(BridgeDisconnectedError("extension connection closed: %s" % reason))
+        self.fail_all(BridgeDisconnectedError(f"extension connection closed: {reason}"))
         await self._close_socket(code, reason)
 
-    def _handle_frame(self, raw: Any) -> None:
+    def _handle_frame(self, raw: Data) -> None:
         try:
             frame = json.loads(raw)
         except (TypeError, ValueError, RecursionError):
@@ -226,7 +235,11 @@ class _Connection:
         if kind == "reply":
             request_id = frame.get("id")
             with self._lock:
-                future = self._pending.pop(request_id, None) if isinstance(request_id, int) else None
+                future = (
+                    self._pending.pop(request_id, None)
+                    if isinstance(request_id, int)
+                    else None
+                )
             if future is None:
                 logger.debug("Reply for unknown request id %r", request_id)
             else:
@@ -237,58 +250,67 @@ class _Connection:
             logger.debug("Ignoring frame of type %r", kind)
 
 
+async def _close_quietly(ws: ServerConnection, code: int, reason: str) -> None:
+    try:
+        await ws.close(code, reason)
+    except Exception:  # the socket may already be gone; closing is best effort
+        logger.debug("close(%d) failed", code, exc_info=True)
+
+
 class Transport:
     """Single-connection bridge server. Public methods are thread-safe."""
 
     def __init__(
-        self, host: str = "127.0.0.1", port: int = 0, *, token: Optional[str] = None
+        self, host: str = "127.0.0.1", port: int = 0, *, token: str | None = None
     ) -> None:
         self.host = host
         self.port = port
         self.token: str = token if token is not None else secrets.token_urlsafe(32)
         # Replaceable checks; both run on the loop thread and must not block.
         # ``authenticate(hello) -> bool`` (see _default_authenticate).
-        self.authenticate: Callable[[Dict[str, Any]], bool] = self._default_authenticate
+        self.authenticate: Callable[[dict[str, Any]], bool] = self._default_authenticate
         # ``allow_origin(origin: str | None) -> bool``, checked before the hello.
-        self.allow_origin: Callable[[Optional[str]], bool] = _default_allow_origin
+        self.allow_origin: Callable[[str | None], bool] = _default_allow_origin
 
         self._cond = threading.Condition(threading.Lock())
-        self._active: Optional[_Connection] = None
+        self._active: _Connection | None = None
         self._started = False
         self._shut = False
 
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._server: Any = None
-        self._stop: Optional[asyncio.Event] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._server: Server | None = None
+        self._stop: asyncio.Event | None = None
         self._ready = threading.Event()
-        self._start_error: Optional[BaseException] = None
-        self._actual_port: Optional[int] = None
+        self._start_error: BaseException | None = None
+        self._actual_port: int | None = None
 
         self._ids = itertools.count(1)
         self._id_lock = threading.Lock()
 
         self._pin_lock = threading.Lock()
-        self._pinned_tab_id: Optional[int] = None
+        self._pinned_tab_id: int | None = None
 
         self._handlers_lock = threading.Lock()
-        self._handlers: Dict[str, List[Callable[[dict], None]]] = {}
-        self._events: "queue.Queue[Any]" = queue.Queue()
-        self._event_thread: Optional[threading.Thread] = None
+        self._handlers: dict[str, list[EventHandler]] = {}
+        self._events: queue.Queue[tuple[list[EventHandler], dict[str, Any]] | None] = (
+            queue.Queue()
+        )
+        self._event_thread: threading.Thread | None = None
 
     # -- properties ------------------------------------------------------
 
     @property
-    def actual_port(self) -> Optional[int]:
+    def actual_port(self) -> int | None:
         return self._actual_port
 
     @property
-    def pinned_tab_id(self) -> Optional[int]:
+    def pinned_tab_id(self) -> int | None:
         with self._pin_lock:
             return self._pinned_tab_id
 
     @pinned_tab_id.setter
-    def pinned_tab_id(self, value: Optional[int]) -> None:
+    def pinned_tab_id(self, value: int | None) -> None:
         with self._pin_lock:
             self._pinned_tab_id = value
 
@@ -310,17 +332,20 @@ class Transport:
             target=self._run_events, daemon=True, name="emun-bridge-events"
         )
         self._event_thread.start()
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="emun-bridge")
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        self._thread = threading.Thread(
+            target=self._run_loop, args=(loop,), daemon=True, name="emun-bridge"
+        )
         self._thread.start()
         if not self._ready.wait(timeout):
             self.shutdown()
-            raise BridgeError("bridge server did not start within %.1f s" % timeout)
+            raise BridgeError(f"bridge server did not start within {timeout:.1f} s")
         if self._start_error is not None:
             error = self._start_error
             self.shutdown()
             raise BridgeError(
-                "cannot listen on %s:%s: %s" % (self.host, self.port, error)
+                f"cannot listen on {self.host}:{self.port}: {error}"
             ) from error
         logger.info("Bridge listening on %s:%d", self.host, self._actual_port)
 
@@ -338,7 +363,7 @@ class Transport:
             try:
                 loop.call_soon_threadsafe(stop.set)
             except RuntimeError:
-                pass  # loop already closed
+                logger.debug("Bridge loop already closed at shutdown")
         current = threading.current_thread()
         if self._thread is not None and self._thread is not current:
             self._thread.join(SHUTDOWN_TIMEOUT * 2)
@@ -352,7 +377,7 @@ class Transport:
             self._cond.wait_for(lambda: self._shut or self._has_active(), timeout)
             return not self._shut and self._has_active()
 
-    def on(self, event: str, handler: Callable[[dict], None]) -> None:
+    def on(self, event: str, handler: EventHandler) -> None:
         with self._handlers_lock:
             self._handlers.setdefault(event, []).append(handler)
 
@@ -361,7 +386,7 @@ class Transport:
     def request(
         self,
         method: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         *,
         tab_id: Any = PINNED,
         timeout: float = 30.0,
@@ -376,7 +401,7 @@ class Transport:
             if time.monotonic() >= deadline:
                 # Never send a command after the caller's deadline.
                 raise BridgeTimeoutError(
-                    "no reply to %s within %.1f s" % (method, timeout), method=method
+                    f"no reply to {method} within {timeout:.1f} s", method=method
                 )
             target_tab = self.pinned_tab_id if tab_id is PINNED else tab_id
             with self._id_lock:
@@ -395,11 +420,11 @@ class Transport:
                 continue
             try:
                 reply = future.result(max(0.0, deadline - time.monotonic()))
-            except concurrent.futures.TimeoutError:
+            except concurrent.futures.TimeoutError as exc:
                 conn.discard(request_id)
                 raise BridgeTimeoutError(
-                    "no reply to %s within %.1f s" % (method, timeout), method=method
-                )
+                    f"no reply to {method} within {timeout:.1f} s", method=method
+                ) from exc
             except BridgeDisconnectedError as exc:
                 if idempotent and not resent:
                     resent = True
@@ -409,7 +434,7 @@ class Transport:
             return self._interpret(method, reply)
 
     @staticmethod
-    def _interpret(method: str, reply: Dict[str, Any]) -> Reply:
+    def _interpret(method: str, reply: dict[str, Any]) -> Reply:
         ok = reply.get("ok")
         if ok is True:
             return Reply(
@@ -427,7 +452,9 @@ class Transport:
             else:
                 code, message = "internal", ""
             raise error_from_reply(str(code), str(message), method)
-        raise BridgeProtocolError("reply to %s has no boolean 'ok'" % method, method=method)
+        raise BridgeProtocolError(
+            f"reply to {method} has no boolean 'ok'", method=method
+        )
 
     def _has_active(self) -> bool:
         return self._active is not None and not self._active.closed
@@ -452,7 +479,7 @@ class Transport:
 
     # -- hello / connection policy (loop thread) -------------------------
 
-    def _default_authenticate(self, hello: Dict[str, Any]) -> bool:
+    def _default_authenticate(self, hello: dict[str, Any]) -> bool:
         """Default ``authenticate(hello) -> bool``: token and protocol must match.
 
         A replacement must be fast and non-blocking: it runs on the bridge loop
@@ -468,34 +495,39 @@ class Transport:
             and protocol == PROTOCOL_VERSION
         )
 
-    async def _handle_socket(self, ws: Any) -> None:
-        if self._shut:
-            await self._close_quietly(ws, CLOSE_GOING_AWAY, "shutting down")
-            return
+    def _origin_allowed(self, ws: ServerConnection) -> bool:
         origin = _request_origin(ws)
         try:
-            origin_ok = bool(self.allow_origin(origin))
-        except Exception:  # noqa: BLE001 - a broken policy must reject, not crash
+            allowed = bool(self.allow_origin(origin))
+        except Exception:  # a broken policy must reject, not crash
             logger.exception("allow_origin() raised; rejecting connection")
-            origin_ok = False
-        if not origin_ok:
+            return False
+        if not allowed:
             logger.warning("Rejecting connection from origin %r", origin)
-            await self._close_quietly(ws, CLOSE_FORBIDDEN_ORIGIN, "origin not allowed")
+        return allowed
+
+    async def _handle_socket(self, ws: ServerConnection) -> None:
+        if self._shut:
+            await _close_quietly(ws, CLOSE_GOING_AWAY, "shutting down")
+            return
+        if not self._origin_allowed(ws):
+            await _close_quietly(ws, CLOSE_FORBIDDEN_ORIGIN, "origin not allowed")
             return
         frames = ws.__aiter__()
         try:
             raw = await asyncio.wait_for(frames.__anext__(), HELLO_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning("Extension sent no hello within %.1f s", HELLO_TIMEOUT)
-            await self._close_quietly(ws, CLOSE_UNAUTHORIZED, "hello timeout")
+            await _close_quietly(ws, CLOSE_UNAUTHORIZED, "hello timeout")
             return
         except (StopAsyncIteration, ConnectionClosed):
             return
         hello = self._parse_hello(raw)
         if hello is None:
-            await self._close_quietly(ws, CLOSE_UNAUTHORIZED, "unauthorized")
+            await _close_quietly(ws, CLOSE_UNAUTHORIZED, "unauthorized")
             return
-        conn = _Connection(ws, hello, self._loop, self._on_event, self._on_close)
+        loop = asyncio.get_running_loop()
+        conn = _Connection(ws, hello, loop, self._on_event, self._on_close)
         try:
             await ws.send(json.dumps({"type": "welcome", "protocol": PROTOCOL_VERSION}))
         except ConnectionClosed:
@@ -509,7 +541,7 @@ class Transport:
                 rejected = False
                 self._cond.notify_all()
         if rejected:
-            await self._close_quietly(ws, CLOSE_GOING_AWAY, "shutting down")
+            await _close_quietly(ws, CLOSE_GOING_AWAY, "shutting down")
             return
         logger.info("Extension connected (%s)", hello.get("extensionVersion"))
         if previous is not None:
@@ -518,7 +550,7 @@ class Transport:
             asyncio.ensure_future(previous.close(CLOSE_SUPERSEDED, "superseded"))
         await conn.run(frames)
 
-    def _parse_hello(self, raw: Any) -> Optional[Dict[str, Any]]:
+    def _parse_hello(self, raw: Data) -> dict[str, Any] | None:
         try:
             hello = json.loads(raw)
         except (TypeError, ValueError, RecursionError):
@@ -529,7 +561,7 @@ class Transport:
             return None
         try:
             accepted = bool(self.authenticate(hello))
-        except Exception:  # noqa: BLE001 - a broken check must reject, not crash
+        except Exception:  # a broken check must reject, not crash
             logger.exception("authenticate() raised; rejecting extension")
             return None
         if not accepted:
@@ -545,16 +577,9 @@ class Transport:
                 self._cond.notify_all()
                 logger.info("Extension disconnected")
 
-    @staticmethod
-    async def _close_quietly(ws: Any, code: int, reason: str) -> None:
-        try:
-            await ws.close(code, reason)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("close(%d) failed: %s", code, exc)
-
     # -- events ----------------------------------------------------------
 
-    def _on_event(self, conn: _Connection, frame: Dict[str, Any]) -> None:
+    def _on_event(self, conn: _Connection, frame: dict[str, Any]) -> None:
         name = frame.get("event")
         if name == "tabRemoved":
             removed = _as_tab_id(frame.get("tabId"))
@@ -562,7 +587,9 @@ class Transport:
                 if removed is not None and removed == self._pinned_tab_id:
                     self._pinned_tab_id = None
         with self._handlers_lock:
-            handlers = list(self._handlers.get(name, ())) if isinstance(name, str) else []
+            handlers = (
+                list(self._handlers.get(name, ())) if isinstance(name, str) else []
+            )
         if handlers:
             self._events.put((handlers, frame))
 
@@ -575,13 +602,12 @@ class Transport:
             for handler in handlers:
                 try:
                     handler(frame)
-                except Exception:  # noqa: BLE001 - handlers are isolated
+                except Exception:  # handlers are isolated
                     logger.exception("Handler for event %r raised", frame.get("event"))
 
     # -- loop thread -----------------------------------------------------
 
-    def _run_loop(self) -> None:
-        loop = self._loop
+    def _run_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._serve())
@@ -596,14 +622,15 @@ class Transport:
     async def _serve(self) -> None:
         self._stop = asyncio.Event()
         try:
-            server = await websockets.serve(
+            server = await serve(
                 self._handle_socket,
                 self.host,
                 self.port,
                 max_size=MAX_SIZE,
                 max_queue=MAX_QUEUE,
             )
-        except Exception as exc:  # noqa: BLE001 - surfaced from start()
+        except Exception as exc:  # surfaced from start()
+            logger.debug("serve() failed", exc_info=True)
             self._start_error = exc
             self._ready.set()
             return
@@ -618,5 +645,5 @@ class Transport:
         server.close()
         try:
             await asyncio.wait_for(server.wait_closed(), SHUTDOWN_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("server did not close cleanly: %s", exc)
+        except Exception:  # shutdown proceeds either way
+            logger.debug("server did not close cleanly", exc_info=True)
