@@ -1,0 +1,55 @@
+# examples/parallel/docker-compose.yml
+# Headed emunium workers, one private X display per container.
+#
+#   cd examples/parallel
+#   docker compose build
+#   docker compose run --rm worker                       # one worker, every job
+#   python run_pool.py --mode docker --workers 3         # 3 workers, static shards
+#   SHARD=claim RUN_ID=batch-1 docker compose up --scale worker=3
+#                                                        # 3 replicas share the list
+#
+# Compose cannot number replicas, so `--scale` uses SHARD=claim: each replica
+# claims a job through an exclusive file in results/RUN_ID before running it.
+# run_pool.py instead starts N `docker compose run` containers with
+# SHARD=i/N. No container_name is set, so both ways start any number.
+#
+# Sizing: a headed Chromium needs about 300-500 MB RAM and a fraction of a
+# core while idle, more on heavy pages; plan for ~1 GB of host RAM per worker
+# and N workers <= cores. Uncomment the limits below to enforce it per
+# container.
+name: emunium-parallel
+
+services:
+  worker:
+    build:
+      context: ../..
+      dockerfile: examples/parallel/Dockerfile.worker
+    image: emunium-worker:local
+    # tini as PID 1: forwards `docker stop` to entrypoint.sh and reaps
+    # Chromium's helper processes.
+    init: true
+    # Chromium's renderers share memory through /dev/shm; Docker's 64 MB
+    # default makes tabs crash on real pages.
+    shm_size: "1gb"
+    # Chromium's sandbox needs user namespaces, which Docker's default seccomp
+    # profile refuses to unprivileged users. Lifting the filter keeps the
+    # sandbox on (no --no-sandbox) for a non-root user with no capabilities,
+    # as tests/docker/run_linux.py does.
+    security_opt:
+      - seccomp=unconfined
+    cap_drop:
+      - ALL
+    # A batch worker exits when its jobs are done; "no" keeps a failed batch
+    # from looping. Use "on-failure:2" for long-running queue consumers.
+    restart: "no"
+    environment:
+      JOB_FILE: ${JOB_FILE:-/jobs/example.json}
+      RESULTS_DIR: /results
+      SHARD: ${SHARD:-0/1}
+      RUN_ID: ${RUN_ID:-}
+      JOB_TIMEOUT: ${JOB_TIMEOUT:-60}
+    volumes:
+      - ./jobs:/jobs:ro
+      - ./results:/results
+    # mem_limit: 1g
+    # cpus: 1.0

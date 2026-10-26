@@ -1,0 +1,7 @@
+[
+  {"id": "example-com", "url": "https://example.com/"},
+  {"id": "example-org", "url": "https://example.org/"},
+  {"id": "example-net", "url": "https://example.net/"},
+  {"id": "iana-example-domains", "url": "https://www.iana.org/help/example-domains"},
+  {"id": "iana-reserved", "url": "https://www.iana.org/domains/reserved", "click": false}
+]

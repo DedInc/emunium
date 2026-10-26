@@ -47,6 +47,7 @@ matching and OCR.
 - [PageParser and Locator](#pageparser-and-locator)
 - [Advanced utilities](#advanced-utilities)
 - [Limitations](#limitations)
+- [Running in parallel](#running-in-parallel)
 - [Running the Linux suite](#running-the-linux-suite)
 
 ---
@@ -1214,6 +1215,32 @@ when no `chrome_path` is given.
   Recording) permission for the terminal or Python process.
 - Standalone clicks are not verified, and OCR quality depends on EasyOCR and the
   screen content.
+
+---
+
+## Running in parallel
+
+Native input is the desktop's one mouse and keyboard, and the X11 Unicode
+remap pool belongs to one process, so run one headed worker per X display.
+Headless browsers have no native input and can share a machine.
+[`examples/parallel/`](examples/parallel/) has ready-made templates:
+
+- `Dockerfile.worker`, `entrypoint.sh` and `docker-compose.yml`: a headed
+  worker image (Chromium, Xvfb and openbox, non-root) that gives each container
+  its own display;
+- `worker.py`: runs a JSON job list in one browser with human clicks and
+  writes one JSON result per job;
+- `run_pool.py`: splits the job list across N containers
+  (`--mode docker`) or N local headless processes (`--mode local`);
+- `headless_pool.py`: a thread pool of headless browsers for DOM-only work.
+
+```bash
+cd examples/parallel
+python run_pool.py --mode docker --workers 3
+```
+
+See [examples/parallel/README.md](examples/parallel/README.md) for sizing
+(about 300-500 MB RAM per headed Chromium, `shm_size`) and the options.
 
 ---
 

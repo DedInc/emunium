@@ -180,3 +180,9 @@ pyrightconfig.json
 emunium_debug/
 emunium/extension/.port
 emunium/extension/port.json
+
+# examples/parallel run output
+examples/parallel/results/
+# local build and spike output
+.build-check/
+.spike/
