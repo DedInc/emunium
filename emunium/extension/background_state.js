@@ -11,13 +11,13 @@
   const LOOPBACK = "127.0.0.1";
   const CLAIM_NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
   const MAX_SEEN_NONCES = 256;
-  // attach-mode.md section 3: the claim queue holds at most 16 nonces (oldest dropped).
-  const MAX_PENDING_CLAIMS = 16;
-  // Close code for a failed attach handshake (no/bad challenge, bad serverProof).
+  // attach-mode.md section 3: the claim queue holds at most 64 nonces (oldest dropped).
+  const MAX_PENDING_CLAIMS = 64;
+  // Close code for a failed attach handshake (bad challenge/serverProof/welcomeMac, frame out of order).
   const CLOSE_AUTH = 4005;
   const NONCE_BYTES = 32;
   const MAC_BYTES = 32;
-  // Frames that arrive while a welcome's serverProof is being verified are replayed after it.
+  // Frames that arrive while a welcome's welcomeMac is being verified are replayed after it.
   const MAX_EARLY_FRAMES = 64;
   const HUB_URL_RE = /^ws:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/?$/;
 
@@ -167,21 +167,19 @@
     return { mode: "attach", url: `ws://${LOOPBACK}:${hubPort}`, hubPort, enrollment: data.enrollment, protocol: PROTOCOL };
   }
 
-  // session.json wins when present (launch mode, unchanged); otherwise attach.json.
+  // A build with attach.json always runs in attach mode (an invalid one is retried, never bypassed);
+  // session.json is honoured only when no attach.json exists.
   async function loadFileConfig() {
-    const session = await readPackagedJson("session.json");
-    if (session.present) {
-      return launchConfigFrom(session.data);
+    // Both are read in parallel; the precedence is decided below, not by fetch order.
+    const [session, attach] = await Promise.all([readPackagedJson("session.json"), readPackagedJson("attach.json")]);
+    if (attach.present) {
+      const config = attachFileConfigFrom(attach.data);
+      if (!config) {
+        warnConfig("attach.json is invalid (protocol 2, mode attach, hubUrl ws://127.0.0.1:<port>, enrollment); retrying");
+      }
+      return config;
     }
-    const attach = await readPackagedJson("attach.json");
-    if (!attach.present) {
-      return null;
-    }
-    const config = attachFileConfigFrom(attach.data);
-    if (!config) {
-      warnConfig("attach.json is invalid (protocol 2, mode attach, hubUrl ws://127.0.0.1:<port>, enrollment); retrying");
-    }
-    return config;
+    return session.present ? launchConfigFrom(session.data) : null;
   }
 
   let identityCreation = null;
@@ -292,36 +290,38 @@
     return diff === 0;
   }
 
-  // The attach hello: proves the enrollment secret (and token) without sending either.
+  // MAC input: label|sN|cN|P[|extra...], P being the dialed port as a decimal string.
+  function handshakeMessage(label, serverNonce, clientNonce, port, ...extra) {
+    return [label, serverNonce, clientNonce, String(port), ...extra].join("|");
+  }
+
+  // Step 4 hello: proves the enrollment secret (and token) without sending either; bound to the port.
   async function buildAttachHello(config, serverNonce, clientNonce) {
+    const port = config.hubPort;
     const proof = await hmacSha256(
       config.enrollment,
-      `emunium-client|${serverNonce}|${clientNonce}|${config.installId}`
+      handshakeMessage("emunium-client", serverNonce, clientNonce, port, config.installId)
     );
     const tokenProof = config.token
-      ? base64UrlEncode(await hmacSha256(config.token, `emunium-token|${serverNonce}|${clientNonce}`))
+      ? base64UrlEncode(await hmacSha256(config.token, handshakeMessage("emunium-token", serverNonce, clientNonce, port)))
       : null;
     return {
       type: "hello",
       protocol: config.protocol,
       mode: "attach",
       installId: config.installId,
-      clientNonce,
       proof: base64UrlEncode(proof),
       tokenProof,
     };
   }
 
-  async function verifyServerProof(config, serverNonce, clientNonce, serverProof) {
-    const received = base64UrlDecode(serverProof);
-    if (!received || received.length !== MAC_BYTES) {
+  // A received MAC (32 bytes, unpadded base64url) against HMAC(secret, message), compared in constant time.
+  async function verifyMac(secret, message, received) {
+    const bytes = base64UrlDecode(received);
+    if (!bytes || bytes.length !== MAC_BYTES) {
       return false;
     }
-    const expected = await hmacSha256(
-      config.enrollment,
-      `emunium-server|${serverNonce}|${clientNonce}|${config.installId}`
-    );
-    return constantTimeEqual(received, expected);
+    return constantTimeEqual(bytes, await hmacSha256(secret, message));
   }
 
   function clearReconnect() {
@@ -450,9 +450,10 @@
     }
   }
 
-  // Per-socket attach handshake (attach-mode.md section 3):
-  // idle -> challenge -> proving -> welcome -> verifying -> done | failed.
-  // Nothing but the hello is sent, and nothing is stored or executed, before `done`.
+  // Per-socket attach handshake (attach-mode.md section 3), the server proves itself first:
+  // idle -> challenge -> serverProof -> verifyingServer -> proving -> welcome -> verifyingWelcome -> done | failed.
+  // Before the serverProof verifies, only the clientNonce frame is sent; nothing is stored or executed
+  // before the welcomeMac verifies. Any frame out of this order closes 4005.
   function attachHandshake(socket, config) {
     let phase = "idle";
     let serverNonce = null;
@@ -460,6 +461,13 @@
     let early = [];
 
     const current = () => socket === state.ws && socket.readyState === WS_OPEN && !state.welcomed;
+
+    function clearPhaseTimer() {
+      if (state.challengeTimer) {
+        clearTimeout(state.challengeTimer);
+        state.challengeTimer = null;
+      }
+    }
 
     function fail(reason) {
       phase = "failed";
@@ -470,21 +478,25 @@
       closeSocket(socket, CLOSE_AUTH, reason);
     }
 
-    function open() {
-      phase = "challenge";
+    // Fails the handshake when it is still in `expected` after ms.
+    function armPhaseTimer(expected, ms, reason) {
+      clearPhaseTimer();
       state.challengeTimer = setTimeout(() => {
         state.challengeTimer = null;
-        if (phase === "challenge" && socket === state.ws) {
-          fail("no challenge");
+        if (phase === expected && socket === state.ws) {
+          fail(reason);
         }
-      }, timing.challengeTimeoutMs);
+      }, ms);
     }
 
+    function open() {
+      phase = "challenge";
+      armPhaseTimer("challenge", timing.challengeTimeoutMs, "no challenge");
+    }
+
+    // Steps 1-2: a well-formed challenge is answered with the clientNonce frame and nothing else.
     function onChallenge(frame) {
-      if (state.challengeTimer) {
-        clearTimeout(state.challengeTimer);
-        state.challengeTimer = null;
-      }
+      clearPhaseTimer();
       const isChallenge = !!frame && frame.type === "challenge" && frame.protocol === PROTOCOL;
       const nonceBytes = isChallenge ? base64UrlDecode(frame.serverNonce) : null;
       if (!nonceBytes || nonceBytes.length !== NONCE_BYTES) {
@@ -492,52 +504,86 @@
         return;
       }
       serverNonce = frame.serverNonce;
-      phase = "proving";
-      (async () => {
+      try {
         clientNonce = randomNonce();
-        return buildAttachHello(config, serverNonce, clientNonce);
-      })().then(
-        (hello) => {
-          if (phase !== "proving" || !current()) {
-            return;
-          }
-          phase = "welcome";
-          sendHello(socket, hello);
-        },
-        () => {
-          if (phase === "proving" && socket === state.ws) {
-            fail("handshake failed");
-          }
-        }
-      );
+        socket.send(JSON.stringify({ type: "clientNonce", clientNonce }));
+      } catch {
+        fail("clientNonce failed");
+        return;
+      }
+      phase = "serverProof";
+      armPhaseTimer("serverProof", timing.welcomeTimeoutMs, "no server proof");
     }
 
-    function onWelcomeFrame(frame) {
-      if (frame.protocol !== PROTOCOL) {
-        phase = "failed";
-        closeSocket(socket, 4000, "protocol mismatch");
+    // Steps 3-4: the hello is built and sent only after the port-bound serverProof verified.
+    function onServerProof(frame) {
+      clearPhaseTimer();
+      if (!frame || frame.type !== "serverProof") {
+        fail("expected serverProof");
         return;
       }
-      if (frame.installId !== undefined && frame.installId !== config.installId) {
-        fail("installId mismatch");
-        return;
-      }
-      phase = "verifying";
-      verifyServerProof(config, serverNonce, clientNonce, frame.serverProof).then(
-        (ok) => {
-          if (phase !== "verifying" || !current()) {
-            return;
+      phase = "verifyingServer";
+      const message = handshakeMessage("emunium-server", serverNonce, clientNonce, config.hubPort);
+      verifyMac(config.enrollment, message, frame.serverProof)
+        .then((ok) => {
+          if (phase !== "verifyingServer" || !current()) {
+            return null;
           }
           if (!ok) {
             fail("bad server proof");
+            return null;
+          }
+          phase = "proving";
+          return buildAttachHello(config, serverNonce, clientNonce).then((hello) => {
+            if (phase !== "proving" || !current()) {
+              return;
+            }
+            phase = "welcome";
+            sendHello(socket, hello);
+          });
+        })
+        .catch(() => {
+          if ((phase === "verifyingServer" || phase === "proving") && socket === state.ws) {
+            fail("handshake failed");
+          }
+        });
+    }
+
+    // Steps 5-6: the welcomeMac binds nonces, port, installId and token; verified before anything else.
+    function onWelcomeFrame(frame) {
+      if (!frame || frame.type !== "welcome") {
+        fail("expected welcome");
+        return;
+      }
+      const token = frame.token === undefined || frame.token === null ? "" : frame.token;
+      if (frame.protocol !== PROTOCOL || frame.installId !== config.installId || typeof token !== "string") {
+        fail("bad welcome");
+        return;
+      }
+      phase = "verifyingWelcome";
+      const message = handshakeMessage(
+        "emunium-welcome",
+        serverNonce,
+        clientNonce,
+        config.hubPort,
+        config.installId,
+        token
+      );
+      verifyMac(config.enrollment, message, frame.welcomeMac).then(
+        (ok) => {
+          if (phase !== "verifyingWelcome" || !current()) {
+            return;
+          }
+          if (!ok) {
+            fail("bad welcome mac");
             return;
           }
           phase = "done";
           const replay = early;
           early = [];
-          // A token is stored only from a welcome whose serverProof verified.
-          if (typeof frame.token === "string" && frame.token) {
-            storeToken(frame.token);
+          // A token is stored only from a welcome whose welcomeMac (covering that token) verified.
+          if (token) {
+            storeToken(token);
           }
           onWelcome(socket);
           for (const queued of replay) {
@@ -548,7 +594,7 @@
           }
         },
         () => {
-          if (phase === "verifying" && socket === state.ws) {
+          if (phase === "verifyingWelcome" && socket === state.ws) {
             fail("handshake failed");
           }
         }
@@ -560,16 +606,18 @@
         case "challenge":
           onChallenge(frame);
           return;
+        case "serverProof":
+          onServerProof(frame);
+          return;
+        case "verifyingServer":
         case "proving":
           fail("frame before hello"); // a genuine hub waits for the hello
           return;
         case "welcome":
-          if (frame && frame.type === "welcome") {
-            onWelcomeFrame(frame);
-          }
-          return; // anything else before the welcome is ignored
-        case "verifying":
-          // Requests the hub sends right after its welcome run once the proof checks out.
+          onWelcomeFrame(frame);
+          return;
+        case "verifyingWelcome":
+          // Requests the hub sends right after its welcome run once the welcomeMac checks out.
           if (frame && early.length < MAX_EARLY_FRAMES) {
             early.push(frame);
           }
