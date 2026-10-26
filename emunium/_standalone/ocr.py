@@ -46,13 +46,14 @@ def initialize_ocr(langs: list[str], use_gpu: bool) -> OcrReader:
 
 
 def to_bgr(image: np.ndarray) -> np.ndarray:
+    """BGR from gray, BGR or BGRA (mss captures are BGRA)."""
     import cv2
 
     if image.ndim == 2:
         return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     if image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-    return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    return image
 
 
 def find_text_elements(
@@ -63,6 +64,7 @@ def find_text_elements(
     region: vision.Region | None = None,
 ) -> list[dict[str, int]]:
     """Centers (INPUT units) of OCR boxes whose text contains ``query``."""
+    vision.require_standalone()
     import numpy as np
 
     capture = vision.capture_screen(region)

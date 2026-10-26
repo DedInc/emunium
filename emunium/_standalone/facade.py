@@ -1,17 +1,18 @@
 """Standalone (screen) automation: template matching, OCR and native input.
 
 Coordinates returned by ``find_*`` and accepted by the input methods are INPUT
-units (what ``pyautogui.moveTo`` uses); screenshot pixels are converted with
-``emunium._screen.screenshot_scale``. pyautogui and HumanCursor are imported
-lazily so DPI awareness is chosen first (see ``docs/architecture/native-input.md``).
+units (what ``emunium._screen.input_backend().moveTo`` uses); screenshots come
+from mss and are converted in ``emunium._standalone.vision``. All input goes
+through the shared ``ElementInteractor`` / ``input_backend()`` (see
+``docs/architecture/native-input.md``).
 """
 
 from __future__ import annotations
 
+import math
 import random
-import sys
 import time
-from typing import TYPE_CHECKING, Sequence, Tuple
+from typing import Callable, Sequence, Tuple
 
 from emunium import _screen
 from emunium._element_interactor import ElementInteractor
@@ -20,23 +21,69 @@ from emunium._standalone import ocr as _ocr
 from emunium._standalone import vision
 from emunium._standalone.config import ClickType, Config, StandaloneConfig
 
-if TYPE_CHECKING:
-    from humancursor import SystemCursor
-
 Region = Tuple[int, int, int, int]
 
-
-def _platform() -> str:
-    return sys.platform
+# ``input_backend().scroll`` takes wheel NOTCHES on every platform (the Windows
+# backend multiplies by WHEEL_DELTA itself; pyautogui on macOS scrolls lines).
+WHEEL_NOTCH = 1
 
 
 def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def wheel_units_per_notch(platform: str) -> int:
-    """Amount ``pyautogui.scroll`` needs for one wheel notch on ``platform``."""
-    return Config.WINDOWS_WHEEL_DELTA if platform == "win32" else 1
+def _xy(point: Sequence[float]) -> tuple[float, float]:
+    if len(point) != 2:
+        raise ValueError(f"point must be (x, y), got {point!r}")
+    return float(point[0]), float(point[1])
+
+
+class SystemCursor:
+    """Compatibility stand-in for the HumanCursor ``SystemCursor`` of emunium 3.0.
+
+    ``move_to``, ``click_on`` and ``drag_and_drop`` delegate to the owner's
+    current ``ElementInteractor`` (human paths, native input, input lock).
+    """
+
+    def __init__(self, interactor: Callable[[], ElementInteractor]) -> None:
+        self._interactor = interactor
+
+    def move_to(self, point: Sequence[float]) -> None:
+        x, y = _xy(point)
+        self._interactor().move(x, y)
+
+    def click_on(
+        self, point: Sequence[float], clicks: int = 1, click_duration: float = 0
+    ) -> None:
+        """Move to ``point`` and click ``clicks`` times.
+
+        ``click_duration`` 0 lets the interactor pick the hold (``clicks`` > 1 is
+        a real multi-click); a positive value holds each press that long.
+        """
+        x, y = _xy(point)
+        if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1:
+            raise ValueError(f"clicks must be a positive int, got {clicks!r}")
+        hold = float(click_duration)
+        if not math.isfinite(hold) or hold < 0:
+            raise ValueError(
+                f"click_duration must be finite and >= 0, got {click_duration!r}"
+            )
+        interactor = self._interactor()
+        with NATIVE_INPUT_LOCK:
+            interactor.move(x, y)
+            if hold == 0:
+                interactor.press("left", clicks=clicks)
+                return
+            gui = interactor._gui()
+            for index in range(clicks):
+                # The interactor's guarded press: the button is released even
+                # when the hold is interrupted.
+                interactor._button_down_up(gui, "left", hold)
+                if index < clicks - 1:
+                    _sleep(interactor.double_click_interval())
+
+    def drag_and_drop(self, start: Sequence[float], end: Sequence[float]) -> None:
+        self._interactor().drag(_xy(start), _xy(end))
 
 
 class Emunium:
@@ -62,22 +109,17 @@ class Emunium:
             self.ocr_reader = _ocr.initialize_ocr(
                 list(langs) if langs else ["en"], use_gpu
             )
-            screen_width, screen_height = _screen.pyautogui().size()
+            screen_width, screen_height = _screen.input_backend().size()
             self.monitor_region = (0, 0, int(screen_width), int(screen_height))
 
     @property
     def cursor(self) -> SystemCursor:
-        """HumanCursor ``SystemCursor``, created on first access.
+        """``SystemCursor``-compatible object (3.0 API), created on first access.
 
-        Input methods go through ``self.interactor``; this stays for callers
-        that drive HumanCursor directly.
+        It delegates to ``self.interactor``, including one assigned later.
         """
         if self._cursor is None:
-            # HumanCursor imports pyautogui; DPI awareness must be chosen first.
-            _screen.pyautogui()
-            from humancursor import SystemCursor
-
-            self._cursor = SystemCursor()
+            self._cursor = SystemCursor(lambda: self.interactor)
         return self._cursor
 
     def find_elements(
@@ -214,18 +256,18 @@ class Emunium:
     def scroll_to(self, element_center: dict[str, int]) -> None:
         """Scroll the wheel until ``element_center`` is near the vertical middle.
 
-        The pixel distance becomes wheel notches of ``Config.SCROLL_STEP_SIZE`` px.
+        The pixel distance becomes wheel notches of ``Config.SCROLL_STEP_SIZE`` px,
+        sent one ``WHEEL_NOTCH`` at a time.
         """
-        gui = _screen.pyautogui()
-        distance = element_center["y"] - int(gui.size()[1]) // 2
+        backend = _screen.input_backend()
+        distance = element_center["y"] - int(backend.size()[1]) // 2
         notches = round(abs(distance) / float(Config.SCROLL_STEP_SIZE))
         if notches == 0:
             return
         direction = -1 if distance > 0 else 1
-        amount = direction * wheel_units_per_notch(_platform())
         with NATIVE_INPUT_LOCK:
             for _ in range(notches):
-                gui.scroll(amount, _pause=False)
+                backend.scroll(direction * WHEEL_NOTCH, _pause=False)
                 _sleep(random.uniform(*Config.SCROLL_DELAY_RANGE))
 
     def drag_and_drop(

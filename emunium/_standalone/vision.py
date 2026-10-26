@@ -1,16 +1,18 @@
-"""Screen capture and template matching for standalone mode.
+"""Screen capture (mss) and template matching for standalone mode.
 
-Matching runs in screenshot pixels; results are converted to INPUT units (what
-``pyautogui.moveTo`` uses) with ``emunium._screen.screenshot_scale`` so Retina
-(2x) screenshots are clicked at the right point. Regions are given in INPUT
-units: ``(left, top, width, height)``.
+Captures come from ``mss`` as BGRA numpy arrays (no Pillow) and span every
+monitor. Matching runs in screenshot pixels; results are converted to INPUT
+units (what ``emunium._screen.input_backend().moveTo`` uses) so Retina (2x)
+screenshots are clicked at the right point. Regions are given in INPUT units:
+``(left, top, width, height)``.
 """
 
 from __future__ import annotations
 
+import importlib
 import math
 from itertools import product
-from typing import TYPE_CHECKING, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple, Sequence, Tuple
 
 from emunium import _screen
 from emunium._standalone.config import StandaloneConfig
@@ -19,6 +21,21 @@ if TYPE_CHECKING:
     import numpy as np
 
 Region = Tuple[float, float, float, float]
+
+STANDALONE_MODULES = ("numpy", "cv2", "mss")
+MISSING_STANDALONE = (
+    "standalone mode needs mss, numpy and opencv, but {module} is not installed. "
+    "Run: pip install emunium[standalone]"
+)
+
+
+def require_standalone() -> None:
+    """Raise ``ImportError`` naming the extra when a standalone dependency is missing."""
+    for module in STANDALONE_MODULES:
+        try:
+            importlib.import_module(module)
+        except ImportError as exc:
+            raise ImportError(MISSING_STANDALONE.format(module=module)) from exc
 
 
 class Match(NamedTuple):
@@ -32,67 +49,105 @@ class Match(NamedTuple):
 
 
 class ScreenCapture(NamedTuple):
-    """A screenshot (cropped to a region) and how to map it back to INPUT units."""
+    """A BGRA screenshot and how to map its pixels back to INPUT units.
+
+    ``(origin_x, origin_y)`` is the INPUT point of pixel ``(0, 0)``; ``scale``
+    is INPUT units per screenshot pixel (1.0 on Windows/Linux, 0.5 on Retina).
+    """
 
     image: np.ndarray
-    origin_x: int
-    origin_y: int
+    origin_x: float
+    origin_y: float
     scale: float
 
     def to_input(self, x: float, y: float) -> dict[str, int]:
         """Map a point of ``image`` (screenshot px) to INPUT units."""
         return {
-            "x": round((self.origin_x + x) * self.scale),
-            "y": round((self.origin_y + y) * self.scale),
+            "x": round(self.origin_x + x * self.scale),
+            "y": round(self.origin_y + y * self.scale),
         }
 
 
-def _region_pixels(
-    region: Region, scale: float, image_width: int, image_height: int
-) -> tuple[int, int, int, int]:
-    """INPUT-unit region -> clamped screenshot-pixel box (left, top, right, bottom)."""
-    if len(region) != 4:
-        raise ValueError(f"region must be (left, top, width, height), got {region!r}")
-    left, top, width, height = (float(value) for value in region)
-    if not all(math.isfinite(v) for v in (left, top, width, height)):
-        raise ValueError(f"region must be finite, got {region!r}")
-    if width <= 0 or height <= 0:
-        raise ValueError(f"region width and height must be positive, got {region!r}")
-    if scale <= 0:
-        raise ValueError(f"screenshot scale must be positive, got {scale!r}")
-    px_left = max(0, math.floor(left / scale))
-    px_top = max(0, math.floor(top / scale))
-    px_right = min(image_width, math.ceil((left + width) / scale))
-    px_bottom = min(image_height, math.ceil((top + height) / scale))
-    if px_right <= px_left or px_bottom <= px_top:
+def _primary_monitor(monitors: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+    """mss ``monitors[0]`` is the union of all monitors; the primary is in ``[1:]``."""
+    if len(monitors) < 2:
+        raise RuntimeError("mss reported no monitor to capture")
+    return next((m for m in monitors[1:] if m.get("is_primary")), monitors[1])
+
+
+def _grab_box(
+    region: Region | None, input_per_unit: float, desktop: Mapping[str, Any]
+) -> dict[str, int]:
+    """INPUT-unit region -> mss box clamped to the all-monitor ``desktop``."""
+    d_left, d_top = int(desktop["left"]), int(desktop["top"])
+    d_right = d_left + int(desktop["width"])
+    d_bottom = d_top + int(desktop["height"])
+    if region is None:
+        left, top, right, bottom = d_left, d_top, d_right, d_bottom
+    else:
+        if len(region) != 4:
+            raise ValueError(
+                f"region must be (left, top, width, height), got {region!r}"
+            )
+        r_left, r_top, r_width, r_height = (float(value) for value in region)
+        if not all(math.isfinite(v) for v in (r_left, r_top, r_width, r_height)):
+            raise ValueError(f"region must be finite, got {region!r}")
+        if r_width <= 0 or r_height <= 0:
+            raise ValueError(
+                f"region width and height must be positive, got {region!r}"
+            )
+        left = max(d_left, math.floor(r_left / input_per_unit))
+        top = max(d_top, math.floor(r_top / input_per_unit))
+        right = min(d_right, math.ceil((r_left + r_width) / input_per_unit))
+        bottom = min(d_bottom, math.ceil((r_top + r_height) / input_per_unit))
+    if right <= left or bottom <= top:
         raise ValueError(f"region {region!r} lies outside the screen")
-    return px_left, px_top, px_right, px_bottom
+    return {"left": left, "top": top, "width": right - left, "height": bottom - top}
 
 
 def capture_screen(region: Region | None = None) -> ScreenCapture:
-    """Full screenshot, scale from it, then crop to ``region`` (INPUT units)."""
+    """Grab ``region`` (INPUT units; ``None``: all monitors) with mss.
+
+    INPUT units per mss unit = ``input_backend().size()`` width / mss primary
+    monitor width (both physical px on Windows/Linux, both points on macOS).
+    mss units per pixel come from the grab itself: on Retina a box given in
+    points comes back with twice the pixels.
+    """
+    require_standalone()
+    import mss
     import numpy as np
 
-    shot = _screen.pyautogui().screenshot()
-    scale = _screen.screenshot_scale(shot)
-    image = np.asarray(shot)
-    if region is None:
-        return ScreenCapture(np.ascontiguousarray(image), 0, 0, scale)
-    left, top, right, bottom = _region_pixels(
-        region, scale, image.shape[1], image.shape[0]
+    # The backend chooses DPI awareness; it must happen before mss measures.
+    backend_width = float(_screen.input_backend().size()[0])
+    factory = getattr(mss, "MSS", None) or mss.mss
+    with factory() as grabber:
+        monitors = grabber.monitors
+        unit_width = float(_primary_monitor(monitors)["width"])
+        if backend_width <= 0 or unit_width <= 0:
+            raise RuntimeError(
+                f"cannot scale screenshots: input width {backend_width}, "
+                f"monitor width {unit_width}"
+            )
+        input_per_unit = backend_width / unit_width
+        box = _grab_box(region, input_per_unit, monitors[0])
+        shot = grabber.grab(box)
+    width, height = int(shot.width), int(shot.height)
+    image = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(height, width, 4)
+    scale = input_per_unit * box["width"] / float(width)
+    return ScreenCapture(
+        image, box["left"] * input_per_unit, box["top"] * input_per_unit, scale
     )
-    crop = np.ascontiguousarray(image[top:bottom, left:right])
-    return ScreenCapture(crop, left, top, scale)
 
 
 def to_gray(image: np.ndarray) -> np.ndarray:
+    """8-bit gray from gray, BGR or BGRA (mss captures are BGRA)."""
     import cv2
 
     if image.ndim == 2:
         return image
     if image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
-    return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 
 def apply_transformations(
@@ -268,6 +323,7 @@ def find_elements(
     region: Region | None = None,
 ) -> list[dict[str, int]]:
     """Centers (INPUT units) of template matches on screen, best score first."""
+    require_standalone()
     import cv2
 
     if not image_path:
