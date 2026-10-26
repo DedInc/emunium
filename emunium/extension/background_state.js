@@ -46,6 +46,8 @@
     pendingClaims: [],
     // Nonces already taken from a navigation (insertion-ordered, bounded).
     seenClaimNonces: new Set(),
+    // The worker-start scan of open tabs for claim pages has run (attach mode).
+    startClaimScanDone: false,
   };
 
   const KNOWN_CODES = new Set([
@@ -282,6 +284,11 @@
           scheduleReconnect(timing.configRetryMs);
           return false;
         }
+        if (config.mode === "attach" && !state.startClaimScanDone) {
+          // A claim page may have committed before the onCommitted listener existed.
+          state.startClaimScanDone = true;
+          scanClaimTabs(config).catch(() => {});
+        }
         let socket;
         try {
           socket = new WebSocket(config.url);
@@ -399,6 +406,9 @@
       }
     }, timing.keepAliveMs);
     flushClaims();
+    if (attachClaimTarget(state.config) !== null) {
+      scanClaimTabs(state.config).catch(() => {});
+    }
   }
 
   // ── start-URL claim (attach-mode.md section 4.1) ────────────────────────
@@ -439,25 +449,50 @@
     }
     // Before the first connect the mode is unknown; read the files (no identity side effects).
     const config = state.config || (await loadFileConfig());
+    return queueClaim(details.url, details.tabId, config);
+  }
+
+  // Queues a claim URL once per nonce, sends it when welcomed, and blanks its tab.
+  async function queueClaim(url, tabId, config) {
     const hubPort = attachClaimTarget(config);
     if (hubPort === null) {
       return false;
     }
-    const nonce = parseClaimUrl(details.url, hubPort);
+    const nonce = parseClaimUrl(url, hubPort);
     if (nonce === null || state.seenClaimNonces.has(nonce)) {
       return false;
     }
     rememberNonce(nonce);
     state.pendingClaims.push({ nonce, hubPort, at: Date.now() });
     flushClaims();
-    if (Number.isInteger(details.tabId)) {
+    if (Number.isInteger(tabId)) {
       try {
-        await chrome.tabs.update(details.tabId, { url: "about:blank" });
+        await chrome.tabs.update(tabId, { url: "about:blank" });
       } catch {
         // tab already gone or navigated away: the nonce is captured either way
       }
     }
     return true;
+  }
+
+  // Already-open tabs showing a claim page (committed before the listener existed); returns the count queued.
+  async function scanClaimTabs(config) {
+    const target = config || state.config;
+    if (attachClaimTarget(target) === null) {
+      return 0;
+    }
+    let tabs;
+    try {
+      tabs = await chrome.tabs.query({});
+    } catch {
+      return 0;
+    }
+    const queued = await Promise.all(
+      (Array.isArray(tabs) ? tabs : []).map((tab) =>
+        tab && typeof tab.url === "string" ? queueClaim(tab.url, tab.id, target) : false
+      )
+    );
+    return queued.filter(Boolean).length;
   }
 
   // Sends queued claims on the current welcomed attach socket; drops claims older than claimTtlMs.
@@ -616,6 +651,7 @@
     hubPortOf,
     parseClaimUrl,
     handleClaimNavigation,
+    scanClaimTabs,
     flushClaims,
     connect,
     ensureConnected,

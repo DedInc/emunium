@@ -776,10 +776,10 @@ test("the wait hook survives re-injection and wraps the published waitForSelecto
 
 // ── manifest ─────────────────────────────────────────────────────────────
 
-test("manifest: 2.0.0, Chrome 111+, userScripts and alarms, no web_accessible_resources, no MAIN-world file", () => {
+test("manifest: 2.0.0, Chrome 116+, userScripts and alarms, no web_accessible_resources, no MAIN-world file", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(h.EXTENSION_DIR, "manifest.json"), "utf8"));
   assert.equal(manifest.version, "2.0.0");
-  assert.equal(manifest.minimum_chrome_version, "111");
+  assert.equal(manifest.minimum_chrome_version, "116");
   for (const permission of ["userScripts", "alarms", "scripting"]) {
     assert.ok(manifest.permissions.includes(permission), permission);
   }

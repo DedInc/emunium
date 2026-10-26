@@ -316,6 +316,69 @@ test("claim: dropped after claimTtlMs; sub-frames, other ports and launch mode a
   assert.equal(blanked(launch.chrome).length, 0);
 });
 
+test("claim: a claim tab open before the worker loaded is queued at start, blanked, sent after the welcome", async (t) => {
+  const other = `http://127.0.0.1:47801/pair#n=${"p".repeat(20)}`;
+  const w = makeWorker(t, {
+    before: (chrome) => {
+      // Committed while the worker was still starting: no onCommitted is ever emitted for it.
+      chrome.__state.tabs.get(1).url = CLAIM_URL;
+      chrome.__state.tabs.set(2, { id: 2, windowId: 1, index: 1, active: false, url: other, status: "complete" });
+      chrome.__state.tabs.set(3, { id: 3, windowId: 1, index: 2, active: false, url: CLAIM_URL, status: "complete" });
+    },
+  });
+  await until(() => blanked(w.chrome).length === 1);
+  assert.deepEqual(plain(blanked(w.chrome)[0]), [1, { url: "about:blank" }], "same nonce in tab 3 is not queued twice");
+  assert.equal(w.bg.state.pendingClaims.length, 1);
+
+  const ws = await until(() => h.FakeWebSocket.last());
+  ws.open();
+  await sleep(10);
+  assert.equal(claims(ws).length, 0, "never on the unwelcomed socket");
+  ws.serverSend({ type: "welcome", protocol: 2 });
+  assert.deepEqual(claims(ws), [{ type: "event", event: "claim", nonce: NONCE }]);
+
+  // The welcome rescan and a late commit of the same nonce add nothing.
+  commit(w.chrome, { url: CLAIM_URL, tabId: 3 });
+  await sleep(20);
+  assert.equal(claims(ws).length, 1);
+  assert.equal(blanked(w.chrome).length, 1);
+});
+
+test("claim: every attach welcome rescans open tabs; launch mode never scans", async (t) => {
+  const w = makeWorker(t);
+  w.bg.timing.backoffMinMs = 5;
+  const ws = await until(() => h.FakeWebSocket.last());
+  ws.open();
+  ws.serverSend({ type: "welcome", protocol: 2 });
+  await sleep(10);
+  assert.equal(claims(ws).length, 0);
+
+  // A claim page that no onCommitted reported (e.g. lost while the worker was suspended).
+  const late = "w".repeat(32);
+  w.chrome.__state.tabs.get(1).url = `http://127.0.0.1:47800/pair#n=${late}`;
+  ws.serverClose(1006);
+  const ws2 = await until(() => h.FakeWebSocket.instances[1]);
+  ws2.open();
+  ws2.serverSend({ type: "welcome", protocol: 2 });
+  await until(() => claims(ws2).length === 1);
+  assert.deepEqual(claims(ws2), [{ type: "event", event: "claim", nonce: late }]);
+  assert.deepEqual(plain(blanked(w.chrome)), [[1, { url: "about:blank" }]]);
+
+  const launch = makeWorker(t, {
+    files: { "session.json": SESSION, "attach.json": ATTACH },
+    before: (chrome) => {
+      chrome.__state.tabs.get(1).url = CLAIM_URL;
+    },
+  });
+  const lws = await until(() => h.FakeWebSocket.last());
+  lws.open();
+  lws.serverSend({ type: "welcome", protocol: 2 });
+  await sleep(20);
+  assert.equal(launch.chrome.tabs.query.calls.length, 0, "launch mode does not query tabs");
+  assert.equal(claims(lws).length, 0);
+  assert.equal(blanked(launch.chrome).length, 0);
+});
+
 test("manifest: storage permission and minimum_chrome_version 116", () => {
   const manifest = require("node:fs").readFileSync(require("node:path").join(h.EXTENSION_DIR, "manifest.json"), "utf8");
   const parsed = JSON.parse(manifest);
