@@ -40,6 +40,16 @@ observe; they are listed first.
 - **Typing checks focus.** `type()` raises `NativeInputError` when the element
   (or the browser window) does not hold keyboard focus, instead of sending
   keystrokes blind, and waits until the page shows the typed text.
+- **Typing speed is validated.** With `human=True`, `characters_per_minute`
+  outside 60-900 raises `InvalidArgumentError`, as does an `offset` outside
+  0-1000 ms or not below the median interval `60000 / characters_per_minute`
+  ms. A `characters_per_minute` of 0 or less still types without delay. Both
+  arguments now default to `None`, which keeps the typing rhythm's own values
+  (280 characters per minute and 20 ms for the `natural` preset).
+- **Custom interactors take a target size.** An interactor passed to
+  `BrowserContext(interactor=...)` must accept
+  `move(x, y, *, human=True, target_size=None)`; element actions pass the
+  element's size on every human move.
 - **Network waits are scoped.** `wait_for_response` only matches responses of
   the pinned tab (`any_tab=True` to widen) that finished after the last action
   (`since=` to override). In URL patterns only `*` is a wildcard.
@@ -56,6 +66,23 @@ observe; they are listed first.
   and a handle from a replaced document raises `StaleElementError`.
 - `Emunium(ocr=True)` as an alias of `ocr_enabled=True`; OCR initialization
   errors surface in the constructor.
+- Motion planners for `human=True` pointer moves: `SigmaDriftPlanner`
+  (default; sigma-lognormal strokes with Fitts' law timing),
+  `BezierTremorPlanner`, `WindMousePlanner` and `LinearPlanner`, each
+  non-linear one with the presets `natural`, `careful` and `brisk`. Select one
+  with `Browser(motion=...)` or `Emunium(motion=...)`, or pass any object
+  implementing the `MotionPlanner` protocol. Every parameter is checked against
+  a documented range and raises `InvalidArgumentError` outside it.
+- Typing rhythm for `human=True` typing: `TypingRhythm` with lognormal
+  intervals, word and sentence pauses, shift and key-pair (bigram) factors and
+  occasional micro-pauses; presets `natural`, `careful`, `brisk`, selected with
+  `Browser(typing=...)` or `Emunium(typing=...)`.
+- `MotionPlanner`, `MotionStep`, `ScreenBounds`, the planner classes,
+  `FittsTiming`, `Tremor`, `Overshoot` and `TypingRhythm` are exported from
+  `emunium`.
+- On Windows, the browser window is brought to the foreground after `launch()`
+  and before every native action, without sending keys or clicks; when Windows
+  keeps another window in front, the action raises `NativeInputError`.
 - On Windows, `EMUNIUM_FAILSAFE=0` disables the screen-corner fail-safe of the
   built-in input backend (which raises `NativeInputError`). On macOS and Linux
   pyautogui's own fail-safe (`pyautogui.FailSafeException`) still applies.
@@ -81,4 +108,17 @@ observe; they are listed first.
   only on macOS and Linux; `HumanCursor` removed. The `standalone` and `ocr`
   extras now include `mss` and `opencv-python-headless` instead of
   `opencv-python`.
+- `human=True` pointer moves follow the selected motion planner instead of a
+  generic curved path; move duration follows Fitts' law from the distance and
+  the target element's size.
 - Package description no longer claims to be undetectable.
+
+### Fixed
+
+- `execute_script` bodies may use `await` directly.
+- Click verification works at any `devicePixelRatio`: the pointer check moves
+  the cursor by at least one CSS pixel, so the page sees an event on high-DPI
+  displays too.
+- Closing a headed browser on Windows no longer waits out the termination
+  grace period: `close()` first closes its tabs through the extension (within
+  one second), so Chrome exits on its own and usually closes in under a second.

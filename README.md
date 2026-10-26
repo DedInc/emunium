@@ -15,6 +15,8 @@ No CDP, no WebDriver.
   focus and blocked scripts each raise their own exception.
 - **Isolated sessions**: every browser has its own extension copy, port and
   token, so parallel runs don't collide.
+- **Natural-looking input**: pointer paths from pluggable motion planners and a
+  typing rhythm with word, sentence and key-pair pauses, each with presets.
 
 A standalone mode drives any desktop application through image template
 matching and OCR.
@@ -31,6 +33,7 @@ matching and OCR.
 - [Waiting](#waiting)
 - [Element API](#element-api)
 - [Mouse and keyboard](#mouse-and-keyboard)
+- [Human-like input](#human-like-input)
 - [Tabs](#tabs)
 - [Network waits](#network-waits)
 - [JavaScript execution](#javascript-execution)
@@ -117,6 +120,8 @@ Browser(
     chrome_path=None,      # Chrome/Chromium binary; see below
     extra_args=None,       # list[str] of extra Chrome command-line flags
     verify_input=True,     # verify the cursor position before every click
+    motion=None,           # pointer planner: "natural" (None), "careful", "brisk" or a MotionPlanner
+    typing=None,           # typing rhythm: "natural" (None), "careful", "brisk" or a TypingRhythm
 )
 ```
 
@@ -128,11 +133,21 @@ Browser(
 - `verify_input=False` skips the pointer check described in
   [Screen coordinates](#screen-coordinates-dpi-and-zoom) and clicks at the
   computed position.
+- `motion` and `typing` choose how `human=True` actions move the cursor and pace
+  keystrokes; see [Human-like input](#human-like-input). An unknown preset name
+  or a wrong type raises `InvalidArgumentError`.
 
 `launch()` is transactional: if Chrome or the extension fails to start, every
 process and temporary directory it created is removed before the error is
 raised (`LaunchError`, or the emunium exception that caused the failure). `close()` is safe to call more than once. The
 context manager calls both.
+
+On Windows, `launch()` then tries once to bring the browser window to the
+foreground (a browser started from a background process can open behind other
+windows); a failure there is only logged. Every native action raises the
+window again before sending input. On a headed Windows browser, `close()` first
+closes the tabs through the extension (up to one second), so Chrome exits on its
+own before the process tree is terminated.
 
 Properties: `browser.url`, `browser.title`, `browser.bridge`.
 
@@ -304,7 +319,7 @@ element.right_click(human=True)
 element.middle_click(human=True)
 element.hover(offset_x=None, offset_y=None, human=True)
 element.move_to(offset_x=None, offset_y=None, human=True)   # same as hover
-element.type(text, characters_per_minute=280, offset=20, human=True,
+element.type(text, characters_per_minute=None, offset=None, human=True,
              click_type=ClickType.LEFT, settle=True)
 element.drag_to(target_element, human=True)
 element.scroll_into_view()
@@ -347,8 +362,9 @@ on (`drag_and_drop` returns `None`).
 `ClickType` values: `LEFT` (default), `RIGHT`, `MIDDLE`, `DOUBLE`. A double click
 is one cursor movement followed by two presses at the OS double-click interval.
 
-`human=True` moves the cursor in many small steps over a duration that grows
-with the distance; `human=False` moves it directly.
+`human=True` moves the cursor along a path planned by the browser's motion
+planner (see [Human-like input](#human-like-input)); `human=False` puts it on
+the target in one step.
 
 A drag verifies the drop target while the button is held. If verification
 fails after the button went down, the cursor returns to the source, Escape is
@@ -357,7 +373,7 @@ sent to cancel the drag, and only then is the button released.
 ### Keyboard
 
 ```python
-browser.type(selector, text, characters_per_minute=280, offset=20, human=True, timeout=10.0)
+browser.type(selector, text, characters_per_minute=None, offset=None, human=True, timeout=10.0)
 browser.type_at(target, text, ..., click_type=ClickType.LEFT)
 ```
 
@@ -384,9 +400,14 @@ How characters are delivered:
   (`Cmd+V` / `Ctrl+V`). The previous clipboard text is restored afterwards if
   the clipboard still holds the pasted text.
 
-`human=True` keeps a per-character rhythm of `characters_per_minute`, each
-delay varied by up to `offset` milliseconds either way; `human=False` types
-without per-character delay.
+`human=True` waits between keystrokes as the browser's typing rhythm draws it
+(see [Typing rhythm](#typing-rhythm)). `characters_per_minute` (60 to 900)
+overrides the rhythm's median speed and `offset` (milliseconds, 0 to 1000 and
+below the median interval `60000 / characters_per_minute`) its random jitter;
+`None` keeps the rhythm's own values. With `human=True`, a value outside these
+ranges raises `InvalidArgumentError` before any key is sent.
+`characters_per_minute` of 0 or less, like
+`human=False`, types without delay between keystrokes.
 
 ### Fail-safe
 
@@ -395,6 +416,163 @@ without per-character delay.
   disable this check.
 - **macOS and Linux**: pyautogui's own fail-safe applies and raises
   `pyautogui.FailSafeException`. `EMUNIUM_FAILSAFE` has no effect there.
+
+---
+
+## Human-like input
+
+With `human=True` (the default) the cursor travels to its target along a
+planned path and keystrokes follow a variable rhythm, modelled on published
+models of human pointing and typing. The goal is input that looks natural to a
+person watching the screen and to pages that react to pointer movement. emunium
+makes no claim that this input is indistinguishable from a person's or that it
+avoids bot detection.
+
+### Motion planners
+
+```python
+from emunium import Browser, Emunium, SigmaDriftPlanner, WindMousePlanner
+
+browser = Browser(motion="careful")                        # preset of the default planner
+browser = Browser(motion=WindMousePlanner.preset("brisk"))
+emu = Emunium(motion=SigmaDriftPlanner(sample_hz=250.0))  # standalone mode takes the same argument
+```
+
+`motion=` (on `Browser` and `Emunium`) is `None` (the `natural` preset of
+`SigmaDriftPlanner`), a preset name (`"natural"`, `"careful"`, `"brisk"`, all
+of `SigmaDriftPlanner`), or a planner object. Every planner except
+`LinearPlanner` has `Planner.preset("natural" | "careful" | "brisk")`:
+`careful` moves slower with more corrections, `brisk` faster.
+
+| Planner | Path |
+|---|---|
+| `SigmaDriftPlanner` (default) | Sigma-lognormal strokes (Plamondon) along a gently curved path; duration from Fitts' law; tremor and slow drift; sometimes an overshoot or undershoot followed by a corrective sub-stroke. |
+| `BezierTremorPlanner` | Cubic Bezier curve (occasionally S-shaped) walked with a minimum-jerk speed profile; tremor and drift; occasional overshoot with a straight corrective approach. |
+| `WindMousePlanner` | Benjamin Land's WindMouse (gravity pulls toward the target, wind wanders), reported at a mouse polling rate. |
+| `LinearPlanner` | One step straight onto the target, no delay. |
+
+Move duration follows Fitts' law, `a + b * log2(D / W + 1)`, where `D` is the
+distance and `W` the target size: for element actions, the smaller side of the
+element's visible box in screen pixels (24 px when no element size is known,
+for example in standalone mode). The duration varies randomly from move to move and
+stays within 0.12 to 1.6 seconds for every preset (`natural` at most 1.2 s,
+`brisk` 0.9 s). On Windows, steps are timed with a 1 ms timer resolution while
+the move plays; a step that falls behind schedule is skipped rather than
+delayed. The built-in planners keep intermediate steps inside the virtual
+screen and off its corners and the primary monitor's corners (the fail-safe);
+on Windows, emunium also moves them onto a real monitor of a mixed
+multi-monitor layout. Every move ends exactly on the target.
+
+Parameters are dataclass fields; every value is checked on construction and an
+out-of-range value raises `InvalidArgumentError` naming the parameter and its
+range. Pairs are `(low, high)` ranges a value is drawn from.
+
+| Object | Parameter (range) |
+|---|---|
+| `FittsTiming` (`timing=` of each planner except `LinearPlanner`) | `a` 0 to 0.3 s, `b` 0.05 to 0.3 s/bit, `variability` 0 to 0.35, `min_duration` 0.12 to 0.6 s, `max_duration` 0.3 to 1.6 s; `min_duration < max_duration` and `a + b <= max_duration` |
+| `Tremor` (`tremor=`) | `frequency_hz` 4 to 15 Hz, `amplitude_px` 0 to 2 px, `drift_px` 0 to 3 px; `amplitude_px[1] + drift_px <= 4` px. Tremor is also capped at a quarter of the target size and fades out before the end of the move. |
+| `Overshoot` (`overshoot=`) | `probability` 0 to 1, `share` 0 to 0.15 of the distance, `px` 0 to 80 px, `slack_px` 0 to 10 px; only for moves of at least 3 target sizes |
+| `SigmaDriftPlanner` | `sigma` 0.08 to 0.16, `primary_fraction` 0.85 to 1.0, `correction_probability` 0 to 1, `correction_onset` 0.5 to 2.5 sigma, `correction_ratio` 0.3 to 1.0, `curvature` 0 to 0.3, `sample_hz` 60 to 1000 Hz |
+| `BezierTremorPlanner` | `curvature` 0 to 0.3, `s_curve_probability` 0 to 1, `correction_share` 0.05 to 0.4, `sample_hz` 60 to 1000 Hz |
+| `WindMousePlanner` | `gravity` 1 to 20, `wind` 0 to 10 (at most `gravity`), `max_step` 3 to 50 px, `target_area` 1 to 50 px, `sample_hz` 60 to 1000 Hz |
+
+```python
+from emunium import FittsTiming, Overshoot, SigmaDriftPlanner, Tremor
+
+planner = SigmaDriftPlanner(
+    timing=FittsTiming(a=0.12, b=0.14, max_duration=1.4),
+    overshoot=Overshoot(probability=0.1),
+    tremor=Tremor(amplitude_px=(0.2, 0.8), drift_px=0.5),
+)
+```
+
+### Custom planners
+
+Any object with a `plan` method matching the `MotionPlanner` protocol can be
+passed as `motion=`:
+
+```python
+import random
+
+from emunium import Browser, MotionStep, ScreenBounds
+
+
+class StraightPlanner:
+    """Twenty evenly spaced steps over 0.3 seconds."""
+
+    def plan(self, start: tuple[int, int], end: tuple[int, int], *,
+             target_size: float, rng: random.Random,
+             bounds: ScreenBounds | None = None) -> list[MotionStep]:
+        steps = []
+        for i in range(1, 21):
+            t = i / 20
+            x = round(start[0] + (end[0] - start[0]) * t)
+            y = round(start[1] + (end[1] - start[1]) * t)
+            steps.append(MotionStep(x, y, 0.015))
+        return steps
+
+
+browser = Browser(motion=StraightPlanner())
+```
+
+`MotionStep(x, y, dt)` means "`dt` seconds after the previous step, put the
+cursor on `(x, y)`" in screen input coordinates. `target_size` is Fitts' `W`
+in the same unit; `rng` is the random generator to draw from; `bounds`, when
+given, is the virtual screen the steps should stay inside. The last step
+should be `end`: emunium places the cursor exactly on the target after the
+last step in any case. Keeping the other steps on screen and off its corners
+is the planner's job; on Windows, emunium additionally moves them onto the
+nearest monitor and off the corners.
+
+### Typing rhythm
+
+```python
+from emunium import Browser, TypingRhythm
+
+browser = Browser(typing="brisk")
+browser = Browser(typing=TypingRhythm(characters_per_minute=320, word_pause=(1.8, 2.8)))
+```
+
+`typing=` (on `Browser` and `Emunium`) is `None` (the `natural` preset), a
+preset name, or a `TypingRhythm`. The wait between two keystrokes is:
+
+1. a lognormal base interval with median `60 / characters_per_minute` seconds
+   and spread `sigma` (cut at 3 sigma);
+2. multiplied by `word_pause` after a space or tab, or by `sentence_pause`
+   after a line break or after `.`, `!`, `?` or `…` followed by whitespace or
+   the end of the text;
+3. multiplied by `shift_pause` before an ASCII capital or shifted symbol;
+4. multiplied by a US-QWERTY bigram factor: `alternate_hand` when the keys use
+   different hands, `roll` for neighbouring fingers of one hand, `same_finger`
+   when one finger types both; 1.0 for other pairs and for non-ASCII
+   characters;
+5. plus, with probability `micro_pause_probability`, a pause drawn from
+   `micro_pause` seconds;
+6. plus a random jitter of up to `jitter_ms` milliseconds either way (the
+   `offset` argument of `type`);
+7. never shorter than 15 ms.
+
+| Preset | `characters_per_minute` | `jitter_ms` | Character |
+|---|---|---|---|
+| `natural` (default) | 280 | 20 | average typist |
+| `careful` | 200 | 15 | slower, longer word and sentence pauses |
+| `brisk` | 420 | 10 | faster, shorter pauses |
+
+Ranges: `characters_per_minute` 60 to 900, `sigma` 0.1 to 0.6, `word_pause`
+1 to 4, `sentence_pause` 1 to 6, `shift_pause` 1 to 2, `alternate_hand` 0.5 to
+1, `roll` 0.5 to 1, `same_finger` 1 to 2, `micro_pause_probability` 0 to 0.1,
+`micro_pause` 0 to 2 s, `jitter_ms` 0 to 1000 ms and below the median interval
+`60000 / characters_per_minute` ms, `dwell` 0.03 to 0.25 s, `dwell_sigma` 0 to
+0.5. `dwell` and `dwell_sigma` describe key hold time, but the built-in
+backends send each keystroke's down and up events together, so they currently
+have no effect on typing.
+
+### `human=False`
+
+`human=False` skips both models: the cursor is put on the target in one step
+and keys are sent without delay between them. Everything else stays the same:
+clicks are still verified, typing still checks focus, and a headless browser
+still refuses native input.
 
 ---
 
@@ -639,6 +817,10 @@ if hits:
   use the same native input as browser mode, including layout-independent
   typing on Windows. Standalone clicks are not verified: there is no page to
   confirm them.
+- `Emunium(motion=..., typing=...)` selects the pointer planner and typing
+  rhythm exactly like `Browser` (see [Human-like input](#human-like-input)).
+  `type_at` and `type_text` take the same `characters_per_minute` and `offset`
+  overrides as `Browser.type`.
 
 ---
 
@@ -702,9 +884,12 @@ when no `chrome_path` is given.
 - **Top frame only.** Queries, waits and element actions do not reach into
   iframes.
 - **Native input needs a visible, focused window.** The browser window must be
-  on screen and not covered at the click point; typing requires OS focus.
-  Real input moves the real cursor: do not use the mouse or keyboard while a
-  script runs.
+  on screen and not covered at the click point; typing requires OS focus. On
+  Windows, emunium brings the browser window to the foreground before native
+  input (without sending any keys or clicks to do so) and raises
+  `NativeInputError` when Windows keeps another window in front. On macOS and
+  Linux it relies on the extension focusing the window. Real input moves the
+  real cursor: do not use the mouse or keyboard while a script runs.
 - **No native input in headless mode** (see [Headless mode](#headless-mode)).
 - **Linux** native input goes through pyautogui and requires an X11 session
   (XWayland included); pure Wayland sessions are not supported.

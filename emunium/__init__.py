@@ -10,6 +10,19 @@ from emunium import _screen
 
 _screen.ensure_dpi_awareness()
 
+from emunium._motion import (
+    BezierTremorPlanner,
+    FittsTiming,
+    LinearPlanner,
+    MotionPlanner,
+    MotionStep,
+    Overshoot,
+    ScreenBounds,
+    SigmaDriftPlanner,
+    Tremor,
+    TypingRhythm,
+    WindMousePlanner,
+)
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.browser import Browser
@@ -42,6 +55,7 @@ from emunium.standalone import Emunium
 from emunium.wait import Wait, WaitStrategy
 
 __all__ = [
+    "BezierTremorPlanner",
     "Bridge",
     "BridgeDisconnectedError",
     "BridgeError",
@@ -59,18 +73,28 @@ __all__ = [
     "ElementRecord",
     "Emunium",
     "EmuniumError",
+    "FittsTiming",
     "InvalidArgumentError",
     "LaunchError",
+    "LinearPlanner",
     "Locator",
+    "MotionPlanner",
+    "MotionStep",
     "NativeInputError",
     "NavigationError",
     "NavigationTimeoutError",
+    "Overshoot",
     "PageParser",
+    "ScreenBounds",
     "ScriptError",
+    "SigmaDriftPlanner",
     "StaleElementError",
     "TargetClosedError",
+    "Tremor",
+    "TypingRhythm",
     "Wait",
     "WaitStrategy",
     "WaitTimeoutError",
+    "WindMousePlanner",
     "ensure_chrome",
 ]
