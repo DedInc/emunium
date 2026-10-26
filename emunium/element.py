@@ -223,6 +223,8 @@ class Element:
         *,
         query: ElementQuery | None = None,
     ) -> Element:
+        """Build a handle from an extension element payload (``elementId``,
+        ``tag``, ``rect``, ``geometry``, ``tabId``, ...)."""
         element = cls(
             ctx_or_bridge,
             str(data.get("elementId", "")),
@@ -236,46 +238,60 @@ class Element:
 
     @property
     def element_id(self) -> str:
+        """The extension's id for this element within its document."""
         return self._element_id
 
     @property
     def tag(self) -> str:
+        """Tag name as the page reported it."""
         return self._tag
 
     @property
     def attrs(self) -> dict[str, str]:
+        """Attributes from the last snapshot (not re-read on access)."""
         return self._attrs
 
     @property
     def rect(self) -> dict[str, float]:
+        """Viewport rect in CSS px (``x``, ``y``, ``width``, ``height``) from the
+        last snapshot."""
         return self._rect
 
     @property
     def text(self) -> str:
+        """Rendered text preview from the last snapshot, cut at 500 chars;
+        ``inner_text()`` reads the full text."""
         return self._text
 
     @property
     def tab_id(self) -> int | None:
+        """The tab the element lives in; None makes every bridge call raise
+        ``StaleElementError``."""
         return self._tab_id
 
     @property
     def zoom(self) -> float | None:
+        """The tab's zoom factor from the last reply, if known."""
         return self._zoom
 
     @property
     def geometry(self) -> Geometry | None:
+        """Window geometry used to map CSS px to screen input units, if known."""
         return self._geometry
 
     @property
     def query(self) -> ElementQuery | None:
+        """How the element was found; ``refresh`` uses it to find it again."""
         return self._query
 
     @property
     def context(self) -> BrowserContext:
+        """The browser context the handle belongs to."""
         return self._ctx
 
     @property
     def center(self) -> tuple[float, float]:
+        """Center of ``rect`` in CSS px (viewport coordinates)."""
         return (
             self._rect.get("x", 0) + self._rect.get("width", 0) / 2,
             self._rect.get("y", 0) + self._rect.get("height", 0) / 2,
@@ -295,10 +311,12 @@ class Element:
 
     @property
     def screen_y(self) -> float:
+        """Center y in INPUT units (see ``screen_x``)."""
         return self._center_input()[1]
 
     @property
     def visible(self) -> bool:
+        """False when the page reported it hidden or its rect has no area."""
         if self._visible_flag is False:
             return False
         return self._rect.get("width", 0) > 0 and self._rect.get("height", 0) > 0
@@ -367,7 +385,18 @@ class Element:
                 self._geometry_raw = dict(geometry)
 
     def refresh(self, *, requery: bool = True) -> Element:
-        """Re-read the element by id; when stale, find it again by its stored query."""
+        """Re-read the element by id; when stale, find it again by its stored query.
+
+        Args:
+            requery: False re-raises a stale element instead of re-querying.
+
+        Returns:
+            This handle, updated in place.
+
+        Raises:
+            StaleElementError: Stale and no query (or ``requery=False``), the
+                query has no match at its index, or the match is another tag.
+        """
         tab = self._tab()
         bridge = self._ctx.bridge
         try:
@@ -405,6 +434,14 @@ class Element:
         return match
 
     def scroll_into_view(self) -> dict[str, Any]:
+        """Scroll the element into view and refresh the snapshot from the reply.
+
+        Returns:
+            The extension's element payload.
+
+        Raises:
+            StaleElementError: The element (or its tab id) is gone.
+        """
         result = self._ctx.bridge.scroll_into_view(self._element_id, tab_id=self._tab())
         self._update_from_data(result)
         return result
@@ -793,7 +830,17 @@ class Element:
         *,
         human: bool = True,
     ) -> None:
-        """Rest the cursor on the element (offsets: CSS px from the rect's top-left)."""
+        """Rest the cursor on the element and verify it is over it.
+
+        Offsets are CSS px from the rect's top-left; None picks a random
+        point in the middle of the visible part.
+
+        Raises:
+            NativeInputError: Headless browser, element not inside the
+                viewport, or no pointer event reached the page.
+            ClickVerificationError: The cursor could not be verified over it.
+            StaleElementError: The element is gone.
+        """
         with NATIVE_INPUT_LOCK:
             self._point_at(offset_x, offset_y, human=human)
 
@@ -804,6 +851,7 @@ class Element:
         *,
         human: bool = True,
     ) -> None:
+        """Rest the cursor on the element; same as ``hover``."""
         self.hover(offset_x=offset_x, offset_y=offset_y, human=human)
 
     def click(
@@ -813,6 +861,16 @@ class Element:
         offset_x: float | None = None,
         offset_y: float | None = None,
     ) -> None:
+        """Left-click with OS input once the cursor is verified over the element.
+
+        Offsets are as in ``hover``. No button event is sent after a failed step.
+
+        Raises:
+            NativeInputError: Headless browser, element not inside the
+                viewport, or the cursor moved off the verified point.
+            ClickVerificationError: The cursor could not be verified over it.
+            StaleElementError: The element is gone (before any button event).
+        """
         self._click(ClickType.LEFT, human=human, offset_x=offset_x, offset_y=offset_y)
 
     def double_click(
@@ -822,6 +880,7 @@ class Element:
         offset_x: float | None = None,
         offset_y: float | None = None,
     ) -> None:
+        """Double-click; otherwise as ``click``."""
         self._click(ClickType.DOUBLE, human=human, offset_x=offset_x, offset_y=offset_y)
 
     def right_click(
@@ -831,6 +890,7 @@ class Element:
         offset_x: float | None = None,
         offset_y: float | None = None,
     ) -> None:
+        """Right-click; otherwise as ``click``."""
         self._click(ClickType.RIGHT, human=human, offset_x=offset_x, offset_y=offset_y)
 
     def middle_click(
@@ -840,6 +900,7 @@ class Element:
         offset_x: float | None = None,
         offset_y: float | None = None,
     ) -> None:
+        """Middle-click; otherwise as ``click``."""
         self._click(ClickType.MIDDLE, human=human, offset_x=offset_x, offset_y=offset_y)
 
     # -- keyboard ------------------------------------------------------------
@@ -870,6 +931,12 @@ class Element:
         ``settle`` the call then waits (up to ``TYPE_SETTLE_TIMEOUT_S``) until
         the page has received the keystrokes still queued in the OS; a timeout
         only logs a warning.
+
+        Raises:
+            InvalidArgumentError: ``click_type`` is neither ``LEFT`` nor ``DOUBLE``.
+            NativeInputError: The element does not hold or lost keyboard focus
+                (the message says how many characters were typed).
+            ClickVerificationError: The click could not be verified.
         """
         if click_type not in _TYPE_CLICKS:
             raise InvalidArgumentError(
@@ -968,6 +1035,12 @@ class Element:
         stays where it is), Escape is sent, then the button is released. The
         release may then happen over an unverified point, but the drag was
         cancelled first; pages that ignore Escape can still see a drop there.
+
+        Raises:
+            InvalidArgumentError: ``target`` belongs to another browser context.
+            NativeInputError: Different tabs, or source and target are not
+                both inside the viewport.
+            ClickVerificationError: Source or drop point could not be verified.
         """
         if target._ctx is not self._ctx:
             raise InvalidArgumentError(
@@ -1057,26 +1130,52 @@ class Element:
     # -- plain bridge reads ----------------------------------------------------
 
     def focus(self) -> dict[str, Any]:
+        """Focus the element in the page (DOM ``focus()``, no OS input).
+
+        Raises:
+            StaleElementError: The element is gone.
+        """
         return self._ctx.bridge.focus(self._element_id, tab_id=self._tab())
 
     def get_attribute(self, name: str) -> str | None:
+        """Read attribute ``name`` now; None when absent.
+
+        Raises:
+            StaleElementError: The element is gone.
+        """
         return self._ctx.bridge.get_attribute(
             self._element_id, name, tab_id=self._tab()
         )
 
     def get_computed_style(self, prop: str) -> str | None:
+        """Read the computed CSS property ``prop`` now.
+
+        Raises:
+            StaleElementError: The element is gone.
+        """
         return self._ctx.bridge.get_computed_style(
             self._element_id, prop, tab_id=self._tab()
         )
 
     def inner_text(self) -> str:
-        """Full rendered text, read now (``text`` is the 500-char snapshot preview)."""
+        """Read the full rendered text now (``text`` is the 500-char snapshot preview).
+
+        Raises:
+            StaleElementError: The element is gone.
+        """
         return self._ctx.bridge.element_text(self._element_id, tab_id=self._tab())
 
     def __repr__(self) -> str:
+        query = ""
+        if self._query is not None:
+            query = f", selector={self._query.selector!r}"
+            if self._query.kind != "css":
+                query += f", kind={self._query.kind!r}"
+            if self._query.index:
+                query += f", index={self._query.index}"
         return (
             f"Element(id={self._element_id!r}, tab={self._tab_id!r}, "
-            f"tag={self._tag!r}, rect={self._rect!r})"
+            f"tag={self._tag!r}, rect={self._rect!r}{query})"
         )
 
 

@@ -24,7 +24,7 @@ from emunium._bridge.transport import PINNED, Reply
 from emunium._browser import facade, page
 from emunium._browser.facade import Browser
 from emunium._standalone.config import ClickType
-from emunium.element import Element
+from emunium.element import Element, ElementQuery
 from emunium.errors import (
     BridgeProtocolError,
     BridgeTimeoutError,
@@ -181,6 +181,79 @@ def test_launch_error_propagates_before_any_command(
     with pytest.raises(LaunchError):
         make().launch()
     assert transport.calls == []
+
+
+# -- reprs without I/O (dx-api.md section 5) --------------------------------------
+
+
+class NoRequestTransport:
+    """A transport whose every request fails: reprs must use cached state only."""
+
+    actual_port = 51234
+    pinned_tab_id = None
+
+    def request(self, *args: Any, **kwargs: Any) -> Reply:
+        raise AssertionError(f"repr sent a request: {args!r}")
+
+
+def test_reprs_send_no_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = NoRequestTransport()
+    monkeypatch.setattr(facade, "Bridge", lambda port=0: Bridge(transport=transport))
+    browser = Browser()
+
+    assert repr(browser) == "Browser(headless=False, launched=False, port=51234)"
+    assert repr(Browser(True)) == "Browser(headless=True, launched=False, port=51234)"
+    assert repr(browser.expect_response("**/api/*")) == (
+        "ResponseExpectation('**/api/*', timeout=10.0)"
+    )
+    assert repr(browser.expect_response("*/x", 2.5, any_tab=True)) == (
+        "ResponseExpectation('*/x', timeout=2.5, any_tab=True)"
+    )
+    assert repr(browser.expect_navigation("*/next", timeout=5.0)) == (
+        "NavigationExpectation(url='*/next', timeout=5.0, wait_until='load')"
+    )
+
+
+def test_browser_repr_follows_launch_and_close(
+    make: Callable[..., Browser],
+    transport: FakeTransport,
+    events: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_launch(session: Any, bridge_timeout: float = 60.0) -> None:
+        # pid None: no foreground-window handling for this stand-in process.
+        session.process = SimpleNamespace(pid=None)
+
+    def fake_close(session: Any) -> None:
+        session.process = None
+
+    monkeypatch.setattr(facade, "launch", fake_launch)
+    monkeypatch.setattr(facade, "close", fake_close)
+    browser = make().launch()
+    sent = len(transport.calls)
+
+    assert repr(browser) == "Browser(headless=False, launched=True, port=40000)"
+    browser.close()
+    assert repr(browser) == "Browser(headless=False, launched=False, port=40000)"
+    assert len(transport.calls) == sent
+
+
+def test_element_repr_adds_its_query(make: Callable[..., Browser]) -> None:
+    ctx = make().context
+    rect = {"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0}
+    plain = Element(ctx, "doc1.1", "button", rect=rect, tab_id=3)
+    css = Element(ctx, "doc1.2", "a", selector="#go", tab_id=3)
+    xpath = Element(ctx, "doc1.3", "a", query=ElementQuery("//a", 2, "xpath"))
+
+    assert repr(plain) == (
+        "Element(id='doc1.1', tab=3, tag='button', "
+        "rect={'x': 1.0, 'y': 2.0, 'width': 3.0, 'height': 4.0})"
+    )
+    assert repr(css) == "Element(id='doc1.2', tab=3, tag='a', rect={}, selector='#go')"
+    assert repr(xpath) == (
+        "Element(id='doc1.3', tab=None, tag='a', rect={}, "
+        "selector='//a', kind='xpath', index=2)"
+    )
 
 
 # -- navigation ----------------------------------------------------------------

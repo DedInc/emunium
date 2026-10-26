@@ -28,7 +28,11 @@ def _property_of(cls: type, name: str) -> property | None:
 
 
 class Record(dict[str, Any]):
-    """A ``dict`` whose keys can also be read as snake_case attributes."""
+    """A ``dict`` whose keys can also be read as snake_case attributes.
+
+    Typed properties raise ``AttributeError`` (not ``KeyError``) when their
+    key is absent from the reply.
+    """
 
     # No instance __dict__: an attribute assignment cannot silently shadow a key.
     __slots__ = ()
@@ -76,10 +80,12 @@ class PageInfo(Record):
 
     @property
     def url(self) -> str:
+        """The page URL (``url``)."""
         return self._require("url", "url")
 
     @property
     def title(self) -> str:
+        """The page title (``title``)."""
         return self._require("title", "title")
 
     @property
@@ -89,18 +95,22 @@ class PageInfo(Record):
 
     @property
     def scroll_x(self) -> float:
+        """Horizontal scroll offset in CSS px (``scrollX``)."""
         return self._require("scrollX", "scroll_x")
 
     @property
     def scroll_y(self) -> float:
+        """Vertical scroll offset in CSS px (``scrollY``)."""
         return self._require("scrollY", "scroll_y")
 
     @property
     def scroll_width(self) -> float:
+        """Document scroll width in CSS px (``scrollWidth``)."""
         return self._require("scrollWidth", "scroll_width")
 
     @property
     def scroll_height(self) -> float:
+        """Document scroll height in CSS px (``scrollHeight``)."""
         return self._require("scrollHeight", "scroll_height")
 
 
@@ -111,22 +121,27 @@ class TabInfo(Record):
 
     @property
     def tab_id(self) -> int:
+        """Chrome tab id (``tabId``)."""
         return self._require("tabId", "tab_id")
 
     @property
     def url(self) -> str:
+        """The page URL (``url``)."""
         return self._require("url", "url")
 
     @property
     def title(self) -> str:
+        """The page title (``title``)."""
         return self._require("title", "title")
 
     @property
     def active(self) -> bool:
+        """True for the active tab of its window."""
         return self._require("active", "active")
 
     @property
     def window_id(self) -> int:
+        """Chrome window id (``windowId``)."""
         return self._require("windowId", "window_id")
 
     @property
@@ -142,6 +157,7 @@ class NetworkResponse(Record):
 
     @property
     def url(self) -> str:
+        """The request URL (``url``)."""
         return self._require("url", "url")
 
     @property
@@ -151,6 +167,7 @@ class NetworkResponse(Record):
 
     @property
     def method(self) -> str:
+        """HTTP method (``GET``, ``POST``, ...)."""
         return self._require("method", "method")
 
     @property
@@ -160,10 +177,12 @@ class NetworkResponse(Record):
 
     @property
     def tab_id(self) -> int:
+        """Chrome tab id (``tabId``)."""
         return self._require("tabId", "tab_id")
 
     @property
     def request_id(self) -> str | None:
+        """``webRequest`` request id (``requestId``)."""
         return self._require("requestId", "request_id")
 
     @property
@@ -195,8 +214,10 @@ class Point(Record):
 
     @property
     def x(self) -> int:
+        """Horizontal screen coordinate in INPUT units."""
         return self._require("x", "x")
 
     @property
     def y(self) -> int:
+        """Vertical screen coordinate in INPUT units."""
         return self._require("y", "y")

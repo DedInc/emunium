@@ -16,6 +16,8 @@ def _count(name: str, n: object) -> int:
 
 
 class WaitStrategy(str, Enum):
+    """The element state ``Browser.wait`` waits for before its conditions."""
+
     PRESENCE = "presence"
     VISIBLE = "visible"
     CLICKABLE = "clickable"
@@ -24,71 +26,103 @@ class WaitStrategy(str, Enum):
 
 
 class Wait:
+    """Fluent builder of the conditions a wait checks in the page.
+
+    Each method appends a condition and returns this builder; chained
+    conditions are ANDed. The extension checks them on the first element the
+    selector matches; ``|``, ``&`` and ``~`` build new groups.
+    """
+
     def __init__(self) -> None:
         self._conditions: list[dict] = []
 
     def visible(self) -> Wait:
+        """Require the element to be rendered: not ``display: none``, not
+        ``visibility: hidden``, opacity above 0, with a non-zero box."""
         self._conditions.append({"type": "visible"})
         return self
 
     def clickable(self) -> Wait:
+        """Require the element to be visible, enabled and to accept pointer events."""
         self._conditions.append({"type": "clickable"})
         return self
 
     def stable(self, duration_ms: int = 300) -> Wait:
+        """Require the bounding rect to stay unchanged for ``duration_ms``."""
         self._conditions.append({"type": "stable", "duration": duration_ms})
         return self
 
     def unobscured(self) -> Wait:
+        """Require that no other element covers the element's center point."""
         self._conditions.append({"type": "unobscured"})
         return self
 
     def hidden(self) -> Wait:
+        """Require the element to be absent or not visible."""
         self._conditions.append({"type": "hidden"})
         return self
 
     def detached(self) -> Wait:
+        """Require that no connected element matches."""
         self._conditions.append({"type": "detached"})
         return self
 
     def text_not_empty(self) -> Wait:
+        """Require non-empty element text after trimming."""
         self._conditions.append({"type": "text_not_empty"})
         return self
 
     def text_contains(self, substring: str) -> Wait:
+        """Require the element text to contain ``substring`` (case-sensitive)."""
         self._conditions.append({"type": "text_contains", "value": substring})
         return self
 
     def has_attribute(self, name: str, value: str | None = None) -> Wait:
+        """Require attribute ``name`` (equal to ``value`` when given)."""
         self._conditions.append({"type": "has_attribute", "name": name, "value": value})
         return self
 
     def without_attribute(self, name: str) -> Wait:
+        """Require attribute ``name`` to be absent."""
         self._conditions.append({"type": "without_attribute", "name": name})
         return self
 
     def has_class(self, name: str) -> Wait:
+        """Require CSS class ``name``."""
         self._conditions.append({"type": "has_class", "value": name})
         return self
 
     def has_style(self, prop: str, value: str) -> Wait:
+        """Require the computed style ``prop`` to equal ``value``."""
         self._conditions.append({"type": "has_style", "name": prop, "value": value})
         return self
 
     def count_gt(self, n: int) -> Wait:
+        """Require more than ``n`` matches.
+
+        Raises:
+            InvalidArgumentError: ``n`` is not a non-negative int.
+        """
         self._conditions.append({"type": "count_gt", "value": _count("count_gt", n)})
         return self
 
     def count_eq(self, n: int) -> Wait:
+        """Require exactly ``n`` matches.
+
+        Raises:
+            InvalidArgumentError: ``n`` is not a non-negative int.
+        """
         self._conditions.append({"type": "count_eq", "value": _count("count_eq", n)})
         return self
 
     def custom_js(self, code: str) -> Wait:
+        """Require ``code`` (a function body run in the page with ``el`` bound
+        to the element) to return a truthy value synchronously."""
         self._conditions.append({"type": "custom_js", "code": code})
         return self
 
     def any_of(self, *conditions: Wait) -> Wait:
-        """At least one group of conditions must be satisfied (OR)."""
+        """Require at least one of the ``conditions`` groups to hold (OR)."""
         self._conditions.append(
             {
                 "type": "any_of",
@@ -98,7 +132,7 @@ class Wait:
         return self
 
     def all_of(self, *conditions: Wait) -> Wait:
-        """Every group of conditions must be satisfied (explicit AND)."""
+        """Require every one of the ``conditions`` groups to hold (explicit AND)."""
         self._conditions.append(
             {
                 "type": "all_of",
@@ -108,7 +142,7 @@ class Wait:
         return self
 
     def not_(self, condition: Wait) -> Wait:
-        """Negate a group of conditions."""
+        """Require the ``condition`` group not to hold."""
         self._conditions.append(
             {
                 "type": "not",
@@ -118,7 +152,7 @@ class Wait:
         return self
 
     def to_payload(self) -> list[dict]:
-        """A deep copy: mutating the payload never changes this builder."""
+        """Return the conditions as sent to the extension (a deep copy)."""
         return copy.deepcopy(self._conditions)
 
     # Operators build a new Wait from deep copies of both payloads, so neither

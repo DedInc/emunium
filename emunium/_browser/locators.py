@@ -479,7 +479,11 @@ class ElementLocator:
         return ElementLocator(self._context, query)
 
     def nth(self, index: int) -> ElementLocator:
-        """The ``index``-th (0-based, document order) match."""
+        """Narrow to the ``index``-th (0-based, document order) match.
+
+        Raises:
+            InvalidArgumentError: ``index`` is not a non-negative int.
+        """
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:
             raise InvalidArgumentError(
                 f"nth() expects a non-negative int, got {index!r}"
@@ -488,24 +492,27 @@ class ElementLocator:
 
     @property
     def first(self) -> ElementLocator:
-        """The first match (``nth(0)``)."""
+        """A locator for the first match (``nth(0)``)."""
         return self.nth(0)
 
     @property
     def last(self) -> ElementLocator:
-        """The last match at the time of each call."""
+        """A locator for the last match at the time of each call."""
         return self._refined(("nth", -1))
 
     def filter(
         self, *, has_text: str | None = None, visible: bool | None = None
     ) -> ElementLocator:
-        """Matches whose text contains ``has_text`` (case-insensitive) and/or
-        whose rendered box is (``True``) or is not (``False``) visible.
+        """Keep matches whose text contains ``has_text`` (case-insensitive)
+        and/or whose rendered box is (``True``) or is not (``False``) visible.
 
         On CSS and ``text=`` locators ``has_text`` tests the full rendered
         text (read with ``Element.inner_text`` when the ``Element.text``
         preview is at ``TEXT_CAP``); XPath-based locators test the full
         ``textContent``.
+
+        Raises:
+            InvalidArgumentError: ``has_text`` is not a str or ``visible`` not a bool.
         """
         result = self
         if has_text is not None:
@@ -531,7 +538,7 @@ class ElementLocator:
         return dom.query_selector_all(context, selector)
 
     def all(self) -> list[Element]:
-        """Every element the locator matches now (no wait)."""
+        """Return every element the locator matches now (no wait)."""
         kind, selector, steps = self._query.plan()
         elements = self._query_all(kind, selector)
         for step in steps:
@@ -539,15 +546,15 @@ class ElementLocator:
         return elements
 
     def count(self) -> int:
-        """How many elements match now (no wait)."""
+        """Count the elements that match now (no wait)."""
         return len(self.all())
 
     def exists(self) -> bool:
-        """True when at least one element matches now (no wait)."""
+        """Return True when at least one element matches now (no wait)."""
         return bool(self.all())
 
     def is_visible(self) -> bool:
-        """True when the target is visible now (no wait); False when absent."""
+        """Return True when the target is visible now (no wait); False when absent."""
         kind, selector, steps = self._query.plan()
         if not steps:
             try:
@@ -710,14 +717,27 @@ class ElementLocator:
         return self._until(budget, attempt, seen)
 
     def element(self, *, timeout: float | None = None) -> Element:
-        """Wait for the target to be present (default 10 s) and return it."""
+        """Wait for the target to be present (default 10 s) and return it.
+
+        Raises:
+            WaitTimeoutError: Nothing matched in time; names the locator.
+        """
         return self._resolve("attached", _Budget.start(timeout))
 
     def wait_for(
         self, state: str = "visible", *, timeout: float | None = None
     ) -> Element | None:
-        """Wait for ``visible``/``attached`` (returns the element) or
-        ``hidden``/``detached`` (returns None). Raises ``WaitTimeoutError``."""
+        """Wait for the target to reach ``state``.
+
+        Args:
+            state: ``visible`` or ``attached`` (returns the element),
+                ``hidden`` or ``detached`` (returns None).
+            timeout: Seconds; None means 10 s.
+
+        Raises:
+            InvalidArgumentError: Unknown ``state``.
+            WaitTimeoutError: The state was not reached in time.
+        """
         if state not in _WAIT_STATES:
             raise InvalidArgumentError(
                 f"state must be one of {_WAIT_STATES}, got {state!r}"
@@ -784,7 +804,21 @@ class ElementLocator:
         offset_y: float | None = None,
         timeout: float | None = None,
     ) -> Element:
-        """Wait until clickable, then a verified native click; returns the element."""
+        """Wait until clickable (visible, not ``disabled``), then click with
+        verified native input.
+
+        A ``StaleElementError`` raised before any button event is retried
+        once with a freshly resolved element.
+
+        Returns:
+            The clicked element.
+
+        Raises:
+            InvalidArgumentError: Unsupported ``click_type``.
+            NativeInputError: Headless browser, or the input could not be sent.
+            WaitTimeoutError: Not clickable within ``timeout`` (None: 10 s).
+            ClickVerificationError: The cursor could not be verified over it.
+        """
         if click_type not in _CLICK_TYPES:
             raise InvalidArgumentError(f"unsupported click_type {click_type!r}")
         self._context.require_native_input()
@@ -811,7 +845,7 @@ class ElementLocator:
         offset_y: float | None = None,
         timeout: float | None = None,
     ) -> Element:
-        """``click`` with ``ClickType.DOUBLE``."""
+        """Double-click; otherwise as ``click``."""
         return self.click(
             human=human,
             click_type=ClickType.DOUBLE,
@@ -828,7 +862,7 @@ class ElementLocator:
         offset_y: float | None = None,
         timeout: float | None = None,
     ) -> Element:
-        """``click`` with ``ClickType.RIGHT``."""
+        """Right-click; otherwise as ``click``."""
         return self.click(
             human=human,
             click_type=ClickType.RIGHT,
@@ -838,7 +872,14 @@ class ElementLocator:
         )
 
     def hover(self, *, human: bool = True, timeout: float | None = None) -> Element:
-        """Wait until visible, then rest the cursor on the element."""
+        """Wait until visible, then rest the cursor on the element.
+
+        Retried once on a stale element, like ``click``.
+
+        Raises:
+            NativeInputError: Headless browser, or the input could not be sent.
+            WaitTimeoutError: Not visible within ``timeout`` (None: 10 s).
+        """
         self._context.require_native_input()
         element, _ = self._act(
             "hover",
@@ -857,7 +898,14 @@ class ElementLocator:
         human: bool = True,
         timeout: float | None = None,
     ) -> Element:
-        """Wait until visible, then click and type (``Element.type``); never retried."""
+        """Wait until visible, then click and type (``Element.type``).
+
+        Never retried: keys may already have been sent.
+
+        Raises:
+            NativeInputError: Headless browser, or focus was not held.
+            WaitTimeoutError: Not visible within ``timeout`` (None: 10 s).
+        """
         self._context.require_native_input()
         element, _ = self._act(
             "type",
@@ -880,8 +928,14 @@ class ElementLocator:
         timeout: float | None = None,
     ) -> None:
         """Drag this element onto ``target`` (a locator, an element or a
-        selector as in ``Browser.locator``); never retried. Both waits share
-        one ``timeout``."""
+        selector as in ``Browser.locator``).
+
+        Both waits (visible) share one ``timeout``; never retried.
+
+        Raises:
+            NativeInputError: Headless browser, or the drag could not be done.
+            WaitTimeoutError: Source or target not visible in time.
+        """
         self._context.require_native_input()
         budget = _Budget.start(timeout)
         if isinstance(target, str):
@@ -896,7 +950,11 @@ class ElementLocator:
         )
 
     def scroll_into_view(self, *, timeout: float | None = None) -> Element:
-        """Wait for presence, then scroll the element into view."""
+        """Wait for presence, then scroll the element into view and return it.
+
+        Raises:
+            WaitTimeoutError: Nothing matched within ``timeout`` (None: 10 s).
+        """
         element, _ = self._act(
             "scroll_into_view",
             "attached",
@@ -908,12 +966,29 @@ class ElementLocator:
     # -- reads --------------------------------------------------------------
 
     def text(self, *, timeout: float | None = None) -> str:
-        """The rendered text of the target, once present (capped at ``TEXT_CAP``
-        characters by the extension)."""
-        return self._resolve("attached", _Budget.start(timeout)).text
+        """Wait for the target to be present and return its full rendered text.
+
+        The ``Element.text`` preview when it is shorter than ``TEXT_CAP``,
+        else the whole text read with ``Element.inner_text`` (``full_text``,
+        at most ``FULL_TEXT_CAP`` chars). A stale element is re-resolved and
+        read once more.
+
+        Args:
+            timeout: Seconds to wait for presence; None means 10 s.
+
+        Raises:
+            WaitTimeoutError: No element matched within ``timeout``.
+            StaleElementError: The element went stale again on the retry.
+        """
+        _, value = self._act("read", "attached", _Budget.start(timeout), full_text)
+        return value
 
     def get_attribute(self, name: str, *, timeout: float | None = None) -> str | None:
-        """Attribute ``name`` of the target, once present (None when absent)."""
+        """Wait for presence and read attribute ``name`` (None when absent).
+
+        Raises:
+            WaitTimeoutError: Nothing matched within ``timeout`` (None: 10 s).
+        """
         _, value = self._act(
             "read",
             "attached",

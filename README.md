@@ -28,6 +28,7 @@ matching and OCR.
 ## Table of Contents
 
 - [Installation](#installation)
+- [Quick start](#quick-start)
 - [Browser mode](#browser-mode)
 - [Navigation](#navigation)
 - [Waiting](#waiting)
@@ -87,6 +88,55 @@ pip install "emunium[standalone,parsing]"
 
 Chrome for Testing is downloaded on first launch (see [ensure_chrome](#ensure_chrome))
 unless you point emunium at a binary.
+
+---
+
+## Quick start
+
+```python
+from emunium import Browser, expect
+
+with Browser() as browser:
+    info = browser.goto("https://example.com/")
+    print(info.url, info.tab_id)  # a result record: the reply dict, plus attributes
+
+    heading = browser.locator("h1")  # a live locator: queried again on every call
+    expect(heading).to_have_text("Example Domain")
+    print(heading.text())
+
+    with browser.expect_navigation("*iana.org*") as nav:
+        browser.locator("a").first.click()  # a real, verified mouse click
+    print(nav.value.title, nav.value.ready_state)
+```
+
+A typical application flow: locators find elements by role, label,
+placeholder or test id; actions wait for the element first; `expect` retries
+until the assertion holds; URL and network waits return records.
+
+```python
+from emunium import Browser, expect
+
+with Browser() as browser:
+    browser.goto("https://app.example/login")
+    browser.get_by_label("Email").type("me@example.com")
+    browser.get_by_placeholder("Password").type("secret")
+
+    with browser.expect_response("*/api/session") as login:
+        browser.get_by_role("button", name="Sign in").click()
+    print(login.value.status, login.value.ok)  # NetworkResponse
+
+    browser.wait_for_url("*/dashboard")  # a glob, a re.Pattern or a callable
+    expect(browser.get_by_test_id("unread")).to_contain_text("new")
+    expect(browser.locator("#spinner")).to_be_hidden()
+
+    for tab in browser.tabs():  # TabInfo records
+        print(tab.tab_id, tab.title, tab.active)
+```
+
+`print(browser)` shows `Browser(headless=False, launched=True, port=51234)`
+without talking to the page. The selector-based API below (`browser.click`,
+`browser.wait` with `Wait`, `query_selector`, ...) works as before; see
+[Locators](#locators) for the full locator and assertion reference.
 
 ---
 
@@ -489,7 +539,7 @@ rows.element(timeout=10)               # waits for presence, returns an Element
 rows.all()                             # list[Element], no wait
 rows.count(), rows.exists(), rows.is_visible()   # no wait
 rows.wait_for("visible")               # also "attached", "hidden", "detached"
-rows.first.text()                      # waits for presence
+rows.first.text()                      # waits for presence; the full text
 rows.first.get_attribute("data-id")
 ```
 
@@ -564,6 +614,11 @@ expect(browser).to_have_title("Checkout")          # or a re.Pattern; ignore_cas
   `Element.inner_text()`. Only a text longer than 1 048 576 characters, which
   the extension cuts, is known just up to the cut; a result that depends on
   the rest never passes, and the failure message says the text was truncated.
+- A failure message shows at most the first 200 characters of the actual
+  text, as `'<first 200 chars>...' (N chars)`; the exception keeps the whole
+  value in `err.actual` and the
+  asserted value in `err.expected` (a `(name, value)` pair for
+  `to_have_attribute`).
 - `emunium.expect` is the function. To import the module itself (for
   `LocatorAssertions`, `PageAssertions`), use
   `importlib.import_module("emunium.expect")` or

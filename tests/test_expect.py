@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import pickle
 import re
 from collections.abc import Callable
 from typing import Any
@@ -125,6 +126,13 @@ def fails(check: Callable[[], None]) -> ExpectationError:
     with pytest.raises(ExpectationError) as info:
         check()
     return info.value
+
+
+def carried(error: ExpectationError) -> tuple[Any, Any]:
+    """``(error.expected, error.actual)``, read from the instance dict: they are
+    set per instance, ``ExpectationError`` does not declare them."""
+    state = vars(error)
+    return state["expected"], state["actual"]
 
 
 # -- dispatch and arguments ------------------------------------------------------------
@@ -377,9 +385,49 @@ def test_long_text_assertions_fail_on_a_missing_needle_without_a_note(
 
     error = fails(lambda: polled.to_contain_text("absent"))
 
-    assert "last actual" in str(error) and "tail end" in str(error)
+    # The message shows the first 200 chars; the whole text is on ``actual``.
+    shown = repr(FULL[:200] + "...") + f" ({len(FULL)} chars)"
+    assert str(error).endswith(f"last actual {shown}")
+    assert "tail end" not in str(error)
+    assert carried(error) == ("absent", FULL)
     assert TRUNCATED_NOTE not in str(error)
     assert clock[0] == pytest.approx(51.0)
+
+
+def test_failure_message_shows_at_most_200_chars_of_the_actual_text(
+    ctx: BrowserContext, transport: FakeTransport, clock: list[float]
+) -> None:
+    at_limit, over = "a" * 199 + "Z", "b" * 200 + "Q"
+    paragraphs = expect(locator(ctx, "p").filter(visible=True), timeout=0)
+
+    transport.handlers["querySelectorAll"] = [element(at_limit)]
+    whole = fails(lambda: paragraphs.to_have_text("other"))
+    transport.handlers["querySelectorAll"] = [element(over)]
+    cut = fails(lambda: paragraphs.to_have_text("other"))
+
+    assert str(whole).endswith(f"last actual {at_limit!r}")
+    assert str(cut).endswith(f"last actual {'b' * 200 + '...'!r} (201 chars)")
+    assert "Q" not in str(cut)
+    assert carried(whole) == ("other", at_limit)
+    assert carried(cut) == ("other", over)
+
+
+def test_expectation_error_carries_expected_and_actual_through_pickling(
+    ctx: BrowserContext, transport: FakeTransport, browser: Browser, clock: list[float]
+) -> None:
+    transport.handlers["querySelectorAll"] = [element(id="a")]
+    target = expect(locator(ctx, "p").filter(visible=True), timeout=0)
+
+    count = fails(lambda: target.to_have_count(2))
+    attribute = fails(lambda: target.to_have_attribute("id", "b"))
+    title = fails(lambda: expect(browser, timeout=0).not_.to_have_title("List"))
+
+    assert carried(count) == (2, 1)
+    assert carried(attribute) == (("id", "b"), "a")
+    assert carried(title) == ("List", "List")
+    restored = pickle.loads(pickle.dumps(count))
+    assert carried(restored) == (2, 1)
+    assert str(restored) == str(count)
 
 
 def test_text_cut_at_the_full_text_cap_is_unknown_beyond_the_cut(

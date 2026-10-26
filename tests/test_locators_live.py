@@ -897,3 +897,42 @@ def test_has_text_skips_an_element_that_goes_stale_before_its_full_read(
     found = locator(ctx, "p").filter(has_text="needle").all()
 
     assert [el.element_id for el in found] == ["q"]
+
+
+def test_text_returns_the_full_text_of_a_long_element(
+    ctx: BrowserContext, transport: FakeTransport
+) -> None:
+    long_text = "head " + "x" * TEXT_CAP + " tail"
+    transport.handlers["waitForSelector"] = element("doc1.1", long_text[:TEXT_CAP])
+    transport.handlers["elementText"] = {
+        "text": long_text,
+        "length": len(long_text),
+        "truncated": False,
+    }
+
+    assert locator(ctx, "#p").text() == long_text
+    assert transport.sent("elementText") == [{"elementId": "doc1.1"}]
+
+
+def test_text_below_the_preview_cap_sends_no_full_read(
+    ctx: BrowserContext, transport: FakeTransport
+) -> None:
+    transport.handlers["waitForSelector"] = element("doc1.1", "x" * (TEXT_CAP - 1))
+
+    assert locator(ctx, "#p").text() == "x" * (TEXT_CAP - 1)
+    assert transport.sent("elementText") == []
+
+
+def test_text_re_resolves_once_when_the_full_read_is_stale(
+    ctx: BrowserContext, transport: FakeTransport
+) -> None:
+    long_text = "y" * (TEXT_CAP + 20)
+    transport.handlers["waitForSelector"] = element("doc1.1", long_text[:TEXT_CAP])
+    transport.handlers["elementText"] = Steps(
+        StaleElementError("gone", method="elementText"),
+        {"text": long_text, "length": len(long_text), "truncated": False},
+    )
+
+    assert locator(ctx, "#p").text() == long_text
+    assert len(transport.sent("waitForSelector")) == 2
+    assert len(transport.sent("elementText")) == 2

@@ -64,6 +64,8 @@ Changelog = "https://github.com/DedInc/emunium/blob/main/CHANGELOG.md"
 [tool.hatch.build.targets.wheel]
 packages = ["emunium"]
 include = ["LICENSE"]
+# PEP 561 marker; listed so it ships even if a VCS ignore rule ever matched it.
+artifacts = ["emunium/py.typed"]
 # Internal persistent-extension builder; not part of this release's API.
 exclude = ["emunium/_attach", "emunium/__main__.py"]
 
@@ -78,5 +80,6 @@ only-include = [
     "LICENSE",
     "pyproject.toml",
 ]
+artifacts = ["emunium/py.typed"]
 # tests/test_build.py imports emunium._attach, which the sdist does not ship.
 exclude = ["emunium/_attach", "emunium/__main__.py", "tests/test_build.py"]

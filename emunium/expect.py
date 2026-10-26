@@ -54,6 +54,9 @@ __all__ = ["LocatorAssertions", "PageAssertions", "expect"]
 
 DEFAULT_TIMEOUT = 5.0
 POLL_S = 0.1
+# A failure message shows at most this many chars of an actual text; the whole
+# value stays on ``ExpectationError.actual``.
+ACTUAL_SHOWN = 200
 TRUNCATED_NOTE = (
     f"the text was truncated at {FULL_TEXT_CAP} chars and cannot be fully compared"
 )
@@ -112,6 +115,14 @@ def _options(**flags: bool) -> str:
     return "".join(f", {name}=True" for name, value in flags.items() if value)
 
 
+def _shown(actual: Any) -> str:
+    """``repr(actual)``; a longer text keeps its first ``ACTUAL_SHOWN`` chars
+    and says how long it was: ``'abc...' (2031 chars)``."""
+    if isinstance(actual, str) and len(actual) > ACTUAL_SHOWN:
+        return f"{actual[:ACTUAL_SHOWN] + '...'!r} ({len(actual)} chars)"
+    return repr(actual)
+
+
 class _Assertions:
     """Retry loop shared by locator and page assertions."""
 
@@ -124,18 +135,25 @@ class _Assertions:
         return reading.holds is not None and reading.holds != self._negated
 
     def _fail(
-        self, name: str, args: str, expected: str, reading: Reading
+        self, name: str, args: str, expected: str, value: Any, reading: Reading
     ) -> ExpectationError:
+        """The error for a failed assertion; ``.actual`` keeps the whole last
+        reading (the message shows at most ``ACTUAL_SHOWN`` chars of a text),
+        ``.expected`` the asserted ``value``."""
         negation = ".not_" if self._negated else ""
         expected_text = f"not {expected}" if self._negated else expected
         message = (
             f"expect({self._target!r}){negation}.{name}({args}) failed after "
             f"{self._timeout}s: expected {expected_text}, "
-            f"last actual {reading.actual!r}"
+            f"last actual {_shown(reading.actual)}"
         )
         if reading.note:
             message += f"; {reading.note}"
-        return ExpectationError(message, method=f"expect.{name}")
+        error = ExpectationError(message, method=f"expect.{name}")
+        # Instance attributes (ExpectationError does not declare them); the
+        # error's __reduce__ carries __dict__, so pickling keeps both.
+        vars(error).update(actual=reading.actual, expected=value)
+        return error
 
     @staticmethod
     def _read(read: Callable[[], Reading]) -> tuple[Reading, EmuniumError | None]:
@@ -150,10 +168,14 @@ class _Assertions:
         name: str,
         args: str,
         expected: str,
+        value: Any,
         read: Callable[[], Reading],
         wait: Callable[[float], bool] | None = None,
     ) -> None:
         """Hold within one deadline, or raise ``ExpectationError``.
+
+        ``expected`` describes the expectation in the message; ``value`` is
+        the asserted value the error carries as ``.expected``.
 
         ``wait(time_left)`` is an extension wait for the (negation-aware)
         condition: True when it held, False when it cannot be used (then the
@@ -171,7 +193,7 @@ class _Assertions:
                 reading, error = self._read(read)
                 if self._satisfied(reading):
                     return
-                raise self._fail(name, args, expected, reading) from (
+                raise self._fail(name, args, expected, value, reading) from (
                     error or last_error or exc
                 )
             except RETRYABLE as exc:
@@ -179,7 +201,9 @@ class _Assertions:
                 last_error = exc
                 if remaining <= 0:
                     reading, error = self._read(read)
-                    raise self._fail(name, args, expected, reading) from (error or exc)
+                    raise self._fail(name, args, expected, value, reading) from (
+                        error or exc
+                    )
                 _sleep(min(POLL_S, remaining))
         while True:
             reading, error = self._read(read)
@@ -189,12 +213,18 @@ class _Assertions:
                 return
             remaining = deadline - _monotonic()
             if remaining <= 0:
-                raise self._fail(name, args, expected, reading) from last_error
+                raise self._fail(name, args, expected, value, reading) from last_error
             _sleep(min(POLL_S, remaining))
 
 
 class LocatorAssertions(_Assertions):
-    """Assertions on an ``ElementLocator``; build with ``expect(locator)``."""
+    """Assertions on an ``ElementLocator``; build with ``expect(locator)``.
+
+    An assertion returns None once it holds. Otherwise, after the timeout, it
+    raises ``ExpectationError`` (an ``AssertionError``) naming the locator,
+    the expectation and the last actual value (texts cut to ``ACTUAL_SHOWN``
+    chars); ``.expected`` and ``.actual`` carry both values, ``.actual`` whole.
+    """
 
     _target: ElementLocator
 
@@ -236,7 +266,12 @@ class LocatorAssertions(_Assertions):
         return found[0] if found else None
 
     def to_be_visible(self) -> None:
-        """The target exists and is visible."""
+        """Assert that the target exists and is visible.
+
+        Raises:
+            ExpectationError: It did not hold within the timeout
+                (``.expected`` is ``"visible"``).
+        """
 
         def read() -> Reading:
             visible = self._target.is_visible()
@@ -247,12 +282,18 @@ class LocatorAssertions(_Assertions):
             "to_be_visible",
             "",
             "visible",
+            "visible",
             read,
             self._server(state="visible", negative=hidden),
         )
 
     def to_be_hidden(self) -> None:
-        """The target is absent or not visible."""
+        """Assert that the target is absent or not visible.
+
+        Raises:
+            ExpectationError: It did not hold within the timeout
+                (``.expected`` is ``"hidden"``).
+        """
 
         def read() -> Reading:
             visible = self._target.is_visible()
@@ -263,12 +304,18 @@ class LocatorAssertions(_Assertions):
             "to_be_hidden",
             "",
             "hidden",
+            "hidden",
             read,
             self._server(positive=hidden, negative_state="visible"),
         )
 
     def to_be_attached(self) -> None:
-        """The target is in the document."""
+        """Assert that the target is in the document.
+
+        Raises:
+            ExpectationError: It did not hold within the timeout
+                (``.expected`` is ``"attached"``, ``.actual`` the match count text).
+        """
 
         def read() -> Reading:
             count = self._target.count()
@@ -276,11 +323,21 @@ class LocatorAssertions(_Assertions):
 
         detached = Wait().detached().to_payload()
         self._check(
-            "to_be_attached", "", "attached", read, self._server(negative=detached)
+            "to_be_attached",
+            "",
+            "attached",
+            "attached",
+            read,
+            self._server(negative=detached),
         )
 
     def to_be_detached(self) -> None:
-        """The target is not in the document."""
+        """Assert that the target is not in the document.
+
+        Raises:
+            ExpectationError: It did not hold within the timeout
+                (``.expected`` is ``"detached"``).
+        """
 
         def read() -> Reading:
             count = self._target.count()
@@ -288,11 +345,22 @@ class LocatorAssertions(_Assertions):
 
         detached = Wait().detached().to_payload()
         self._check(
-            "to_be_detached", "", "detached", read, self._server(positive=detached)
+            "to_be_detached",
+            "",
+            "detached",
+            "detached",
+            read,
+            self._server(positive=detached),
         )
 
     def to_have_count(self, count: int) -> None:
-        """Exactly ``count`` elements match."""
+        """Assert that exactly ``count`` elements match.
+
+        Raises:
+            InvalidArgumentError: ``count`` is not a non-negative int.
+            ExpectationError: It did not hold within the timeout
+                (``.expected`` is ``count``, ``.actual`` the last count).
+        """
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise InvalidArgumentError(
                 f"to_have_count() expects a non-negative int, got {count!r}"
@@ -307,6 +375,7 @@ class LocatorAssertions(_Assertions):
             "to_have_count",
             repr(count),
             f"count {count}",
+            count,
             read,
             self._server(positive=equal.to_payload(), negative=(~equal).to_payload()),
         )
@@ -314,14 +383,20 @@ class LocatorAssertions(_Assertions):
     def to_have_text(
         self, text: TextOrPattern, *, exact: bool = False, ignore_case: bool = False
     ) -> None:
-        """The target's whole text equals ``text``, or the pattern is found in
-        it (``search``). Case-sensitive unless ``ignore_case``.
+        """Assert that the target's whole text equals ``text`` (or that the
+        pattern is found in it with ``search``).
 
-        ``exact=False`` collapses whitespace on both sides first;
-        ``exact=True`` compares the text as it is, which is brittle: the
-        rendered text's whitespace depends on layout. Long texts compare in
-        full; only a text cut at ``FULL_TEXT_CAP`` characters never passes,
-        plain or negated.
+        Case-sensitive unless ``ignore_case``. ``exact=False`` collapses
+        whitespace on both sides first; ``exact=True`` compares the text as it
+        is, which is brittle: the rendered text's whitespace depends on
+        layout. Long texts compare in full; only a text cut at
+        ``FULL_TEXT_CAP`` characters never passes, plain or negated.
+
+        Raises:
+            InvalidArgumentError: ``text`` is neither a str nor a str pattern.
+            ExpectationError: It did not hold within the timeout; ``.expected``
+                is ``text``, ``.actual`` the whole last text (the message
+                shows at most ``ACTUAL_SHOWN`` chars of it).
         """
         expected = _text_or_pattern(text, "text")
 
@@ -338,16 +413,21 @@ class LocatorAssertions(_Assertions):
             return Reading(holds, actual)
 
         args = repr(expected) + _options(exact=exact, ignore_case=ignore_case)
-        self._check("to_have_text", args, f"text {expected!r}", read)
+        self._check("to_have_text", args, f"text {expected!r}", expected, read)
 
     def to_contain_text(self, text: str, *, ignore_case: bool = False) -> None:
-        """The target's text contains ``text``; case-sensitive unless
-        ``ignore_case`` (which polls instead of waiting in the page).
+        """Assert that the target's text contains ``text``.
 
-        Long texts are searched in full. Only on a text cut at
+        Case-sensitive unless ``ignore_case`` (which polls instead of waiting
+        in the page). Long texts are searched in full. Only on a text cut at
         ``FULL_TEXT_CAP`` characters is just the kept prefix known: found
         there it holds, otherwise the result is unknown and the assertion
         (plain or negated) does not pass.
+
+        Raises:
+            InvalidArgumentError: ``text`` is not a str.
+            ExpectationError: It did not hold within the timeout; ``.expected``
+                is ``text``, ``.actual`` the whole last text.
         """
         if not isinstance(text, str):
             raise InvalidArgumentError(f"text must be a str, got {text!r}")
@@ -373,11 +453,20 @@ class LocatorAssertions(_Assertions):
                 positive=contains.to_payload(), negative=(~contains).to_payload()
             )
         args = repr(text) + _options(ignore_case=ignore_case)
-        self._check("to_contain_text", args, f"text containing {text!r}", read, wait)
+        description = f"text containing {text!r}"
+        self._check("to_contain_text", args, description, text, read, wait)
 
     def to_have_attribute(self, name: str, value: TextOrPattern | None = None) -> None:
-        """The target has attribute ``name`` (equal to ``value`` or matching
-        the pattern, when given)."""
+        """Assert that the target has attribute ``name`` (equal to ``value``,
+        or matching it with ``search`` when it is a pattern, when given).
+
+        Raises:
+            InvalidArgumentError: ``name`` is empty or ``value`` is neither a
+                str nor a str pattern.
+            ExpectationError: It did not hold within the timeout; ``.expected``
+                is ``(name, value)``, ``.actual`` the last attribute value
+                (None when absent).
+        """
         if not isinstance(name, str) or not name:
             raise InvalidArgumentError(f"name must be a non-empty str, got {name!r}")
         expected = None if value is None else _text_or_pattern(value, "value")
@@ -403,11 +492,16 @@ class LocatorAssertions(_Assertions):
         if not isinstance(expected, re.Pattern):
             has = Wait().has_attribute(name, expected)
             wait = self._server(positive=has.to_payload(), negative=(~has).to_payload())
-        self._check("to_have_attribute", args, description, read, wait)
+        self._check(
+            "to_have_attribute", args, description, (name, expected), read, wait
+        )
 
 
 class PageAssertions(_Assertions):
-    """Assertions on the pinned tab of a ``Browser``; build with ``expect(browser)``."""
+    """Assertions on the pinned tab of a ``Browser``; build with ``expect(browser)``.
+
+    Failures raise ``ExpectationError`` as in ``LocatorAssertions``.
+    """
 
     _target: Browser
 
@@ -422,8 +516,17 @@ class PageAssertions(_Assertions):
         return PageAssertions(self._target, self._timeout, not self._negated)
 
     def to_have_url(self, url: UrlMatcher) -> None:
-        """The URL matches a glob (``*`` wildcard, whole URL), a ``re.Pattern``
-        (``search``) or a ``Callable[[str], bool]``."""
+        """Assert that the pinned tab's URL matches ``url``.
+
+        Args:
+            url: A glob (``*`` wildcard, whole URL), a ``re.Pattern``
+                (``search``) or a ``Callable[[str], bool]``.
+
+        Raises:
+            InvalidArgumentError: ``url`` is none of those.
+            ExpectationError: It did not hold within the timeout; ``.expected``
+                is ``url``, ``.actual`` the last URL.
+        """
         matches = url_matcher(url)
 
         def read() -> Reading:
@@ -432,11 +535,18 @@ class PageAssertions(_Assertions):
 
         expected = getattr(url, "__qualname__", None) if callable(url) else None
         description = f"URL matching {expected or url!r}"
-        self._check("to_have_url", repr(url), description, read)
+        self._check("to_have_url", repr(url), description, url, read)
 
     def to_have_title(self, title: TextOrPattern, *, ignore_case: bool = False) -> None:
-        """The title equals ``title`` after collapsing whitespace, or the
-        pattern is found in it; case-sensitive unless ``ignore_case``."""
+        """Assert that the title equals ``title`` after collapsing whitespace
+        (or that the pattern is found in it); case-sensitive unless
+        ``ignore_case``.
+
+        Raises:
+            InvalidArgumentError: ``title`` is neither a str nor a str pattern.
+            ExpectationError: It did not hold within the timeout; ``.expected``
+                is ``title``, ``.actual`` the last title.
+        """
         expected = _text_or_pattern(title, "title")
 
         def read() -> Reading:
@@ -445,7 +555,7 @@ class PageAssertions(_Assertions):
             return Reading(holds, current)
 
         args = repr(expected) + _options(ignore_case=ignore_case)
-        self._check("to_have_title", args, f"title {expected!r}", read)
+        self._check("to_have_title", args, f"title {expected!r}", expected, read)
 
 
 @overload
@@ -461,8 +571,20 @@ def expect(target: Browser, *, timeout: float = DEFAULT_TIMEOUT) -> PageAssertio
 def expect(
     target: ElementLocator | Browser, *, timeout: float = DEFAULT_TIMEOUT
 ) -> LocatorAssertions | PageAssertions:
-    """``LocatorAssertions`` for an ``ElementLocator``, ``PageAssertions`` for a
-    ``Browser``; each assertion retries for up to ``timeout`` seconds."""
+    """Build retrying assertions on a locator or a browser's page.
+
+    Args:
+        target: An ``ElementLocator`` (gives ``LocatorAssertions``) or a
+            ``Browser`` (gives ``PageAssertions``).
+        timeout: Seconds each assertion retries before it fails.
+
+    Returns:
+        The assertions; ``.not_`` negates them.
+
+    Raises:
+        InvalidArgumentError: ``target`` is neither, or ``timeout`` is not a
+            number >= 0.
+    """
     if isinstance(target, ElementLocator):
         return LocatorAssertions(target, timeout)
     if isinstance(target, Browser):

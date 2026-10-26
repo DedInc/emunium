@@ -175,6 +175,23 @@ observe; they are listed first.
   locators read the full text, so needles past character 500 match and
   `to_have_text` / `not_.to_contain_text` decide on long texts. Only a text
   cut at 1 048 576 characters is still known just up to the cut.
+  `ElementLocator.text()` returns the full text too (one retry when the
+  element went stale), and `elementText` is re-sent once after a reconnect
+  like the other reads.
+- `ExpectationError` carries `.expected` (the asserted value) and `.actual`
+  (the whole last value); its message shows at most the first 200 characters
+  of an actual text, followed by its length (`'...' (2031 chars)`).
+- Typing: the package ships `py.typed` (PEP 561), so type checkers use its
+  annotations. Every public method and property of `Browser`, `Element`,
+  `ElementLocator`, `Wait`, `expect`, `Emunium`, `Bridge`,
+  `ResponseExpectation`, `NavigationExpectation` and the result records has a
+  docstring.
+- Reprs that send no request: `Browser(headless=False, launched=True,
+  port=51234)`, `ResponseExpectation('**/api/*', timeout=10.0)`; an
+  `Element` repr names its query selector (and kind and index when not the
+  defaults).
+- README quick start built around `with Browser() as browser:`, locators,
+  `expect`, `expect_navigation` / `wait_for_url` and result records.
 
 ### Changed
 

@@ -88,6 +88,11 @@ class SystemCursor:
 
 
 class Emunium:
+    """Screen automation: template matching, OCR and native mouse/keyboard input.
+
+    Coordinates are INPUT units, as returned by ``find_elements``.
+    """
+
     def __init__(
         self,
         ocr_enabled: bool = False,
@@ -98,10 +103,21 @@ class Emunium:
         motion: MotionPlanner | str | None = None,
         typing: TypingRhythm | str | None = None,
     ) -> None:
-        """``motion``: human pointer planner, a preset name (``natural``,
-        ``careful``, ``brisk``), a ``MotionPlanner`` or None (``natural``);
-        resolved like ``Browser(motion=)``. ``typing``: typing rhythm, a preset
-        name, a ``TypingRhythm`` or None (``natural``), as ``Browser(typing=)``.
+        """Set up input and, when OCR is enabled, the OCR reader.
+
+        Args:
+            ocr_enabled: Load the OCR reader now (alias ``ocr``).
+            use_gpu: Let the OCR reader use the GPU.
+            langs: OCR languages; None means ``["en"]``.
+            ocr: Alias of ``ocr_enabled``.
+            motion: Human pointer planner: a preset name (``natural``,
+                ``careful``, ``brisk``), a ``MotionPlanner`` or None
+                (``natural``); resolved like ``Browser(motion=)``.
+            typing: Typing rhythm: a preset name, a ``TypingRhythm`` or None
+                (``natural``), as ``Browser(typing=)``.
+
+        Raises:
+            ValueError: ``ocr_enabled=True`` together with ``ocr=False``.
         """
         if ocr is not None and ocr_enabled and not ocr:
             raise ValueError("conflicting arguments: ocr_enabled=True and ocr=False")
@@ -139,7 +155,8 @@ class Emunium:
         max_elements: int = StandaloneConfig.DEFAULT_MAX_ELEMENTS,
         region: Region | None = None,
     ) -> list[dict[str, int]]:
-        """Template match centers in INPUT units, best score first.
+        """Find on-screen matches of the image template; return centers in
+        INPUT units, best score first.
 
         ``region`` is ``(left, top, width, height)`` in INPUT units.
         """
@@ -159,7 +176,13 @@ class Emunium:
         max_elements: int = StandaloneConfig.DEFAULT_MAX_ELEMENTS,
         region: Region | None = None,
     ) -> list[dict[str, int]]:
-        """OCR text match centers in INPUT units; ``region`` as in ``find_elements``."""
+        """Find on-screen text with OCR; return match centers in INPUT units.
+
+        ``region`` is as in ``find_elements``.
+
+        Raises:
+            RuntimeError: OCR was not enabled at construction.
+        """
         if not self.ocr or self.ocr_reader is None:
             raise RuntimeError(
                 "OCR disabled. Initialize with Emunium(ocr_enabled=True) (alias: ocr=True)."
@@ -178,6 +201,14 @@ class Emunium:
         target_width: int | None = None,
         raise_on_timeout: bool = True,
     ) -> dict[str, int] | None:
+        """Poll every ``poll_interval`` s for the image; return the best match center.
+
+        Returns:
+            The center, or None on timeout with ``raise_on_timeout=False``.
+
+        Raises:
+            TimeoutError: Not found within ``timeout``.
+        """
         from emunium._standalone import wait as _wait
 
         return _wait.wait_for_image(
@@ -200,6 +231,15 @@ class Emunium:
         region: tuple[int, int, int, int] | None = None,
         raise_on_timeout: bool = True,
     ) -> dict[str, int] | None:
+        """Poll every ``poll_interval`` s for OCR text; return the best match center.
+
+        Returns:
+            The center, or None on timeout with ``raise_on_timeout=False``.
+
+        Raises:
+            TimeoutError: Not found within ``timeout``.
+            RuntimeError: OCR was not enabled at construction.
+        """
         from emunium._standalone import wait as _wait
 
         return _wait.wait_for_text_ocr(
@@ -218,6 +258,10 @@ class Emunium:
         offset_x: float | None = None,
         offset_y: float | None = None,
     ) -> None:
+        """Move the cursor to ``element_center`` plus an offset (INPUT units).
+
+        None offsets are random in ``Config.DEFAULT_OFFSET_RANGE``.
+        """
         ox = (
             offset_x
             if offset_x is not None
@@ -235,7 +279,7 @@ class Emunium:
         element_center: dict[str, int],
         click_type: ClickType = ClickType.LEFT,
     ) -> None:
-        """One move, then the button press(es); a double click is never two moves."""
+        """Move to ``element_center`` once, then press; a double click is never two moves."""
         self.interactor.click(
             element_center["x"], element_center["y"], click_type=click_type
         )
@@ -248,6 +292,7 @@ class Emunium:
         offset: int | None = None,
         click_type: ClickType = ClickType.LEFT,
     ) -> None:
+        """Click ``element_center`` and type ``text`` (see ``type_text``)."""
         # One lock span: no other native input lands between the click and the text.
         with NATIVE_INPUT_LOCK:
             self.click_at(element_center, click_type)
@@ -259,7 +304,7 @@ class Emunium:
         characters_per_minute: int | None = None,
         offset: int | None = None,
     ) -> None:
-        """Layout-independent typing through ``ElementInteractor``.
+        """Type ``text`` independently of the keyboard layout (``ElementInteractor``).
 
         ``characters_per_minute`` and ``offset`` (ms of jitter) override the
         ``typing`` rhythm; None keeps the rhythm's own values.
@@ -288,4 +333,5 @@ class Emunium:
     def drag_and_drop(
         self, start_coords: Sequence[float], end_coords: Sequence[float]
     ) -> None:
+        """Press at ``start_coords`` and release at ``end_coords`` (INPUT units)."""
         self.interactor.drag(start_coords, end_coords)

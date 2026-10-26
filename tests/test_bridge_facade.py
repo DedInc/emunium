@@ -396,6 +396,8 @@ IDEMPOTENCY_CASES = [
     (lambda b: b.create_tab(), "createTab", False),
     (lambda b: b.close_tab(5), "closeTab", False),
     (lambda b: b.send("pageInfo"), "pageInfo", True),
+    # elementText is in IDEMPOTENT_METHODS, so the raw path agrees with element_text.
+    (lambda b: b.send("elementText", {"elementId": "e"}), "elementText", True),
     (lambda b: b.send("navigate", {"url": "u"}), "navigate", False),
 ]
 

@@ -16,6 +16,7 @@ import re
 import shutil
 import struct
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,16 @@ from emunium._attach.build import (
     load_or_create_state,
     state_dir,
 )
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
+ROOT = Path(__file__).resolve().parent.parent
+# Where the release gate puts the wheel and sdist:
+# ``python -m build --outdir .build-check``.
+DIST_DIR = ROOT / ".build-check"
 
 HAVE_CRYPTOGRAPHY = importlib.util.find_spec("cryptography") is not None
 needs_crypto = pytest.mark.skipif(
@@ -388,3 +399,46 @@ def test_cli_reports_missing_cryptography(home, monkeypatch, capsys):
         monkeypatch.setitem(sys.modules, name, None)
     assert main(["extension", "id"]) == 1
     assert "pip install emunium[hub]" in capsys.readouterr().err
+
+
+# --- package distributions (PEP 561 marker, dx-api.md section 5) ------------------
+
+
+def _project() -> dict[str, Any]:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+def _distribution(name: str) -> Path:
+    """``DIST_DIR / name``, skipped when absent or older than its inputs."""
+    path = DIST_DIR / name
+    if not path.is_file():
+        pytest.skip(f"{name} not built; run: python -m build --outdir .build-check")
+    inputs = (ROOT / "pyproject.toml", ROOT / "emunium" / "py.typed")
+    if path.stat().st_mtime < max(p.stat().st_mtime for p in inputs):
+        pytest.skip(f"{name} is stale; run: python -m build --outdir .build-check")
+    return path
+
+
+def test_py_typed_marker_is_declared_for_wheel_and_sdist():
+    marker = ROOT / "emunium" / "py.typed"
+    assert marker.is_file() and marker.stat().st_size == 0
+    targets = _project()["tool"]["hatch"]["build"]["targets"]
+    for target in ("wheel", "sdist"):
+        assert "emunium/py.typed" in targets[target]["artifacts"], target
+
+
+def test_wheel_ships_py_typed():
+    version = _project()["project"]["version"]
+    wheel = _distribution(f"emunium-{version}-py3-none-any.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+        assert names.count("emunium/py.typed") == 1
+        assert archive.getinfo("emunium/py.typed").file_size == 0
+
+
+def test_sdist_ships_py_typed():
+    version = _project()["project"]["version"]
+    sdist = _distribution(f"emunium-{version}.tar.gz")
+    with tarfile.open(sdist, "r:gz") as archive:
+        names = archive.getnames()
+    assert names.count(f"emunium-{version}/emunium/py.typed") == 1

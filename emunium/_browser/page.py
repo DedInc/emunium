@@ -323,6 +323,11 @@ class ResponseExpectation:
 
     @property
     def value(self) -> NetworkResponse:
+        """The matching ``NetworkResponse``; set after a clean exit.
+
+        Raises:
+            RuntimeError: Read inside the block or after it raised.
+        """
         if self._value is None:
             raise RuntimeError(
                 "expect_response(): the response is available after the with "
@@ -361,6 +366,12 @@ class ResponseExpectation:
             )
         self._value = NetworkResponse(entry)
 
+    def __repr__(self) -> str:
+        any_tab = ", any_tab=True" if self._any_tab else ""
+        return (
+            f"ResponseExpectation({self._pattern!r}, timeout={self._timeout}{any_tab})"
+        )
+
 
 class NavigationExpectation:
     """``with`` block that waits, on exit, for the tab to navigate.
@@ -396,7 +407,11 @@ class NavigationExpectation:
 
     @property
     def value(self) -> PageInfo:
-        """The ``PageInfo`` of the page navigated to; set after a clean exit."""
+        """The ``PageInfo`` of the page navigated to; set after a clean exit.
+
+        Raises:
+            RuntimeError: Read inside the block or after it raised.
+        """
         if self._value is None:
             raise RuntimeError(
                 "expect_navigation(): the page is available after the with "
