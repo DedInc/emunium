@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>E2E Index</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; }
+  #mover { position: absolute; left: 0; top: 300px; width: 40px; height: 20px; background: #39c; }
+  #ghost { display: none; }
+</style>
+</head>
+<body>
+<h1 id="heading">Hello e2e</h1>
+<div class="card" id="card"><section><span class="label" id="signin-label">Sign in</span></section></div>
+<ul id="list"><li>alpha</li><li>beta</li><li>gamma</li></ul>
+<p id="doomed">remove me</p>
+<div id="ghost">hidden but attached</div>
+<div id="mover"></div>
+<script>
+  setTimeout(function () {
+    var late = document.createElement("p");
+    late.id = "late";
+    late.textContent = "arrived late";
+    document.body.appendChild(late);
+  }, 400);
+  // Moves #mover every 50 ms for durationMs, then stops and sets moverDone.
+  window.startMover = function (durationMs) {
+    window.moverDone = false;
+    var el = document.getElementById("mover");
+    var started = Date.now();
+    var timer = setInterval(function () {
+      if (Date.now() - started >= durationMs) {
+        clearInterval(timer);
+        window.moverStoppedAt = Date.now();
+        window.moverDone = true;
+        return;
+      }
+      el.style.left = (parseInt(el.style.left || "0", 10) + 7) + "px";
+    }, 50);
+  };
+</script>
+</body>
+</html>

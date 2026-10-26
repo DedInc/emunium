@@ -1,0 +1,9 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>E2E Slow Load</title></head>
+<body>
+<h1 id="heading">Slow subresource</h1>
+<!-- /slow delays its response, so "load" fires well after "domcontentloaded". -->
+<img id="slow-img" src="/slow?ms=1500" alt="">
+</body>
+</html>

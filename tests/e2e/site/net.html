@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>E2E Net</title></head>
+<body>
+<h1 id="heading">Network page</h1>
+<script>
+  // The query string names the caller, e.g. net.html?from=bg -> /api/ping.json?from=bg
+  fetch("/api/ping.json" + location.search).then(function () {
+    document.getElementById("heading").setAttribute("data-fetched", "1");
+  });
+</script>
+</body>
+</html>

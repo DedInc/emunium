@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>E2E Input</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; background: #fafafa; }
+  .box { position: absolute; box-sizing: border-box; }
+  #btn { left: 40px; top: 40px; width: 140px; height: 44px; }
+  #dbl { left: 220px; top: 40px; width: 140px; height: 44px; }
+  #field { left: 40px; top: 110px; width: 320px; height: 32px; }
+  #drag-src { left: 40px; top: 170px; width: 90px; height: 50px; background: #fc6; }
+  #drop-zone { left: 240px; top: 165px; width: 170px; height: 80px; background: #cdf; }
+  #hover-target { left: 450px; top: 40px; width: 130px; height: 44px; background: #ddd; }
+  #hover-target:hover { background: #8c8; }
+  #covered-btn { left: 450px; top: 110px; width: 130px; height: 44px; }
+  #overlay { left: 440px; top: 100px; width: 150px; height: 64px; z-index: 10; background: rgba(200, 60, 60, 0.9); }
+</style>
+</head>
+<body>
+<button id="btn" class="box">Click me</button>
+<button id="dbl" class="box">Double</button>
+<input id="field" class="box" autocomplete="off">
+<div id="drag-src" class="box" draggable="true">drag</div>
+<div id="drop-zone" class="box">drop here</div>
+<div id="hover-target" class="box">hover</div>
+<button id="covered-btn" class="box">Covered</button>
+<div id="overlay" class="box">overlay</div>
+<script>
+  // All page state lives under one namespaced global: a global named like an
+  // element id would collide with window named access.
+  window.__e2e = { clicks: 0, lastClick: null, dblclicks: 0, dblSingles: 0,
+                   dropped: 0, dragstarts: 0, enters: 0, coveredClicks: 0,
+                   overlayClicks: 0, mousedowns: 0 };
+  var state = window.__e2e;
+  document.addEventListener("mousedown", function () { state.mousedowns += 1; }, true);  document.getElementById("btn").addEventListener("click", function (ev) {
+    state.clicks += 1;
+    state.lastClick = { target: ev.target.id, clientX: ev.clientX, clientY: ev.clientY, isTrusted: ev.isTrusted };
+  });
+  var dbl = document.getElementById("dbl");
+  dbl.addEventListener("click", function () { state.dblSingles += 1; });
+  dbl.addEventListener("dblclick", function (ev) { if (ev.isTrusted) { state.dblclicks += 1; } });
+  var src = document.getElementById("drag-src");
+  src.addEventListener("dragstart", function (ev) {
+    state.dragstarts += 1;
+    ev.dataTransfer.setData("text/plain", "payload-42");
+  });
+  var zone = document.getElementById("drop-zone");
+  zone.addEventListener("dragover", function (ev) { ev.preventDefault(); });
+  zone.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    state.dropped += 1;
+    state.dropData = ev.dataTransfer.getData("text/plain");
+  });
+  document.getElementById("hover-target").addEventListener("mouseenter", function () { state.enters += 1; });
+  document.getElementById("covered-btn").addEventListener("click", function () { state.coveredClicks += 1; });
+  document.getElementById("overlay").addEventListener("click", function () { state.overlayClicks += 1; });
+</script>
+</body>
+</html>
