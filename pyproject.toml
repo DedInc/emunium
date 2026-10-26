@@ -4,48 +4,79 @@ build-backend = "hatchling.build"
 
 [project]
 name = "emunium"
-version = "3.0.0"
-description = "Human-like, undetectable browser automation. Bypasses CDP/WebDriver via custom bridge and native OS inputs."
+version = "3.1.0"
+description = "DOM-aware browser automation with native OS-level mouse and keyboard input, driven through a Chrome extension bridge instead of CDP or WebDriver."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [
     { name = "Maehdakvan", email = "visitanimation@google.com" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
 ]
 
 dependencies = [
-    "websockets>=12.0",
-    "pyautogui>=0.9.54",
-    "HumanCursor>=1.1",
-    "pyperclip>=1.8",
+    "websockets>=14,<18",
+    "pyautogui>=0.9.54; sys_platform != \"win32\"",
+    "pyperclip>=1.8; sys_platform != \"win32\"",
 ]
 
 [project.optional-dependencies]
+standalone = [
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+    "mss>=9",
+]
+ocr = [
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+    "mss>=9",
+    "easyocr>=1.7",
+]
 parsing = [
     "selectolax>=0.3.17",
 ]
 keyboard = [
     "keyboard>=0.13",
 ]
-standalone = [
-    "opencv-python>=4.8",
-    "numpy>=1.24",
-]
-ocr = [
-    "opencv-python>=4.8",
-    "numpy>=1.24",
-    "easyocr>=1.7",
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
 ]
 
 [project.urls]
 Homepage = "https://github.com/DedInc/emunium"
 "Bug Tracker" = "https://github.com/DedInc/emunium/issues"
+Changelog = "https://github.com/DedInc/emunium/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["emunium"]
 include = ["LICENSE"]
+# Internal persistent-extension builder; not part of this release's API.
+exclude = ["emunium/_attach", "emunium/__main__.py"]
+
+[tool.hatch.build.targets.sdist]
+# Allow-list: local scratch (.spike/ browser profiles), agent tooling and docs
+# must never ship.
+only-include = [
+    "emunium",
+    "tests",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+# tests/test_build.py imports emunium._attach, which the sdist does not ship.
+exclude = ["emunium/_attach", "emunium/__main__.py", "tests/test_build.py"]

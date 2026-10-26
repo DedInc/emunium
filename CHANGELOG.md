@@ -1,0 +1,84 @@
+# Changelog
+
+## 3.1.0
+
+Stability release. Several behaviours change in ways existing scripts can
+observe; they are listed first.
+
+### Behaviour changes
+
+- **Typed exceptions.** Every failure raises a subclass of `emunium.EmuniumError`
+  (`StaleElementError`, `TargetClosedError`, `NavigationTimeoutError`,
+  `ScriptError`, `NativeInputError`, `LaunchError`, ...) carrying `.code`,
+  `.method` and `.message`. `Bridge` methods no longer return
+  `{"error": ...}` dicts. Timeout classes also derive from `TimeoutError`, and
+  the other classes from the matching built-in (`ValueError`, `RuntimeError`,
+  `ConnectionError`), so existing `except` clauses keep matching. All classes
+  are exported from `emunium`.
+- **`execute_script` returns JSON values.** The script runs as a function body
+  (use `return`; promises are awaited) and the result is converted to a JSON
+  value: `undefined` becomes `None`, DOM nodes become small descriptor dicts,
+  circular references become `"[Circular]"`. A throwing script raises
+  `ScriptError`; a page CSP that blocks evaluation raises `CSPBlockedError`.
+- **Detached waits return `None`.** A wait satisfied by the absence of an
+  element (for example `Wait().detached()`) returns `None` instead of an element
+  handle, since there is no element to act on.
+- **`new_tab` switches the pinned tab.** `new_tab()` activates the new tab and
+  makes it the target of later commands; `new_tab(url, switch=False)` opens it
+  in the background without moving the pin. Closing the pinned tab pins the
+  active tab.
+- **`PageParser` raises without selectolax.** Query methods raise `ImportError`
+  when `emunium[parsing]` is not installed, instead of returning empty results
+  that looked like "no match". `PageParser.title` still falls back to a regex.
+- **Headless browsers refuse native input.** Click, type, hover and drag
+  methods raise `NativeInputError` on a `Browser(headless=True)` instead of
+  moving the cursor to positions of an invisible window.
+- **Clicks are verified.** Before a button is pressed, the page must report
+  the pointer over the target element; otherwise the position is corrected up
+  to twice and `ClickVerificationError` is raised. `Browser(verify_input=False)`
+  restores unverified clicks.
+- **Typing checks focus.** `type()` raises `NativeInputError` when the element
+  (or the browser window) does not hold keyboard focus, instead of sending
+  keystrokes blind, and waits until the page shows the typed text.
+- **Network waits are scoped.** `wait_for_response` only matches responses of
+  the pinned tab (`any_tab=True` to widen) that finished after the last action
+  (`since=` to override). In URL patterns only `*` is a wildcard.
+- **Python 3.10+** is required.
+
+### Added
+
+- `Browser.goto(..., wait_until="commit" | "domcontentloaded" | "load")`.
+- `Browser.switch_to_tab(tab_id)` and `Browser.tabs()`.
+- `Browser.expect_response(pattern)` context manager and the `since=` /
+  `any_tab=` parameters of `wait_for_response`.
+- `Browser(chrome_path=..., extra_args=[...], verify_input=True)`.
+- Element handles remember their tab and document: actions address that tab,
+  and a handle from a replaced document raises `StaleElementError`.
+- `Emunium(ocr=True)` as an alias of `ocr_enabled=True`; OCR initialization
+  errors surface in the constructor.
+- On Windows, `EMUNIUM_FAILSAFE=0` disables the screen-corner fail-safe of the
+  built-in input backend (which raises `NativeInputError`). On macOS and Linux
+  pyautogui's own fail-safe (`pyautogui.FailSafeException`) still applies.
+
+### Changed
+
+- Windows typing sends every character as a Unicode keystroke (`SendInput`),
+  independent of the keyboard layout; nothing is pasted through the clipboard.
+- On Windows, mouse and keyboard input use the Win32 API directly; pyautogui is
+  no longer installed or imported there. `import emunium` makes the process
+  per-monitor DPI aware and loads no GUI or imaging library.
+- Coordinates account for page zoom, `devicePixelRatio` and multi-monitor
+  layouts, and are calibrated from real pointer events.
+- Every `Browser` runs in its own session: a private extension copy, a random
+  connection token and an OS-assigned port. The shared `port.json` is gone, so
+  parallel browsers no longer conflict. Launch failures clean up the Chrome
+  process tree and temporary files.
+- Standalone mode captures the screen with `mss` and uses
+  `opencv-python-headless`; matches are ranked by score and de-duplicated, and
+  coordinates are correct on Retina displays.
+- Dependencies: `websockets>=14,<18`; `pyautogui` only on macOS and Linux,
+  which keep using it for native input; `pyperclip`
+  only on macOS and Linux; `HumanCursor` removed. The `standalone` and `ocr`
+  extras now include `mss` and `opencv-python-headless` instead of
+  `opencv-python`.
+- Package description no longer claims to be undetectable.
