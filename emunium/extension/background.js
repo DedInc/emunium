@@ -12,9 +12,7 @@ importScripts(
   background.registerRuntimeListeners();
   background.connect();
 
-  setInterval(() => {
-    if (!background.state.ws || background.state.ws.readyState !== WebSocket.OPEN) {
-      background.connect();
-    }
-  }, 5000);
+  // Watchdog: connect() itself is single-flight and backs off; this only restarts a
+  // stalled loop and never shortens a pending backoff.
+  setInterval(() => background.ensureConnected(), 5000);
 })();

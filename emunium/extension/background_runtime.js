@@ -1,73 +1,83 @@
+// background_runtime.js - browser event listeners: content readiness, tab lifecycle, wake-ups.
 (() => {
   "use strict";
 
   const scope = globalThis.EmuniumBackground;
+  const RECONNECT_ALARM = "emunium-reconnect";
 
-  function handleExecMessage(msg, sender, sendResponse) {
-    chrome.scripting
-      .executeScript({
-        target: { tabId: sender.tab.id },
-        world: "MAIN",
-        args: [msg.code],
-        func: (code) => {
-          try {
-            const result = new Function(code)();
-            return {
-              success: true,
-              result: result !== undefined ? String(result) : null,
-            };
-          } catch (error) {
-            return { error: error.message };
-          }
-        },
-      })
-      .then((results) => {
-        sendResponse(results?.[0]?.result || { error: "No result" });
-      })
-      .catch((error) => {
-        sendResponse({ error: error.message });
-      });
-    return true;
+  function handleRuntimeMessage(msg, sender) {
+    if (!msg || typeof msg !== "object" || msg.__emunium_ready__ !== 2) {
+      return undefined;
+    }
+    const tab = sender && sender.tab;
+    if (!tab || !Number.isInteger(tab.id) || sender.frameId !== 0) {
+      return undefined; // readiness is tracked for the top frame only
+    }
+    scope.markContentReady(tab.id, sender.documentId);
+    scope.sendEvent("tabReady", {
+      tabId: tab.id,
+      url: typeof msg.url === "string" ? msg.url : tab.url || null,
+    });
+    return undefined;
   }
 
-  function handleReadyMessage(msg, sender) {
-    if (sender.frameId === 0) {
-      scope.state.readyTabs.add(sender.tab.id);
-      if (sender.documentId) {
-        scope.state.tabDocIds.set(sender.tab.id, sender.documentId);
-      }
+  function handleTopFrameCommitted(details) {
+    if (details && details.frameId === 0) {
+      scope.onTopFrameCommitted(details.tabId, details.documentId);
     }
+  }
 
-    scope.send({
-      event: "tabReady",
-      tabId: sender.tab.id,
-      url: msg.url,
-      frameId: sender.frameId,
-    });
+  function handleTabRemoved(tabId) {
+    scope.clearTrackedTab(tabId);
+    scope.sendEvent("tabRemoved", { tabId });
   }
 
   function registerRuntimeListeners() {
-    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-      if (msg.__emunium_exec__ && sender.tab) {
-        return handleExecMessage(msg, sender, sendResponse);
-      }
-      if (msg.__emunium_ready__ && sender.tab) {
-        handleReadyMessage(msg, sender);
-      }
-      return undefined;
-    });
-
-    chrome.webNavigation.onBeforeNavigate.addListener((details) => {
-      if (details.frameId === 0) {
-        scope.clearTrackedTab(details.tabId);
-      }
-    });
-
-    chrome.tabs.onRemoved.addListener((tabId) => {
-      scope.clearTrackedTab(tabId);
-      scope.clearPinnedTab(tabId);
-    });
+    if (scope.state.listenersRegistered) {
+      return;
+    }
+    scope.state.listenersRegistered = true;
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+    if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
+      chrome.webNavigation.onCommitted.addListener(handleTopFrameCommitted);
+    }
+    chrome.tabs.onRemoved.addListener(handleTabRemoved);
+    const wake = () => scope.ensureConnected();
+    if (chrome.runtime.onStartup) {
+      chrome.runtime.onStartup.addListener(wake);
+    }
+    if (chrome.runtime.onInstalled) {
+      chrome.runtime.onInstalled.addListener(wake);
+    }
+    registerReconnectAlarm();
   }
 
-  Object.assign(scope, { registerRuntimeListeners });
+  // Timers die with a suspended worker; an alarm wakes it up again to reconnect.
+  // The `alarms` permission is granted by the manifest slice, hence the guard.
+  function registerReconnectAlarm() {
+    if (!chrome.alarms || !chrome.alarms.onAlarm) {
+      return;
+    }
+    chrome.alarms.onAlarm.addListener(handleAlarm);
+    try {
+      const created = chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
+      if (created && typeof created.catch === "function") {
+        created.catch(() => {});
+      }
+    } catch {
+      // without the permission the worker still reconnects through its own timers
+    }
+  }
+
+  function handleAlarm(alarm) {
+    if (alarm && alarm.name === RECONNECT_ALARM && !scope.isConnected()) {
+      scope.connect();
+    }
+  }
+
+  Object.assign(scope, {
+    registerRuntimeListeners,
+    handleRuntimeMessage,
+    handleTabRemoved,
+  });
 })();
