@@ -73,6 +73,13 @@ MIXED_DPI_HINT = (
     "display scaling differs between monitors; set verify_input=False or move "
     "the window to the primary display"
 )
+# ClickVerificationError when the element is not under the verified cursor.
+COVERED_HINT = (
+    "another element (overlay, banner, sticky header) may cover it or it is "
+    "moving; wait with Wait().clickable() or Wait().stable() before acting"
+)
+# NativeInputError when no pointer sample reached the page.
+NO_SAMPLE_HINT = "is the window minimized, covered or off-screen?"
 
 _QUERY_KINDS = ("css", "xpath", "text")
 _CLICK_BUTTONS = {
@@ -632,7 +639,8 @@ class Element:
                     raise NativeInputError(
                         "no fresh pointer event reached the page after moving and "
                         "jiggling the cursor; the window may be occluded, minimized "
-                        "or off-screen"
+                        "or off-screen",
+                        hint=NO_SAMPLE_HINT,
                     )
                 retried_silence = True
                 continue
@@ -657,11 +665,15 @@ class Element:
                     f"{MAX_CORRECTIONS} corrections (cursor at {position!r}, sample "
                     f"{event!r}, hit={hit!r})"
                 )
+                # pointerProbe reports only hit/miss, not which element is
+                # under the cursor, so the miss hint cannot name it.
+                hint = COVERED_HINT
                 if foreign_hits == samples:
                     # The page sees the element under the cursor but reports a
                     # screen point that does not match the OS cursor.
                     message += f"; {MIXED_DPI_HINT}"
-                raise ClickVerificationError(message)
+                    hint = None
+                raise ClickVerificationError(message, hint=hint)
             corrections += 1
             self._correct(anchor, event if describes else None, position, geometry)
 

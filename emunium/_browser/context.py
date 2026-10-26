@@ -37,6 +37,9 @@ _DEFAULT_ATTR = "_emunium_default_context"
 _DEFAULTS_LOCK = threading.Lock()
 # Window API failures that mean "the window could not be raised".
 _WINDOW_ERRORS = (NativeInputError, OSError, ctypes.ArgumentError)
+HEADLESS_HINT = (
+    "launch with headless=False to use native input; DOM-only work does not need it"
+)
 
 
 def _on_windows() -> bool:
@@ -237,7 +240,8 @@ class BrowserContext:
         if self.headless:
             raise NativeInputError(
                 "native input is unavailable for a headless browser: there is no "
-                "window to send OS events to"
+                "window to send OS events to",
+                hint=HEADLESS_HINT,
             )
 
     @property

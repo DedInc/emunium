@@ -32,7 +32,7 @@ from emunium._browser import context as context_module
 from emunium._browser import dom
 from emunium._browser import facade as facade_module
 from emunium._browser import tabs as tabs_module
-from emunium._browser.context import BrowserContext, DragInteractor
+from emunium._browser.context import HEADLESS_HINT, BrowserContext, DragInteractor
 from emunium._element_interactor import ElementInteractor
 from emunium._motion import DEFAULT_TARGET_SIZE
 from emunium._native.win32 import CHROME_WINDOW_CLASS
@@ -44,7 +44,13 @@ from emunium._screen import (
     input_per_dip,
 )
 from emunium._standalone.config import ClickType
-from emunium.element import MIXED_DPI_HINT, Element, ElementQuery
+from emunium.element import (
+    COVERED_HINT,
+    MIXED_DPI_HINT,
+    NO_SAMPLE_HINT,
+    Element,
+    ElementQuery,
+)
 from emunium.errors import (
     BridgeDisconnectedError,
     ClickVerificationError,
@@ -112,6 +118,7 @@ class World:
         self.after_button_down: Callable[[], None] | None = None
         self.focus_states: list[dict[str, Any]] = []
         self.wait_result: Any = None
+        self.page: dict[str, Any] = {"url": "https://a.test/", "title": "A page"}
         self.errors: dict[str, Exception] = {}
         self.drop_geometry = False
         self.probes: list[dict[str, Any]] = []
@@ -418,6 +425,12 @@ class FakeBridge(Bridge):
         self._record("queryByText", None, tab_id)
         return self._matches(f"{text}|exact={exact}")
 
+    def page_info(
+        self, timeout: float = 10.0, *, tab_id: Any = PINNED
+    ) -> dict[str, Any]:
+        self._record("pageInfo", None, tab_id)
+        return dict(self.world.page)
+
     def get_all_interactive(
         self, timeout: float = 10.0, *, tab_id: Any = PINNED
     ) -> list[dict[str, Any]]:
@@ -676,6 +689,8 @@ def test_persistent_miss_raises_after_two_corrections(world: World) -> None:
     with pytest.raises(ClickVerificationError) as info:
         handle(ctx).click()
     assert MIXED_DPI_HINT not in str(info.value)
+    assert info.value.hint == COVERED_HINT
+    assert str(info.value).endswith(f"\nhint: {COVERED_HINT}")
     assert len(world.moves()) == 3 and len(world.probes) == 3
     assert world.presses() == []
 
@@ -687,6 +702,8 @@ def test_no_fresh_sample_raises_native_input_error(world: World) -> None:
     with pytest.raises(NativeInputError) as info:
         handle(ctx).click()
     assert not isinstance(info.value, ClickVerificationError)
+    assert info.value.hint == NO_SAMPLE_HINT
+    assert f"\nhint: {NO_SAMPLE_HINT}" in str(info.value)
     assert len(world.probes) == 2 and len(world.kinds("jiggle")) == 4
     assert world.presses() == []
 
@@ -731,6 +748,7 @@ def test_hit_with_foreign_screen_point_hints_mixed_dpi(world: World) -> None:
     with pytest.raises(ClickVerificationError) as info:
         handle(ctx).click()
     assert MIXED_DPI_HINT in str(info.value)
+    assert info.value.hint is None  # the message already carries the DPI hint
     assert world.presses() == []
     assert not ctx.calibration.is_calibrated(world.live())
 
@@ -790,8 +808,10 @@ def test_probe_geometry_uses_the_reply_zoom(world: World) -> None:
 def test_headless_refuses_before_any_command(world: World) -> None:
     ctx = make_ctx(world, headless=True)
 
-    with pytest.raises(NativeInputError):
+    with pytest.raises(NativeInputError) as info:
         handle(ctx).click()
+    assert info.value.hint == HEADLESS_HINT
+    assert str(info.value).endswith(f"\nhint: {HEADLESS_HINT}")
     assert world.log == []
 
 
@@ -1971,14 +1991,86 @@ def test_dom_wait_returns_element_with_query(world: World) -> None:
 
 
 def test_dom_wait_timeout_becomes_timeout_error(world: World) -> None:
-    world.wait_result = WaitTimeoutError("waited 1000 ms")
+    cause = WaitTimeoutError("waited 1000 ms", method="waitForSelector")
+    world.wait_result = cause
     ctx = make_ctx(world)
     with pytest.raises(TimeoutError) as info:
         dom.wait_for_element(ctx, "#a", timeout=1.0)
-    assert type(info.value) is TimeoutError
-    assert isinstance(info.value.__cause__, WaitTimeoutError)
+    error = info.value
+    assert isinstance(error, WaitTimeoutError) and error is not cause
+    assert error.__cause__ is cause
+    assert (error.code, error.method) == ("wait_timeout", "waitForSelector")
+    assert error.message == (
+        "Element not found after 1.0s: '#a' (url=https://a.test/, title='A page')"
+    )
+    assert error.hint == "no element matches '#a' on this page"
+    assert str(error) == f"{error.message}\nhint: {error.hint}"
+    assert world.bridge_methods() == ["waitForSelector", "pageInfo", "querySelectorAll"]
+
+
+def test_dom_wait_timeout_without_raise_makes_no_probe(world: World) -> None:
+    world.wait_result = WaitTimeoutError("waited 1000 ms")
+    ctx = make_ctx(world)
     assert dom.wait_for_text(ctx, "Go", timeout=1.0, raise_on_timeout=False) is None
-    assert world.bridge_methods().count("waitForSelector") == 2  # no retry loop
+    assert dom.wait_for_element(ctx, "#a", 1.0, raise_on_timeout=False) is None
+    assert world.bridge_methods() == ["waitForSelector", "waitForSelector"]
+
+
+def test_dom_wait_timeout_reuses_the_extension_page_context(world: World) -> None:
+    world.wait_result = WaitTimeoutError(
+        'waitForSelector timed out after 500 ms waiting for xpath "//b" '
+        '(url: https://b.test/?q=1, x, title: "Say \\"hi\\"")'
+    )
+    world.selectors["//b"] = ["doc1.1"]
+    with pytest.raises(WaitTimeoutError) as info:
+        dom.wait_for_xpath(make_ctx(world), "//b", timeout=0.5)
+    assert info.value.message == (
+        "XPath not found after 0.5s: '//b' "
+        "(url=https://b.test/?q=1, x, title='Say \"hi\"')"
+    )
+    assert (
+        info.value.hint
+        == "1 element(s) match but none satisfied the wait before it timed out"
+    )
+    assert world.bridge_methods() == ["waitForSelector", "queryXPath"]
+
+
+def test_dom_wait_timeout_hint_names_state_and_conditions(world: World) -> None:
+    world.wait_result = WaitTimeoutError("late")
+    world.selectors["#a"] = ["doc1.1", "doc1.1"]
+    with pytest.raises(WaitTimeoutError) as info:
+        dom.wait_for_element(
+            make_ctx(world),
+            "#a",
+            1.0,
+            state="visible",
+            conditions=[{"type": "clickable"}, {"type": "stable", "duration": 300}],
+        )
+    assert info.value.hint == (
+        "2 element(s) match but none satisfied state 'visible' and "
+        "conditions clickable, stable"
+    )
+
+
+def test_dom_text_wait_timeout_counts_substring_matches(world: World) -> None:
+    world.wait_result = WaitTimeoutError("late")
+    world.selectors["Go|exact=False"] = ["doc1.1"]
+    with pytest.raises(WaitTimeoutError) as info:
+        dom.wait_for_text(make_ctx(world), "Go", timeout=1.0)
+    assert info.value.message.startswith("Text not found after 1.0s: 'Go' (url=")
+    assert info.value.hint is not None and info.value.hint.startswith("1 element(s)")
+    assert world.bridge_methods()[-1] == "queryByText"
+
+
+def test_dom_wait_timeout_ignores_failed_probes(world: World) -> None:
+    world.wait_result = WaitTimeoutError("late")
+    world.errors["pageInfo"] = ContentUnavailableError("document swap")
+    world.errors["querySelectorAll"] = BridgeDisconnectedError("socket closed")
+    with pytest.raises(WaitTimeoutError) as info:
+        dom.wait_for_element(make_ctx(world), "#a", timeout=1.0)
+    assert info.value.message == "Element not found after 1.0s: '#a'"
+    assert info.value.hint is None
+    assert str(info.value) == "Element not found after 1.0s: '#a'"
 
 
 def test_dom_wait_other_errors_propagate(world: World) -> None:

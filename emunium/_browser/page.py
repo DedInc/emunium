@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 from emunium._bridge.transport import PINNED
 from emunium._browser.context import BrowserContext
 from emunium._browser.tabs import pin_from
-from emunium.errors import ContentUnavailableError
+from emunium.errors import ContentUnavailableError, WaitTimeoutError
+from emunium.results import NetworkResponse, PageInfo
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -31,12 +32,13 @@ _sleep = time.sleep
 
 def goto(
     ctx: BrowserContext, url: str, *, timeout: float = 30.0, wait_until: str = "load"
-) -> dict[str, Any]:
+) -> PageInfo:
+    """Navigate the pinned tab; the reply keeps every key ``navigate`` returns."""
     ctx.mark_action()
     result = ctx.bridge.navigate(url, timeout, wait_until=wait_until)
     pin_from(ctx, result, "navigate")
     logger.info("Navigated to: %s", url)
-    return result
+    return PageInfo(result)
 
 
 def get_url(ctx: BrowserContext) -> str:
@@ -53,8 +55,8 @@ def execute_script(ctx: BrowserContext, code: str) -> Any:
     return ctx.bridge.execute_script(code)
 
 
-def page_info(ctx: BrowserContext) -> dict[str, Any]:
-    return ctx.bridge.page_info()
+def page_info(ctx: BrowserContext) -> PageInfo:
+    return PageInfo(ctx.bridge.page_info())
 
 
 def scroll_to(ctx: BrowserContext, x: int, y: int) -> dict[str, Any]:
@@ -94,16 +96,17 @@ def wait_for_response(
     *,
     since: float | None = None,
     any_tab: bool = False,
-) -> dict[str, Any] | None:
+) -> NetworkResponse | None:
     """First response matching ``url_pattern`` (glob), or ``None`` on timeout.
 
     ``since`` (epoch ms) defaults to the last action on this browser.
     """
     if since is None:
         since = ctx.last_action_ms
-    return ctx.bridge.wait_for_response(
+    entry = ctx.bridge.wait_for_response(
         url_pattern, timeout, since=since, any_tab=any_tab
     )
+    return None if entry is None else NetworkResponse(entry)
 
 
 class ResponseExpectation:
@@ -111,8 +114,9 @@ class ResponseExpectation:
 
     ``since`` is taken when the block is entered; the ``timeout`` runs from the
     block's exit. ``value`` holds the network entry once the block exited
-    cleanly; ``TimeoutError`` is raised on exit when nothing matched. When the
-    block raises, nothing is awaited and the exception propagates.
+    cleanly; ``WaitTimeoutError`` (a ``TimeoutError``) is raised on exit when
+    nothing matched. When the block raises, nothing is awaited and the
+    exception propagates.
     """
 
     def __init__(
@@ -129,10 +133,10 @@ class ResponseExpectation:
         self._any_tab = any_tab
         self._since: float | None = None
         self._tab_id: Any = PINNED
-        self._value: dict[str, Any] | None = None
+        self._value: NetworkResponse | None = None
 
     @property
-    def value(self) -> dict[str, Any]:
+    def value(self) -> NetworkResponse:
         if self._value is None:
             raise RuntimeError(
                 "expect_response(): the response is available after the with "
@@ -164,7 +168,9 @@ class ResponseExpectation:
             tab_id=self._tab_id,
         )
         if entry is None:
-            raise TimeoutError(
-                f"no response matching {self._pattern!r} within {self._timeout}s"
+            raise WaitTimeoutError(
+                f"no response matching {self._pattern!r} within {self._timeout}s",
+                code="wait_timeout",
+                method="waitForResponse",
             )
-        self._value = entry
+        self._value = NetworkResponse(entry)

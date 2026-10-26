@@ -9,6 +9,8 @@ replaced on ``Element`` (the conftest safety net traps the real OS entry points)
 from __future__ import annotations
 
 import copy
+import json
+import pickle
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -24,11 +26,14 @@ from emunium.element import Element
 from emunium.errors import (
     BridgeProtocolError,
     ContentUnavailableError,
+    ElementNotFoundError,
     InvalidArgumentError,
     LaunchError,
     NativeInputError,
     TargetClosedError,
+    WaitTimeoutError,
 )
+from emunium.results import NetworkResponse, PageInfo, Point, Record, TabInfo
 from emunium.wait import Wait
 
 ELEMENT = {
@@ -359,10 +364,14 @@ def test_expect_response_raises_timeout_when_nothing_matched(
 ) -> None:
     transport.handlers["waitForResponse"] = None
     browser = make()
-    with pytest.raises(TimeoutError), browser.expect_response(
-        "*api*", 0.5
-    ) as expectation:
+    with (
+        pytest.raises(TimeoutError) as info,
+        browser.expect_response("*api*", 0.5) as expectation,
+    ):
         pass
+    assert isinstance(info.value, WaitTimeoutError)
+    assert (info.value.code, info.value.method) == ("wait_timeout", "waitForResponse")
+    assert str(info.value) == "no response matching '*api*' within 0.5s"
     with pytest.raises(RuntimeError):
         _ = expectation.value
 
@@ -535,3 +544,209 @@ def test_wait_count_accepts_non_negative_ints() -> None:
         {"type": "count_gt", "value": 0},
         {"type": "count_eq", "value": 3},
     ]
+
+
+# -- result records and error context (dx-api.md sections 1 and 2) ----------------
+
+
+def _assert_plain_compatible(record: dict[str, Any], plain: Any) -> None:
+    """Every way old code read the plain dict still works on the record."""
+    assert isinstance(record, dict)
+    assert record == plain
+    assert dict(record) == plain
+    assert json.loads(json.dumps(record)) == plain
+    assert pickle.loads(pickle.dumps(record)) == plain
+    assert type(pickle.loads(pickle.dumps(record))) is type(record)
+
+
+def test_goto_and_page_info_return_page_info(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    navigated = {
+        "url": "https://a.test/",
+        "title": "A",
+        "tabId": 9,
+        "contentReady": True,
+    }
+    info = {"url": "https://a.test/", "title": "A", "readyState": "complete"}
+    transport.handlers["navigate"] = navigated
+    transport.handlers["pageInfo"] = info
+    browser = make()
+
+    result = browser.goto("https://a.test/")
+    assert type(result) is PageInfo
+    _assert_plain_compatible(result, navigated)
+    assert result["tabId"] == 9 and result.tab_id == 9 and result.content_ready
+    assert result.url == "https://a.test/" and result.title == "A"
+
+    page_state = browser.page_info()
+    assert type(page_state) is PageInfo
+    _assert_plain_compatible(page_state, info)
+    assert page_state["readyState"] == page_state.ready_state == "complete"
+
+
+def test_tab_descriptions_are_tab_info_and_replies_are_records(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    # Reply shapes of background_handlers.js: createTab, activateTab and
+    # closeTab are command replies, not tab descriptions.
+    created_reply = {
+        "tabId": 12,
+        "url": "about:blank",
+        "title": "",
+        "contentReady": True,
+    }
+    switched_reply = {"tabId": 5, "windowId": 1, "activated": True}
+    listed = [{"tabId": 3, "active": False}, {"tabId": 5, "active": True}]
+    transport.handlers["createTab"] = created_reply
+    transport.handlers["activateTab"] = switched_reply
+    transport.handlers["listTabs"] = listed
+    transport.handlers["getTabInfo"] = {"tabId": 5, "status": "loading"}
+    browser = make()
+
+    created = browser.new_tab()
+    assert type(created) is Record
+    _assert_plain_compatible(created, created_reply)
+    assert created.tab_id == 12 and created.content_ready is True
+    switched = browser.switch_to_tab(5)
+    assert type(switched) is Record
+    _assert_plain_compatible(switched, switched_reply)
+    assert switched["activated"] is True and switched.activated is True
+    assert (switched.tab_id, switched.window_id) == (5, 1)
+    tabs = browser.tabs()
+    assert tabs == listed and all(type(tab) is TabInfo for tab in tabs)
+    assert [tab.tab_id for tab in tabs] == [3, 5] and tabs[1].active is True
+    assert tabs[0].status is None
+    info = browser.tab_info()
+    assert type(info) is TabInfo and info.status == "loading"
+    closed = browser.close_tab(8)
+    assert type(closed) is Record
+    _assert_plain_compatible(closed, {"closed": True})
+    assert closed.closed is True and closed["closed"] is True
+
+
+def test_records_print_like_the_plain_replies(
+    make: Callable[..., Browser],
+    transport: FakeTransport,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    info = {"url": "https://a.test/", "title": "A", "readyState": "complete"}
+    transport.handlers["pageInfo"] = info
+    browser = make()
+    print(browser.page_info())
+    print(browser.close_tab(8))
+    assert capsys.readouterr().out == f"{info!r}\n{{'closed': True}}\n"
+    assert repr(browser.page_info()) == repr(info) == str(browser.page_info())
+
+
+def test_network_waits_return_network_response(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    entry = {
+        "url": "https://a.test/api",
+        "statusCode": 204,
+        "method": "GET",
+        "type": "xmlhttprequest",
+        "timeStamp": 1700000000000.0,
+        "tabId": 3,
+        "requestId": "9",
+    }
+    transport.handlers["waitForResponse"] = entry
+    browser = make()
+    browser.bridge.pinned_tab_id = 3
+
+    resp = browser.wait_for_response("*api*")
+    assert type(resp) is NetworkResponse
+    _assert_plain_compatible(resp, entry)
+    assert resp.status == 204 and resp.ok and resp["statusCode"] == 204
+
+    with browser.expect_response("*api*") as expectation:
+        pass
+    assert type(expectation.value) is NetworkResponse
+    assert expectation.value == entry and expectation.value.request_id == "9"
+
+
+def test_get_center_returns_a_point(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    placed = dict(ELEMENT, absoluteScreenX=140, absoluteScreenY=260)
+    transport.handlers["waitForSelector"] = placed
+    transport.handlers["scrollIntoView"] = placed
+    browser = make()
+    browser.bridge.pinned_tab_id = 3
+
+    center = browser.get_center("#go")
+    assert type(center) is Point
+    assert center == {"x": center.x, "y": center.y}
+    assert center["x"] == center.x and isinstance(center.x, int)
+    _assert_plain_compatible(center, {"x": center.x, "y": center.y})
+
+
+def test_element_less_match_raises_element_not_found(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    transport.handlers["waitForSelector"] = {"element": None, "matched": True}
+    with pytest.raises(LookupError) as info:
+        make().get_center("#gone")
+    assert isinstance(info.value, ElementNotFoundError)
+    assert str(info.value) == "'#gone' matched without an element to act on"
+
+
+def test_element_wait_timeout_names_the_page_and_hints(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    transport.handlers["waitForSelector"] = _raise(
+        WaitTimeoutError(
+            'waitForSelector timed out after 1000 ms waiting for css "#go" '
+            '(url: https://a.test/form, title: "Form")',
+            method="waitForSelector",
+        )
+    )
+    transport.handlers["querySelectorAll"] = [ELEMENT, ELEMENT, ELEMENT]
+    browser = make()
+    browser.bridge.pinned_tab_id = 3
+
+    with pytest.raises(TimeoutError) as info:
+        browser.wait("#go", condition=Wait().clickable(), timeout=1.0)
+    error = info.value
+    assert isinstance(error, WaitTimeoutError)
+    assert isinstance(error.__cause__, WaitTimeoutError)
+    assert error.message == (
+        "Element not found after 1.0s: '#go' (url=https://a.test/form, title='Form')"
+    )
+    assert error.hint == "3 element(s) match but none satisfied conditions clickable"
+    assert str(error).endswith("\nhint: " + error.hint)
+    probe = transport.last("querySelectorAll")
+    assert probe.params == {"selector": "#go"} and probe.timeout <= 3.0
+    assert "pageInfo" not in transport.methods()  # the message already had it
+
+    # Every _resolve_element path raises the same error.
+    with pytest.raises(WaitTimeoutError):
+        browser.get_center("#go", timeout=1.0)
+    assert browser.wait("#go", timeout=1.0, raise_on_timeout=False) is None
+
+
+def test_element_wait_timeout_falls_back_to_one_page_info_probe(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    transport.handlers["waitForSelector"] = _raise(WaitTimeoutError("late"))
+    transport.handlers["pageInfo"] = {"url": "https://a.test/", "title": "A"}
+    transport.handlers["queryXPath"] = []
+    browser = make()
+
+    with pytest.raises(WaitTimeoutError) as info:
+        browser.wait_for_xpath("//button", timeout=0.5)
+    assert info.value.message == (
+        "XPath not found after 0.5s: '//button' (url=https://a.test/, title='A')"
+    )
+    assert info.value.hint == "no element matches '//button' on this page"
+    assert transport.methods().count("pageInfo") == 1
+    assert transport.last("pageInfo").timeout <= 3.0
+    assert transport.last("queryXPath").timeout <= 3.0
+
+
+def test_headless_refusal_carries_a_hint(make: Callable[..., Browser]) -> None:
+    with pytest.raises(NativeInputError) as info:
+        make(headless=True).click("#go")
+    assert info.value.hint is not None and "headless=False" in info.value.hint
+    assert "\nhint: launch with headless=False" in str(info.value)

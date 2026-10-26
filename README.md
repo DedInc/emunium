@@ -162,8 +162,22 @@ Properties: `browser.url`, `browser.title`, `browser.bridge`.
 
 ```python
 result = browser.goto("https://example.com", timeout=30.0, wait_until="load")
-# -> {"url": ..., "title": ..., "tabId": ..., "contentReady": ...}
+# -> PageInfo {"url": ..., "title": ..., "tabId": ..., "contentReady": ...}
+result["tabId"]   # dict access, as before
+result.tab_id     # the same value as a typed attribute
 ```
+
+Results of `goto`, `page_info`, `tab_info`, `tabs`, `wait_for_response`,
+`expect_response(...).value` and `get_center` are **result records**
+(`PageInfo`, `TabInfo`, `NetworkResponse`, `Point` from `emunium`); the
+replies of `new_tab`, `switch_to_tab` and `close_tab` are plain `Record`s.
+They are `dict` subclasses holding exactly the extension's reply: `x["key"]`,
+`==` with a dict, `json.dumps(x)`, `print(x)` and `repr(x)` behave as for the
+plain dict. Each key can also be read as a snake_case attribute
+(`info.ready_state` is `info["readyState"]`); a missing key raises
+`AttributeError` naming the key. `type(x) is dict` is `False`, pickles need
+emunium importable to load, and serializers that accept only exact dicts (for
+example `yaml.safe_dump`) need `dict(x)`.
 
 `wait_until` is one of:
 
@@ -186,7 +200,8 @@ before and after `silence` seconds, `False` when `timeout` runs out. Only the
 transient error of a document swap is retried; any other error propagates.
 
 ```python
-browser.page_info()  # url, title, readyState, scrollX, scrollY, scrollWidth, scrollHeight, geometry
+browser.page_info()  # PageInfo: url, title, readyState, scrollX, scrollY, scrollWidth, scrollHeight, geometry
+browser.page_info().ready_state  # also .url, .title, .scroll_x, .scroll_y, .scroll_width, .scroll_height
 browser.scroll_to(element_or_selector)  # scroll the element into view
 browser.scroll_to(x, y)                 # scroll the page to absolute CSS pixel coords
 ```
@@ -203,7 +218,8 @@ browser.wait_for_xpath(xpath, timeout=10.0)
 browser.wait_for_text(text, timeout=10.0)
 ```
 
-Each returns an `Element` and raises `TimeoutError` when nothing matched in time.
+Each returns an `Element` and raises `WaitTimeoutError` (a `TimeoutError`)
+when nothing matched in time; see [Errors](#errors) for its message and hint.
 
 ### Waits with conditions
 
@@ -357,7 +373,7 @@ browser.click_at(target, click_type=ClickType.LEFT, human=True, timeout=10.0)
 browser.move_to(target, offset_x=None, offset_y=None, human=True, timeout=10.0)
 browser.hover(target, ...)                      # same as move_to
 browser.drag_and_drop(source, target, human=True, timeout=10.0)
-browser.get_center(target)                      # -> {"x": int, "y": int}
+browser.get_center(target)                      # -> Point {"x": int, "y": int}; also .x, .y
 ```
 
 `target` is a CSS selector or an `Element`. A selector is resolved with
@@ -597,9 +613,10 @@ tab after the pinned tab is closed.
 ```python
 info = browser.new_tab("https://example.com")              # opens, activates and pins it
 bg = browser.new_tab("https://example.org", switch=False)  # opens in the background, pin unchanged
-browser.tabs()               # -> [{"tabId", "url", "title", "active", "windowId"}, ...]
+browser.tabs()               # -> [TabInfo {"tabId", "url", "title", "active", "windowId"}, ...]
 browser.switch_to_tab(bg["tabId"])  # activates the tab, focuses its window, pins it
-browser.tab_info()           # pinned tab: {"tabId", "url", "title", "status", "active", "windowId"}
+browser.switch_to_tab(bg.tab_id)    # the same, through the record attribute
+browser.tab_info()           # pinned tab: TabInfo {"tabId", "url", "title", "status", "active", "windowId"}
 browser.close_tab()          # closes the pinned tab, then pins the active tab
 browser.close_tab(tab_id)    # closes a specific tab
 ```
@@ -616,6 +633,7 @@ browser.click("#fetch-data")
 response = browser.wait_for_response("*/api/v1/users*", timeout=10.0)
 if response:
     print(response["statusCode"], response["url"])
+    print(response.status, response.url, response.ok)  # NetworkResponse attributes
 ```
 
 `wait_for_response(url_pattern, timeout=10.0, *, since=None, any_tab=False)`
@@ -634,8 +652,11 @@ returns the first matching response, or `None` on timeout.
 
 Entries look like
 `{"url", "statusCode", "method", "type", "timeStamp", "tabId", "requestId"}`, plus
-`"error"` for requests that failed at the network level. The extension keeps the
-last 500 responses from the last two minutes.
+`"error"` for requests that failed at the network level. They are returned as
+`NetworkResponse` records: `.url`, `.status` (`statusCode`), `.method`, `.type`,
+`.tab_id`, `.request_id`, `.timestamp` (`timeStamp`, epoch ms), `.error` (`None`
+unless the request failed) and `.ok` (status 200-399 and no error). The
+extension keeps the last 500 responses from the last two minutes.
 
 To wait for a response caused by a specific block of code, use
 `expect_response`:
@@ -643,12 +664,12 @@ To wait for a response caused by a specific block of code, use
 ```python
 with browser.expect_response("*/api/search*", timeout=10.0) as resp:
     browser.click("#search")
-print(resp.value["statusCode"])
+print(resp.value["statusCode"], resp.value.status)
 ```
 
 The time window starts when the block is entered and the timeout runs from
 when it exits. The tab is the pinned tab at entry (`any_tab=True` widens it). If
-no response matches, `TimeoutError` is raised on exit. If the block itself
+no response matches, `WaitTimeoutError` (a `TimeoutError`) is raised on exit. If the block itself
 raises, nothing is awaited and the exception propagates.
 
 ---
@@ -679,8 +700,10 @@ raises `ScriptError`.
 ## Errors
 
 Every emunium exception derives from `EmuniumError` and carries `.message`,
-`.code` (the bridge error code, or `None`) and `.method` (the bridge command, or
-`None`). All classes are importable from `emunium` and `emunium.errors`.
+`.code` (the bridge error code, or `None`), `.method` (the bridge command, or
+`None`) and `.hint` (a suggested next step, or `None`). `str(exc)` is the
+message, followed by a `hint: ...` line when there is a hint; the hint survives
+pickling. All classes are importable from `emunium` and `emunium.errors`.
 
 ```text
 EmuniumError
@@ -702,13 +725,29 @@ EmuniumError
   NativeInputError                  also RuntimeError: OS input unavailable or refused
     ClickVerificationError          the cursor could not be verified over the element
   LaunchError                       also RuntimeError: Chrome or the extension did not start
+  ElementNotFoundError              also LookupError: a selector resolved to no element to act on
+  ExpectationError                  also AssertionError: an expectation did not hold in time
 ```
 
 Because the timeout classes also derive from `TimeoutError` and the others from
-the matching built-in, `except TimeoutError:` and similar handlers keep working.
+the matching built-in, `except TimeoutError:`, `except LookupError:` and similar
+handlers keep working.
+
 The element waits (`wait`, `wait_for_element`, `wait_for_xpath`,
-`wait_for_text`) raise a plain `TimeoutError` whose cause is the
-`WaitTimeoutError`.
+`wait_for_text`, and every action that takes a selector) raise
+`WaitTimeoutError` chained from the extension's error. The message names the
+page, and the hint comes from one count of the selector's matches taken after
+the timeout (left out when that count fails):
+
+```text
+Element not found after 10.0s: '#save' (url=https://example.com/form, title='Form')
+hint: 2 element(s) match but none satisfied conditions clickable
+```
+
+`no element matches '#save' on this page` means the selector itself is wrong or
+the content has not loaded. A headless browser refusing native input, a click
+that could not be verified and a window that delivers no pointer events also
+carry hints.
 
 ```python
 from emunium import NativeInputError, StaleElementError
@@ -718,7 +757,9 @@ try:
 except StaleElementError:
     button.refresh().click()
 except NativeInputError as exc:
-    print("cannot click:", exc)
+    print("cannot click:", exc.message)
+    if exc.hint:
+        print("try:", exc.hint)
 ```
 
 ---

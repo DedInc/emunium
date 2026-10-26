@@ -54,6 +54,30 @@ observe; they are listed first.
   the pinned tab (`any_tab=True` to widen) that finished after the last action
   (`since=` to override). In URL patterns only `*` is a wildcard.
 - **Python 3.10+** is required.
+- **Results are dict subclasses.** `goto`, `page_info`, `tab_info`, `tabs`,
+  `wait_for_response`, `expect_response(...).value` and `get_center` return
+  `PageInfo`, `TabInfo`, `NetworkResponse` or `Point`; `new_tab`,
+  `switch_to_tab` and `close_tab` return a `Record`. Keys, `x["key"]`, `==`
+  with a dict, `json.dumps`, `repr()` and `print()` are those of the plain
+  dict, but `type(x) is dict` is now `False`, serializers that accept only
+  exact dicts (for example `yaml.safe_dump`) need `dict(x)`, and a pickled
+  result needs emunium importable to load.
+- **Element-wait timeouts raise `WaitTimeoutError`.** `wait`,
+  `wait_for_element`, `wait_for_xpath`, `wait_for_text` and every action given
+  a selector raise `WaitTimeoutError` (still a `TimeoutError`, chained from the
+  extension's error) instead of a plain `TimeoutError`; so does an unmatched
+  `expect_response` block. `str(e)` now ends with ` (url=..., title=...)`
+  (element waits) and a `\nhint: ...` line when a hint is known; `e.args` is
+  unchanged. A selector resolving to no element raises `ElementNotFoundError`
+  (still a `LookupError`) instead of a bare `LookupError`.
+- **A timed-out element wait probes the page.** Before raising, it makes up to
+  two best-effort requests of at most 2 s each: `pageInfo` (only when the
+  extension's message lacks url/title) and a count of the selector's matches
+  for the hint. Probe failures are ignored. `raise_on_timeout=False` makes no
+  probes.
+- **Click-verification hint is generic.** The pointer probe does not report
+  which element is under the cursor, so the hint of `ClickVerificationError`
+  suggests an overlay or a moving element instead of naming it.
 
 ### Added
 
@@ -97,6 +121,16 @@ observe; they are listed first.
   emunium process per X display.
 - `python tests/docker/run_linux.py` builds a Docker image (Xvfb, openbox,
   Chromium) and runs the unit and e2e suites on Linux in it.
+- Result records (`emunium.Record`, `PageInfo`, `TabInfo`, `NetworkResponse`,
+  `Point`): keys can be read as snake_case attributes (`info.ready_state`,
+  `tab.tab_id`, `response.status`, `response.ok`); a missing key raises
+  `AttributeError` naming it. `Bridge` keeps returning plain dicts.
+- Exceptions carry a `.hint` (keyword-only `hint=` argument; shown as a
+  `hint: ...` line in `str(exc)` and kept by pickling). Hints are given for
+  element-wait timeouts, headless native input, unverified clicks and windows
+  that deliver no pointer events.
+- `ElementNotFoundError` (also a `LookupError`) and `ExpectationError` (also an
+  `AssertionError`), exported from `emunium`.
 
 ### Changed
 

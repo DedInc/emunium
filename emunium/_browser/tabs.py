@@ -13,6 +13,7 @@ from typing import Any
 
 from emunium._browser.context import BrowserContext
 from emunium.errors import BridgeProtocolError, InvalidArgumentError, TargetClosedError
+from emunium.results import Record, TabInfo
 
 logger = logging.getLogger("emunium.browser")
 
@@ -40,29 +41,29 @@ def pin_active(ctx: BrowserContext) -> int:
 
 def new_tab(
     ctx: BrowserContext, url: str = "about:blank", *, switch: bool = True
-) -> dict[str, Any]:
+) -> Record:
     """Open ``url`` in a new tab; with ``switch`` it is activated and pinned."""
     ctx.mark_action()
     result = ctx.bridge.create_tab(url, active=switch)
     if switch:
         pin_from(ctx, result, "createTab")
-    return result
+    return Record(result)
 
 
-def switch_to_tab(ctx: BrowserContext, tab_id: int) -> dict[str, Any]:
+def switch_to_tab(ctx: BrowserContext, tab_id: int) -> Record:
     """Activate ``tab_id`` (focusing its window) and pin it."""
     if isinstance(tab_id, bool) or not isinstance(tab_id, int):
         raise InvalidArgumentError(f"tab_id must be an int, got {tab_id!r}")
     result = ctx.bridge.activate_tab(tab_id=tab_id)
     ctx.bridge.pinned_tab_id = tab_id
-    return result
+    return Record(result)
 
 
-def list_tabs(ctx: BrowserContext) -> list[dict[str, Any]]:
-    return ctx.bridge.list_tabs()
+def list_tabs(ctx: BrowserContext) -> list[TabInfo]:
+    return [TabInfo(tab) for tab in ctx.bridge.list_tabs()]
 
 
-def close_tab(ctx: BrowserContext, tab_id: int | None = None) -> dict[str, Any]:
+def close_tab(ctx: BrowserContext, tab_id: int | None = None) -> Record:
     """Close ``tab_id`` (``None``: the pinned tab).
 
     When that leaves nothing pinned, the active tab is pinned; when no tab is
@@ -74,8 +75,8 @@ def close_tab(ctx: BrowserContext, tab_id: int | None = None) -> dict[str, Any]:
             pin_active(ctx)
         except TargetClosedError as exc:
             logger.info("No tab left to pin after close_tab: %s", exc)
-    return result
+    return Record(result)
 
 
-def tab_info(ctx: BrowserContext) -> dict[str, Any]:
-    return ctx.bridge.get_tab_info()
+def tab_info(ctx: BrowserContext) -> TabInfo:
+    return TabInfo(ctx.bridge.get_tab_info())

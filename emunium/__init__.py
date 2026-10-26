@@ -39,7 +39,9 @@ from emunium.errors import (
     CommandTimeoutError,
     ContentUnavailableError,
     CSPBlockedError,
+    ElementNotFoundError,
     EmuniumError,
+    ExpectationError,
     InvalidArgumentError,
     LaunchError,
     NativeInputError,
@@ -51,6 +53,7 @@ from emunium.errors import (
     WaitTimeoutError,
 )
 from emunium.locator import Locator, PageParser
+from emunium.results import NetworkResponse, PageInfo, Point, Record, TabInfo
 from emunium.standalone import Emunium
 from emunium.wait import Wait, WaitStrategy
 
@@ -70,9 +73,11 @@ __all__ = [
     "ContentUnavailableError",
     "CoordsStore",
     "Element",
+    "ElementNotFoundError",
     "ElementRecord",
     "Emunium",
     "EmuniumError",
+    "ExpectationError",
     "FittsTiming",
     "InvalidArgumentError",
     "LaunchError",
@@ -83,12 +88,17 @@ __all__ = [
     "NativeInputError",
     "NavigationError",
     "NavigationTimeoutError",
+    "NetworkResponse",
     "Overshoot",
+    "PageInfo",
     "PageParser",
+    "Point",
+    "Record",
     "ScreenBounds",
     "ScriptError",
     "SigmaDriftPlanner",
     "StaleElementError",
+    "TabInfo",
     "TargetClosedError",
     "Tremor",
     "TypingRhythm",

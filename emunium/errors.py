@@ -3,36 +3,40 @@
 Contract: ``docs/architecture/python-internals.md`` (errors.py) and the error-code
 table in ``docs/architecture/bridge-protocol.md`` section 3.
 
-Every exception carries ``.message`` (also ``str(exc)``), ``.code`` and
-``.method``. ``CommandError`` subclasses default ``.code`` to the protocol code
+Every exception carries ``.message``, ``.code``, ``.method`` and ``.hint`` (a
+suggested next step, or None). ``str(exc)`` is the message, plus a
+``"\\nhint: ..."`` line when there is a hint (``docs/architecture/dx-api.md``
+section 2). ``CommandError`` subclasses default ``.code`` to the protocol code
 they represent; other classes default ``.code`` to ``None`` unless built by
 ``error_from_reply``.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Type
+from typing import Any, Dict, Optional, Type
 
 __all__ = [
-    "EmuniumError",
-    "BridgeError",
     "BridgeDisconnectedError",
-    "BridgeTimeoutError",
+    "BridgeError",
     "BridgeProtocolError",
+    "BridgeTimeoutError",
+    "CSPBlockedError",
+    "ClickVerificationError",
     "CommandError",
-    "StaleElementError",
-    "TargetClosedError",
-    "ContentUnavailableError",
-    "InvalidArgumentError",
     "CommandTimeoutError",
-    "WaitTimeoutError",
+    "ContentUnavailableError",
+    "ElementNotFoundError",
+    "EmuniumError",
+    "ExpectationError",
+    "InvalidArgumentError",
+    "LaunchError",
+    "NativeInputError",
     "NavigationError",
     "NavigationTimeoutError",
     "ScriptError",
-    "CSPBlockedError",
-    "NativeInputError",
-    "ClickVerificationError",
-    "LaunchError",
+    "StaleElementError",
+    "TargetClosedError",
+    "WaitTimeoutError",
     "error_from_reply",
 ]
 
@@ -40,28 +44,39 @@ __all__ = [
 class EmuniumError(Exception):
     """Base class for every emunium exception."""
 
-    default_code: Optional[str] = None
+    default_code: str | None = None
 
     def __init__(
         self,
         message: str = "",
-        code: Optional[str] = None,
-        method: Optional[str] = None,
+        code: str | None = None,
+        method: str | None = None,
+        *,
+        hint: str | None = None,
     ) -> None:
         message = "" if message is None else str(message)
         super().__init__(message)
         self.message = message
         self.code = self.default_code if code is None else code
         self.method = method
+        self.hint = hint
 
     def __str__(self) -> str:
         # OSError-derived subclasses (TimeoutError, ConnectionError) would
         # otherwise format their own errno/strerror text.
+        if self.hint:
+            return f"{self.message}\nhint: {self.hint}"
         return self.message
 
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[Any, ...]:
         # Keep code/method across pickling; the default only replays ``args``.
-        return (type(self), (self.message, self.code, self.method))
+        # The instance dict travels as state (BaseException.__setstate__): it
+        # restores the keyword-only hint and any attribute a subclass set.
+        return (
+            type(self),
+            (self.message, self.code, self.method),
+            dict(self.__dict__),
+        )
 
 
 # -- transport ---------------------------------------------------------------
@@ -147,6 +162,14 @@ class ClickVerificationError(NativeInputError):
 
 class LaunchError(EmuniumError, RuntimeError):
     """Chrome or the extension could not be started."""
+
+
+class ElementNotFoundError(EmuniumError, LookupError):
+    """A target resolved to no element to act on (still a ``LookupError``)."""
+
+
+class ExpectationError(EmuniumError, AssertionError):
+    """An ``expect()`` assertion did not hold in time (still an ``AssertionError``)."""
 
 
 # bridge-protocol.md section 3, "Error codes".

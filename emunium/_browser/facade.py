@@ -21,7 +21,8 @@ from emunium._motion import MotionPlanner, TypingRhythm
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.element import Element
-from emunium.errors import InvalidArgumentError, NativeInputError
+from emunium.errors import ElementNotFoundError, InvalidArgumentError, NativeInputError
+from emunium.results import NetworkResponse, PageInfo, Point, Record, TabInfo
 from emunium.wait import Wait, WaitStrategy
 
 if TYPE_CHECKING:
@@ -109,7 +110,7 @@ class Browser:
 
     def goto(
         self, url: str, *, timeout: float = 30.0, wait_until: str = "load"
-    ) -> dict[str, Any]:
+    ) -> PageInfo:
         return page.goto(self._ctx, url, timeout=timeout, wait_until=wait_until)
 
     def query_selector(self, selector: str) -> Element | None:
@@ -165,7 +166,9 @@ class Browser:
         el = dom.wait_for_element(self._ctx, target, timeout)
         if el is None:
             # Only an element-less match (e.g. a detached state) returns None.
-            raise LookupError(f"{target!r} matched without an element to act on")
+            raise ElementNotFoundError(
+                f"{target!r} matched without an element to act on"
+            )
         return el
 
     # -- native input -------------------------------------------------------
@@ -180,12 +183,10 @@ class Browser:
     ) -> Element:
         return self.click_at(selector, click_type, human=human, timeout=timeout)
 
-    def get_center(
-        self, target: str | Element, *, timeout: float = 10.0
-    ) -> dict[str, int]:
+    def get_center(self, target: str | Element, *, timeout: float = 10.0) -> Point:
         el = self._resolve_element(target, timeout=timeout)
         el.scroll_into_view()
-        return {"x": int(el.screen_x), "y": int(el.screen_y)}
+        return Point(x=int(el.screen_x), y=int(el.screen_y))
 
     def move_to(
         self,
@@ -310,7 +311,7 @@ class Browser:
         """JSON value of the script's completion value (``None`` for undefined)."""
         return page.execute_script(self._ctx, code)
 
-    def page_info(self) -> dict[str, Any]:
+    def page_info(self) -> PageInfo:
         return page.page_info(self._ctx)
 
     def scroll_to(
@@ -337,21 +338,19 @@ class Browser:
 
     # -- tabs ---------------------------------------------------------------
 
-    def new_tab(
-        self, url: str = "about:blank", *, switch: bool = True
-    ) -> dict[str, Any]:
+    def new_tab(self, url: str = "about:blank", *, switch: bool = True) -> Record:
         return tab_ops.new_tab(self._ctx, url, switch=switch)
 
-    def switch_to_tab(self, tab_id: int) -> dict[str, Any]:
+    def switch_to_tab(self, tab_id: int) -> Record:
         return tab_ops.switch_to_tab(self._ctx, tab_id)
 
-    def tabs(self) -> list[dict[str, Any]]:
+    def tabs(self) -> list[TabInfo]:
         return tab_ops.list_tabs(self._ctx)
 
-    def close_tab(self, tab_id: int | None = None) -> dict[str, Any]:
+    def close_tab(self, tab_id: int | None = None) -> Record:
         return tab_ops.close_tab(self._ctx, tab_id)
 
-    def tab_info(self) -> dict[str, Any]:
+    def tab_info(self) -> TabInfo:
         return tab_ops.tab_info(self._ctx)
 
     # -- network ------------------------------------------------------------
@@ -363,7 +362,7 @@ class Browser:
         *,
         since: float | None = None,
         any_tab: bool = False,
-    ) -> dict[str, Any] | None:
+    ) -> NetworkResponse | None:
         """First response matching ``url_pattern`` (glob) in the pinned tab.
 
         ``since`` (epoch ms) defaults to the start of the last action, so a
