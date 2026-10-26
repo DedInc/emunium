@@ -863,6 +863,91 @@ def test_keyboard_package_needs_root_on_posix(monkeypatch):
     assert ei._usable_keyboard_module("darwin") is None
 
 
+class UnicodeGui(FakeGui):
+    """A backend that declares native Unicode typing (X11, win32)."""
+
+    supports_unicode_write = True
+
+
+def test_native_unicode_backend_types_every_character_itself():
+    keyboard_log = []
+    clipboard = FakeClipboard()
+    interactor, gui, sleep, log = make(
+        "linux",
+        gui=UnicodeGui(),
+        keyboard=FakeKeyboard(keyboard_log),
+        clipboard=clipboard,
+    )
+    interactor.type_text("aпр\U0001f600 中\n\t!", human=False)
+    assert [e for e in log if e[0] != "sleep"] == [
+        ("write", "a"),
+        ("write", "п"),
+        ("write", "р"),
+        ("write", "\U0001f600"),
+        ("write", " "),
+        ("write", "中"),
+        ("press", "enter"),
+        ("press", "tab"),
+        ("write", "!"),
+    ]
+    assert keyboard_log == [] and clipboard.log == [] and sleep.calls == []
+    assert all(p is False for p in gui.pauses)
+
+
+def test_native_unicode_typing_keeps_the_per_character_rhythm():
+    seen = []
+
+    class Recording(TypingRhythm):
+        def interval(self, typed, upcoming, rng):
+            seen.append((typed, upcoming))
+            return 0.1
+
+    interactor, _, _, log = make(
+        "linux", gui=UnicodeGui(), keyboard=None, typing=Recording()
+    )
+    interactor.type_text("éж\nb")
+    assert log == [
+        ("write", "é"),
+        ("sleep", 0.1),
+        ("write", "ж"),
+        ("sleep", 0.1),
+        ("press", "enter"),
+        ("sleep", 0.1),
+        ("write", "b"),
+        ("sleep", 0.1),
+    ]
+    assert seen == [("é", "ж"), ("ж", "\n"), ("\n", "b"), ("b", None)]
+
+
+def test_native_unicode_backend_still_pastes_control_characters():
+    clipboard = FakeClipboard()
+    interactor, _, _, log = make(
+        "linux", gui=UnicodeGui(), keyboard=None, clipboard=clipboard
+    )
+    interactor.type_text("ä\x07\x1bö", human=False)
+    assert ("copy", "\x07\x1b") in clipboard.log
+    writes = [e for e in log if e[0] == "write"]
+    assert writes == [("write", "ä"), ("write", "ö")]
+
+
+class DeclaringGui(FakeGui):
+    def __init__(self, declared):
+        super().__init__()
+        self.supports_unicode_write = declared
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("declared", [None, False, 1, "yes"])
+def test_unicode_capability_must_be_declared_true(platform, declared):
+    # pyautogui (macOS) declares nothing: non-ASCII text keeps the paste path.
+    gui = FakeGui() if declared is None else DeclaringGui(declared)
+    clipboard = FakeClipboard()
+    interactor, _, _, log = make(platform, gui=gui, keyboard=None, clipboard=clipboard)
+    interactor.type_text("ü", human=False)
+    assert ("copy", "ü") in clipboard.log
+    assert ("write", "ü") not in log
+
+
 # -- clipboard restore rule ----------------------------------------------------
 
 

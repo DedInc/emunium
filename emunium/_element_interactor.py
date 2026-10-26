@@ -18,6 +18,7 @@ import random
 import sys
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
@@ -84,6 +85,8 @@ _CLICK_TYPES = {
     ClickType.DOUBLE: ("left", 2),
 }
 _UNSET: Any = object()
+# Control characters and lone surrogates: no backend types them as keystrokes.
+_UNTYPEABLE_CATEGORIES = ("Cc", "Cs")
 # winmm's success code for timeBeginPeriod.
 _TIMERR_NOERROR = 0
 
@@ -729,17 +732,37 @@ class ElementInteractor:
             self._pace(rhythm, stroke, upcoming)
 
     @staticmethod
-    def _is_pyautogui_stroke(stroke: str) -> bool:
-        return stroke in ("\n", "\t") or (stroke.isascii() and stroke.isprintable())
+    def _writes_unicode(gui: Any) -> bool:
+        """True when the backend declares it types any Unicode character itself.
+
+        Only an explicit ``supports_unicode_write = True`` counts: pyautogui
+        lacks the attribute, and a truthy stand-in must not enable it.
+        """
+        return getattr(gui, "supports_unicode_write", False) is True
+
+    @staticmethod
+    def _is_backend_stroke(stroke: str, native_unicode: bool) -> bool:
+        """True when ``gui.write``/``gui.press`` can type ``stroke``.
+
+        pyautogui types printable ASCII only; a native Unicode backend types
+        every character except control characters and lone surrogates.
+        """
+        if stroke in ("\n", "\t"):
+            return True
+        if native_unicode:
+            return unicodedata.category(stroke) not in _UNTYPEABLE_CATEGORIES
+        return stroke.isascii() and stroke.isprintable()
 
     def _type_posix(self, text: str, rhythm: TypingRhythm | None) -> None:
         gui = self._gui()
+        native_unicode = self._writes_unicode(gui)
         strokes = split_strokes(text)
         index = 0
         while index < len(strokes):
             stroke = strokes[index]
-            if self._is_pyautogui_stroke(stroke):
-                # pyautogui presses and releases in one call: no dwell between.
+            if self._is_backend_stroke(stroke, native_unicode):
+                # One write per keystroke, press and release in one call (no
+                # dwell between), so every character gets its own wait.
                 if stroke == "\n":
                     gui.press("enter", _pause=False)
                 elif stroke == "\t":
@@ -751,8 +774,8 @@ class ElementInteractor:
                 index += 1
                 continue
             run_end = index
-            while run_end < len(strokes) and not self._is_pyautogui_stroke(
-                strokes[run_end]
+            while run_end < len(strokes) and not self._is_backend_stroke(
+                strokes[run_end], native_unicode
             ):
                 run_end += 1
             following = strokes[run_end] if run_end < len(strokes) else None
@@ -762,7 +785,7 @@ class ElementInteractor:
     def _type_other(
         self, chunk: str, rhythm: TypingRhythm | None, following: str | None
     ) -> None:
-        """Characters pyautogui cannot type: ``keyboard`` package, else paste.
+        """Characters the backend cannot type: ``keyboard`` package, else paste.
 
         ``following`` is the keystroke after ``chunk`` (None at the end).
         """
