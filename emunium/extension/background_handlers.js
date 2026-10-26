@@ -565,7 +565,9 @@
     let fn = compiled;
     if (typeof fn !== "function") {
       try {
-        fn = new Function(code);
+        // Async so the body may `await`; under a CSP this constructor throws EvalError too.
+        const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+        fn = new AsyncFunction(code);
       } catch (error) {
         const message = String((error && error.message) || error);
         if (
@@ -621,7 +623,7 @@
   }
 
   function userScriptSource(code) {
-    return `(${runPageScript.toString()})(null, function () {\n${code}\n})`;
+    return `(${runPageScript.toString()})(null, async function () {\n${code}\n})`;
   }
 
   async function runViaUserScripts(tabId, code) {

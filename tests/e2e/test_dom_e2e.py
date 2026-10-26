@@ -430,17 +430,6 @@ def test_execute_script_json_conversion(browser: Browser, site_url: str) -> None
         browser.execute_script("throw new Error('kaput')")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ScriptError,
-    reason=(
-        "product defect: README 'JavaScript execution' shows "
-        "execute_script(\"const r = await fetch('/api/me'); return r.json();\"), but "
-        "background_handlers.js compiles the body with new Function(code) (not "
-        "async), so a top-level await raises ScriptError 'await is only valid in "
-        "async functions'"
-    ),
-)
 def test_execute_script_body_may_await(browser: Browser, site_url: str) -> None:
     browser.goto(site_url + "/index.html")
 

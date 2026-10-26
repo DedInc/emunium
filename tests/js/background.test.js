@@ -914,6 +914,21 @@ test("executeScript runs in MAIN world, awaits promises and converts results to 
   assert.deepEqual(nothing.result, { value: null });
 });
 
+test("executeScript: the body may await (compiled as an async function)", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  w.chrome.scripting.executeScript = pageExecutor(w.chrome);
+  const awaited = await request(ws, "executeScript", {
+    code: "const r = await new Promise((done) => setTimeout(() => done({ pong: true }), 5)); return r;",
+  });
+  assert.equal(awaited.ok, true, JSON.stringify(awaited));
+  assert.deepEqual(awaited.result, { value: { pong: true } });
+  const rejected = await request(ws, "executeScript", { code: "await Promise.reject(new RangeError('later'));" });
+  assert.deepEqual(rejected.error, { code: "script_error", message: "RangeError: later" });
+  const hung = await request(ws, "executeScript", { code: "await new Promise(() => {});", timeoutMs: 30 });
+  assert.equal(hung.error.code, "timeout");
+});
+
 test("executeScript: hostile values become [Unserializable] instead of throwing", async (t) => {
   const w = makeWorker(t);
   const ws = await welcomed();
@@ -1040,6 +1055,9 @@ test("executeScript CSP path: userScripts.execute fallback, else csp_blocked", a
 
   const failing = await request(ws, "executeScript", { code: "throw new Error('inner');" });
   assert.deepEqual(failing.error, { code: "script_error", message: "Error: inner" });
+  const awaited = await request(ws, "executeScript", { code: "const v = await Promise.resolve(6); return v * 7;" });
+  assert.equal(awaited.ok, true, JSON.stringify(awaited));
+  assert.deepEqual(awaited.result, { value: 42 });
 
   w.chrome.userScripts.execute = h.spy(async () => {
     throw new Error("userScripts is not enabled");
