@@ -131,6 +131,18 @@ observe; they are listed first.
   that deliver no pointer events.
 - `ElementNotFoundError` (also a `LookupError`) and `ExpectationError` (also an
   `AssertionError`), exported from `emunium`.
+- `Wait` operators: `a | b`, `a & b` and `~a` build a new `Wait` with the
+  conditions of `Wait().any_of(a, b)`, `Wait().all_of(a, b)` and
+  `Wait().not_(a)`; the operands are left unchanged.
+- Keyword-only `strategy=` and `condition=` on `wait_for_xpath` and
+  `wait_for_text`, with the same meaning as in `Browser.wait`.
+- `Browser.wait_for_url(url, *, timeout=30.0, wait_until="load")`: waits until
+  the pinned tab's URL matches a glob (the `wait_for_response` syntax), a
+  compiled `re.Pattern` or a predicate, then for the `wait_until` state; it
+  returns the URL and raises `NavigationTimeoutError` naming the last URL seen.
+- `Browser.expect_navigation(url=None, *, timeout=30.0, wait_until="load")`
+  context manager: on exit, waits until the URL changes (and matches `url`
+  when given) and the page has loaded; `.value` is the new `PageInfo`.
 
 ### Changed
 

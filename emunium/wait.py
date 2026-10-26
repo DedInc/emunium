@@ -121,5 +121,24 @@ class Wait:
         """A deep copy: mutating the payload never changes this builder."""
         return copy.deepcopy(self._conditions)
 
+    # Operators build a new Wait from deep copies of both payloads, so neither
+    # operand changes and later edits to an operand never reach the result.
+
+    def __or__(self, other: object) -> Wait:
+        """``a | b``: a new ``Wait().any_of(a, b)``."""
+        if not isinstance(other, Wait):
+            return NotImplemented
+        return Wait().any_of(self, other)
+
+    def __and__(self, other: object) -> Wait:
+        """``a & b``: a new ``Wait().all_of(a, b)``."""
+        if not isinstance(other, Wait):
+            return NotImplemented
+        return Wait().all_of(self, other)
+
+    def __invert__(self) -> Wait:
+        """``~a``: a new ``Wait().not_(a)``."""
+        return Wait().not_(self)
+
     def __repr__(self) -> str:
         return f"Wait(conditions={self._conditions})"

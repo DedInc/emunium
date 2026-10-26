@@ -214,12 +214,14 @@ browser.scroll_to(x, y)                 # scroll the page to absolute CSS pixel 
 
 ```python
 browser.wait_for_element(selector, timeout=10.0)  # CSS
-browser.wait_for_xpath(xpath, timeout=10.0)
-browser.wait_for_text(text, timeout=10.0)
+browser.wait_for_xpath(xpath, timeout=10.0, *, strategy=None, condition=None)
+browser.wait_for_text(text, timeout=10.0, *, strategy=None, condition=None)
 ```
 
 Each returns an `Element` and raises `WaitTimeoutError` (a `TimeoutError`)
 when nothing matched in time; see [Errors](#errors) for its message and hint.
+`strategy` and `condition` on the XPath and text waits mean what they mean in
+`browser.wait` below.
 
 ### Waits with conditions
 
@@ -291,6 +293,57 @@ browser.wait(
 # Until the button is no longer disabled
 browser.wait("#submit", condition=Wait().not_(Wait().has_attribute("disabled")))
 ```
+
+The operators `|` (any of), `&` (all of) and `~` (not) build the same groups.
+Each returns a new `Wait` and leaves its operands unchanged:
+
+```python
+done = Wait().has_class("success-loaded") | Wait().text_contains("Verify you are human")
+browser.wait("body", condition=done, timeout=15)
+
+enabled = ~Wait().has_attribute("disabled")
+browser.wait("#submit", condition=Wait().visible() & enabled)
+browser.wait_for_text("Saved", strategy=WaitStrategy.VISIBLE, condition=~Wait().hidden())
+```
+
+The extension checks the conditions on the first element the selector
+matches, in document order.
+
+### Waiting for a URL or a navigation
+
+```python
+import re
+
+browser.wait_for_url("*/dashboard*", timeout=30.0, wait_until="load")  # -> the URL
+browser.wait_for_url(re.compile(r"/orders/\d+$"))     # re.Pattern: search()
+browser.wait_for_url(lambda url: "#done" in url)      # any predicate
+```
+
+`wait_for_url` polls the pinned tab's URL every 100 ms until it matches, then
+waits for the `wait_until` state (`"commit"`, `"domcontentloaded"` or
+`"load"`, as in `goto`) and returns the URL. The glob is the
+`wait_for_response` syntax: only `*` is a wildcard and the whole URL must
+match. URL changes without a new document (`history.pushState`, a new
+`#hash`) count too. Pages without a content script (the PDF viewer, Chrome
+error pages) count as loaded once the tab's status is `"complete"`. When the
+time runs out it raises `NavigationTimeoutError` (a `TimeoutError`) with the
+last URL seen and, if the URL matched, the last load state seen.
+
+```python
+with browser.expect_navigation() as navigation:
+    browser.click("a.next-page")
+print(navigation.value.url, navigation.value.title)   # PageInfo of the new page
+
+with browser.expect_navigation("*/checkout", timeout=15):
+    browser.click("#buy")
+```
+
+`expect_navigation` records the tab and its URL when the block starts. When
+the block ends without an error, it waits until the URL differs from that one
+(and also matches `url` when given) and the `wait_until` state is reached;
+`.value` is then the `PageInfo` of the page (reading it earlier raises
+`RuntimeError`). A navigation back to the same URL, such as a reload, is not
+detected. When the block raises, nothing is awaited.
 
 ### Waits without an element
 

@@ -21,6 +21,7 @@ from emunium._bridge.facade import Bridge
 from emunium._browser.context import BrowserContext
 from emunium.element import Element, ElementQuery
 from emunium.errors import EmuniumError, WaitTimeoutError
+from emunium.wait import Wait, WaitStrategy
 
 logger = logging.getLogger("emunium.browser")
 
@@ -128,6 +129,25 @@ def _timeout_error(
     )
 
 
+def wait_arguments(
+    strategy: WaitStrategy | str | None, condition: Wait | list[dict] | None
+) -> tuple[str | None, list[dict[str, Any]] | None]:
+    """``(state, conditions)`` for ``waitForSelector``, as ``Browser.wait`` maps them.
+
+    A ``WaitStrategy`` becomes its value (other values pass through); a
+    ``Wait`` becomes its payload, a list is sent as given, anything else is
+    no conditions.
+    """
+    state = strategy.value if isinstance(strategy, WaitStrategy) else strategy
+    if isinstance(condition, Wait):
+        conditions = condition.to_payload()
+    elif isinstance(condition, list):
+        conditions = condition
+    else:
+        conditions = None
+    return state, conditions
+
+
 def query_selector(ctx: ContextOrBridge, selector: str) -> Element | None:
     context = BrowserContext.of(ctx)
     data = context.bridge.query_selector(selector)
@@ -210,13 +230,20 @@ def wait_for_xpath(
     xpath: str,
     timeout: float = 10.0,
     raise_on_timeout: bool = True,
+    *,
+    strategy: WaitStrategy | str | None = None,
+    condition: Wait | list[dict] | None = None,
 ) -> Element | None:
+    """``strategy``/``condition`` mean what they mean in ``Browser.wait``."""
+    state, conditions = wait_arguments(strategy, condition)
     return _wait(
         BrowserContext.of(ctx),
         xpath,
         "xpath",
         timeout,
         what="XPath",
+        state=state,
+        conditions=conditions,
         raise_on_timeout=raise_on_timeout,
     )
 
@@ -226,13 +253,20 @@ def wait_for_text(
     text: str,
     timeout: float = 10.0,
     raise_on_timeout: bool = True,
+    *,
+    strategy: WaitStrategy | str | None = None,
+    condition: Wait | list[dict] | None = None,
 ) -> Element | None:
+    """``strategy``/``condition`` mean what they mean in ``Browser.wait``."""
+    state, conditions = wait_arguments(strategy, condition)
     return _wait(
         BrowserContext.of(ctx),
         text,
         "text",
         timeout,
         what="Text",
+        state=state,
+        conditions=conditions,
         raise_on_timeout=raise_on_timeout,
     )
 

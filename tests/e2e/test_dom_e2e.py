@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -407,6 +408,123 @@ def test_network_wait_since_ignores_earlier_responses(
     with browser.expect_response("*/api/ping.json?n=2", timeout=5) as response:
         browser.execute_script("fetch('/api/ping.json?n=2'); return null")
     assert response.value["statusCode"] == 200
+
+
+# -- URL and navigation waits -------------------------------------------------------
+
+# Clicks a link through the DOM (no OS input) after the script has returned.
+CLICK_LINK_JS = (
+    "setTimeout(() => {{ const a = document.createElement('a');"
+    " a.href = {href!r}; document.body.appendChild(a); a.click(); }}, 150);"
+    " return null"
+)
+
+
+def test_wait_for_url_after_a_dom_link_click(browser: Browser, site_url: str) -> None:
+    browser.goto(site_url + "/index.html")
+
+    browser.execute_script(CLICK_LINK_JS.format(href="/slow_load.html"))
+    found = browser.wait_for_url("*/slow_load.html", timeout=10)
+
+    assert found == site_url + "/slow_load.html"
+    assert browser.page_info().ready_state == "complete"
+    assert browser.url == found
+
+
+def test_wait_for_url_sees_push_state_regex_and_predicate(
+    browser: Browser, site_url: str
+) -> None:
+    browser.goto(site_url + "/index.html")
+
+    browser.execute_script(
+        "setTimeout(() => history.pushState({}, '', '/pushed?step=2'), 150)"
+    )
+    found = browser.wait_for_url(re.compile(r"/pushed\?step=2$"), timeout=5)
+    assert found == site_url + "/pushed?step=2"
+    # Same document: the page is not reloaded.
+    assert browser.query_selector("#heading") is not None
+
+    browser.execute_script("setTimeout(() => { location.hash = 'done'; }, 150)")
+    found = browser.wait_for_url(lambda url: url.endswith("#done"), timeout=5)
+    assert found == site_url + "/pushed?step=2#done"
+
+
+def test_expect_navigation_around_a_script_navigation(
+    browser: Browser, site_url: str
+) -> None:
+    browser.goto(site_url + "/index.html")
+
+    with browser.expect_navigation(timeout=10) as navigation:
+        browser.execute_script(
+            "setTimeout(() => location.assign('/other.html'), 150); return null"
+        )
+    assert navigation.value.url == site_url + "/other.html"
+    assert navigation.value.title == "E2E Other"
+    assert navigation.value.ready_state == "complete"
+
+    with browser.expect_navigation("*/index.html?via=link", timeout=10) as by_glob:
+        browser.execute_script(CLICK_LINK_JS.format(href="/index.html?via=link"))
+    assert by_glob.value.title == "E2E Index"
+    assert browser.url == site_url + "/index.html?via=link"
+
+
+def test_expect_navigation_from_a_page_that_already_matches(
+    browser: Browser, site_url: str
+) -> None:
+    browser.goto(site_url + "/other.html")
+
+    # Both URLs match the glob: only the change to the second one counts.
+    with browser.expect_navigation("*/*.html", timeout=10) as navigation:
+        browser.execute_script(
+            "setTimeout(() => location.assign('/index.html'), 300); return null"
+        )
+    assert navigation.value.url == site_url + "/index.html"
+    assert navigation.value.title == "E2E Index"
+    assert navigation.value.ready_state == "complete"
+
+    with (
+        pytest.raises(NavigationTimeoutError) as info,
+        browser.expect_navigation("*/*.html", timeout=1),
+    ):
+        browser.execute_script("return 1")
+    assert f"(last url: {site_url}/index.html)" in str(info.value)
+
+
+def test_xpath_and_text_waits_with_strategy_and_condition(
+    browser: Browser, site_url: str
+) -> None:
+    browser.goto(site_url + "/index.html")
+
+    beta = browser.wait_for_xpath(
+        "//ul[@id='list']/li[2]",
+        timeout=5,
+        strategy=WaitStrategy.VISIBLE,
+        condition=Wait().text_contains("beta") | Wait().text_contains("zeta"),
+    )
+    assert beta is not None and beta.text == "beta"
+    late = browser.wait_for_text(
+        "arrived late", timeout=5, condition=Wait().visible() & ~Wait().hidden()
+    )
+    assert late is not None and late.get_attribute("id") == "late"
+    with pytest.raises(WaitTimeoutError) as info:
+        browser.wait_for_text("hidden but attached", 1, strategy=WaitStrategy.VISIBLE)
+    assert info.value.hint is not None and "state 'visible'" in info.value.hint
+
+
+def test_url_waits_time_out_with_the_last_url(browser: Browser, site_url: str) -> None:
+    browser.goto(site_url + "/index.html")
+
+    started = time.monotonic()
+    with pytest.raises(NavigationTimeoutError) as info:
+        browser.wait_for_url("*/never.html", timeout=1)
+    assert time.monotonic() - started < 4.0
+    assert isinstance(info.value, TimeoutError)
+    assert f"(last url: {site_url}/index.html)" in str(info.value)
+
+    with pytest.raises(NavigationTimeoutError), browser.expect_navigation(timeout=1):
+        browser.execute_script("return 1")
+    with pytest.raises(InvalidArgumentError):
+        browser.wait_for_url("*", wait_until="networkidle")
 
 
 # -- scripts ----------------------------------------------------------------------

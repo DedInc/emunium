@@ -11,8 +11,10 @@ from __future__ import annotations
 import copy
 import json
 import pickle
+import re
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -25,16 +27,18 @@ from emunium._standalone.config import ClickType
 from emunium.element import Element
 from emunium.errors import (
     BridgeProtocolError,
+    BridgeTimeoutError,
     ContentUnavailableError,
     ElementNotFoundError,
     InvalidArgumentError,
     LaunchError,
     NativeInputError,
+    NavigationTimeoutError,
     TargetClosedError,
     WaitTimeoutError,
 )
 from emunium.results import NetworkResponse, PageInfo, Point, Record, TabInfo
-from emunium.wait import Wait
+from emunium.wait import Wait, WaitStrategy
 
 ELEMENT = {
     "elementId": "doc1.1",
@@ -750,3 +754,401 @@ def test_headless_refusal_carries_a_hint(make: Callable[..., Browser]) -> None:
         make(headless=True).click("#go")
     assert info.value.hint is not None and "headless=False" in info.value.hint
     assert "\nhint: launch with headless=False" in str(info.value)
+
+
+# -- xpath/text strategy and condition, URL and navigation waits (section 3) ------
+
+
+def _sent(call: Call) -> dict[str, Any]:
+    return {key: call.params.get(key) for key in ("type", "state", "conditions")}
+
+
+def test_xpath_and_text_waits_send_strategy_and_condition(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    browser = make()
+    either = Wait().visible() | Wait().text_contains("ok")
+
+    assert browser.wait_for_xpath("//a", 2.0) is not None
+    assert _sent(transport.last("waitForSelector")) == {
+        "type": "xpath",
+        "state": None,
+        "conditions": None,
+    }
+    browser.wait_for_xpath("//a", strategy=WaitStrategy.CLICKABLE, condition=either)
+    assert _sent(transport.last("waitForSelector")) == {
+        "type": "xpath",
+        "state": "clickable",
+        "conditions": either.to_payload(),
+    }
+    browser.wait_for_text("Go", 3.0, condition=[{"type": "visible"}])
+    sent = transport.last("waitForSelector")
+    assert _sent(sent) == {
+        "type": "text",
+        "state": None,
+        "conditions": [{"type": "visible"}],
+    }
+    browser.wait_for_text("Go", strategy=WaitStrategy.STABLE, condition=~either)
+    assert _sent(transport.last("waitForSelector")) == {
+        "type": "text",
+        "state": "stable",
+        "conditions": [{"type": "not", "condition": either.to_payload()}],
+    }
+    # The same mapping as Browser.wait, which the operators feed too.
+    browser.wait("#go", WaitStrategy.VISIBLE, either & Wait().clickable())
+    assert transport.last("waitForSelector").params["conditions"] == [
+        {
+            "type": "all_of",
+            "conditions": [either.to_payload(), [{"type": "clickable"}]],
+        }
+    ]
+
+
+def test_xpath_timeout_hint_names_the_requested_state(
+    make: Callable[..., Browser], transport: FakeTransport
+) -> None:
+    transport.handlers["waitForSelector"] = _raise(
+        WaitTimeoutError('t (url: https://a.test/, title: "A")')
+    )
+    transport.handlers["queryXPath"] = [ELEMENT]
+    with pytest.raises(WaitTimeoutError) as info:
+        make().wait_for_xpath("//a", 1.0, strategy=WaitStrategy.VISIBLE)
+    assert info.value.hint == "1 element(s) match but none satisfied state 'visible'"
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """page's monotonic clock; page._sleep advances it instead of sleeping."""
+    now = [1000.0]
+
+    def sleep(seconds: float) -> None:
+        # Rounded: ten 0.1 s polls end exactly on a 1 s deadline.
+        now[0] = round(now[0] + seconds, 9)
+
+    monkeypatch.setattr(page, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(page, "_sleep", sleep)
+    return now
+
+
+PageStep = str | tuple[str, str] | BaseException
+
+
+class FakeTab:
+    """Scripted getTabInfo/pageInfo replies of one tab (the last entry stays).
+
+    Each getTabInfo call reports the next of ``urls`` and ``statuses``; each
+    pageInfo call reports the next of ``states``: a readyState of the document
+    at the current tab URL, a ``(readyState, url)`` pair for a document at
+    another URL, or an exception to raise.
+    """
+
+    def __init__(
+        self,
+        transport: FakeTransport,
+        urls: list[str],
+        states: list[PageStep] | None = None,
+        statuses: list[str] | None = None,
+    ) -> None:
+        self.urls = list(urls)
+        self.states: list[PageStep] = list(states or ["complete"])
+        self.statuses = list(statuses or ["complete"])
+        self.url = self.urls[0]
+        transport.handlers["getTabInfo"] = self.tab_info
+        transport.handlers["pageInfo"] = self.page_info
+
+    @staticmethod
+    def _next(steps: list[Any]) -> Any:
+        return steps.pop(0) if len(steps) > 1 else steps[0]
+
+    def tab_info(self, params: Any, tab: Any) -> dict[str, Any]:
+        self.url = self._next(self.urls)
+        status = self._next(self.statuses)
+        return {"tabId": tab, "url": self.url, "title": "T", "status": status}
+
+    def page_info(self, params: Any, tab: Any) -> dict[str, Any]:
+        step = self._next(self.states)
+        if isinstance(step, BaseException):
+            raise step
+        state, url = step if isinstance(step, tuple) else (step, self.url)
+        return {"url": url, "title": "T", "readyState": state}
+
+
+def _timeouts(transport: FakeTransport, method: str) -> list[float]:
+    return [call.timeout for call in transport.calls if call.method == method]
+
+
+def test_wait_for_url_glob_polls_the_pinned_tab_then_waits_for_load(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    FakeTab(
+        transport,
+        ["https://a.test/", "https://a.test/", "https://a.test/next?id=1"],
+        [
+            ContentUnavailableError("swapping"),
+            ("complete", "https://a.test/"),  # the old document still answers
+            "loading",
+            "complete",
+        ],
+        statuses=["loading"],
+    )
+    browser = make()
+    browser.bridge.pinned_tab_id = 4
+
+    assert browser.wait_for_url("*/next?id=1") == "https://a.test/next?id=1"
+    assert {call.tab for call in transport.calls} == {4}
+    assert transport.methods().count("pageInfo") == 4
+    # Every call is capped at the time left of the 30 s deadline.
+    assert _timeouts(transport, "getTabInfo") == pytest.approx(
+        [30.0, 29.9, 29.8, 29.7, 29.6, 29.5]
+    )
+    assert _timeouts(transport, "pageInfo") == pytest.approx([29.8, 29.7, 29.6, 29.5])
+    assert clock[0] == pytest.approx(1000.5)
+
+
+@pytest.mark.parametrize(
+    ("wait_until", "page_info_calls"),
+    [("commit", 0), ("domcontentloaded", 1), ("load", 2)],
+)
+def test_wait_for_url_wait_until_selects_the_ready_state(
+    make: Callable[..., Browser],
+    transport: FakeTransport,
+    clock: list[float],
+    wait_until: str,
+    page_info_calls: int,
+) -> None:
+    FakeTab(transport, ["https://a.test/done"], ["interactive", "complete"])
+    found = make().wait_for_url(re.compile(r"/done$"), wait_until=wait_until)
+    assert found == "https://a.test/done"
+    assert transport.methods().count("pageInfo") == page_info_calls
+
+
+def test_wait_for_url_regex_searches_and_predicate_receives_each_url(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    FakeTab(transport, ["https://a.test/", "https://b.test/x"])
+    browser = make()
+    assert browser.wait_for_url(re.compile("b\\.test")) == "https://b.test/x"
+
+    seen: list[str] = []
+
+    def is_b(url: str) -> bool:
+        seen.append(url)
+        return url.startswith("https://b.")
+
+    assert browser.wait_for_url(is_b, wait_until="commit") == "https://b.test/x"
+    assert seen == ["https://b.test/x"]
+
+
+def test_wait_for_url_timeout_names_the_last_url_and_the_state(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    FakeTab(transport, ["https://a.test/1", "https://a.test/2"], ["loading"])
+    browser = make()
+    with pytest.raises(TimeoutError) as info:
+        browser.wait_for_url("*/never", timeout=1.0)
+    error = info.value
+    assert isinstance(error, NavigationTimeoutError)
+    assert error.code == "navigation_timeout"
+    assert error.message == (
+        "URL did not match '*/never' within 1.0s (last url: https://a.test/2)"
+    )
+    assert clock[0] == pytest.approx(1001.0)
+    assert "pageInfo" not in transport.methods()
+    assert max(_timeouts(transport, "getTabInfo")) == pytest.approx(1.0)
+    assert min(_timeouts(transport, "getTabInfo")) == pytest.approx(0.1)
+
+    with pytest.raises(NavigationTimeoutError) as info:
+        browser.wait_for_url("*/2", timeout=0.5)
+    assert info.value.message == (
+        "URL did match '*/2' but readyState never reached 'load' within 0.5s "
+        "(last state: 'loading', last url: https://a.test/2)"
+    )
+
+
+def test_wait_for_url_retries_bridge_timeouts_until_its_own_deadline(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    tab = FakeTab(transport, ["https://a.test/done"])
+    pending = [BridgeTimeoutError("no reply to pageInfo")]
+
+    def page_info(params: Any, tab_id: Any) -> dict[str, Any]:
+        clock[0] += 0.3
+        if pending:
+            raise pending.pop()
+        return tab.page_info(params, tab_id)
+
+    transport.handlers["pageInfo"] = page_info
+    browser = make()
+    assert browser.wait_for_url("*/done", timeout=5.0) == "https://a.test/done"
+    assert transport.methods().count("pageInfo") == 2
+
+    def blocked(params: Any, tab_id: Any) -> dict[str, Any]:
+        # The call uses up all the time it was given, then times out.
+        clock[0] += transport.calls[-1].timeout
+        raise BridgeTimeoutError("no reply to getTabInfo")
+
+    transport.handlers["getTabInfo"] = blocked
+    transport.calls.clear()
+    with pytest.raises(NavigationTimeoutError) as info:
+        browser.wait_for_url("*/done", timeout=2.0)
+    assert info.value.message == (
+        "URL did not match '*/done' within 2.0s (last url: None)"
+    )
+    assert _timeouts(transport, "getTabInfo") == [2.0]
+
+
+def test_wait_for_url_falls_back_to_tab_status_without_page_info(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    # A PDF viewer or chrome-error page never gets a content script.
+    unavailable = ContentUnavailableError("no content script")
+    pdf = "https://a.test/doc.pdf"
+    FakeTab(
+        transport,
+        ["https://a.test/", pdf],
+        [unavailable],
+        statuses=["complete", "loading", "complete"],
+    )
+    browser = make()
+    assert browser.wait_for_url("*.pdf") == pdf
+    assert transport.methods().count("getTabInfo") == 3
+    assert transport.methods().count("pageInfo") == 2
+
+    FakeTab(transport, [pdf], [unavailable], statuses=["loading"])
+    with pytest.raises(NavigationTimeoutError) as info:
+        browser.wait_for_url("*.pdf", timeout=0.5, wait_until="domcontentloaded")
+    assert info.value.message == (
+        "URL did match '*.pdf' but readyState never reached 'domcontentloaded' "
+        "within 0.5s (last state: pageInfo unavailable, tab status 'loading', "
+        f"last url: {pdf})"
+    )
+
+    FakeTab(transport, ["https://a.test/", pdf], [unavailable])
+    with browser.expect_navigation() as navigation:
+        pass
+    assert type(navigation.value) is PageInfo
+    assert navigation.value == {"url": pdf, "title": "T"}
+
+
+@pytest.mark.parametrize("method", ["getTabInfo", "pageInfo"])
+def test_wait_for_url_propagates_errors_that_are_not_transient(
+    make: Callable[..., Browser],
+    transport: FakeTransport,
+    clock: list[float],
+    method: str,
+) -> None:
+    FakeTab(transport, ["https://a.test/"])
+    transport.handlers[method] = _raise(TargetClosedError("gone"))
+    with pytest.raises(TargetClosedError):
+        make().wait_for_url("*")
+    assert transport.methods().count(method) == 1
+
+
+@pytest.mark.parametrize(
+    ("url", "wait_until"),
+    [("*", "networkidle"), ("*", "complete"), ("", "load"), (b"*", "load")],
+)
+def test_url_waits_validate_arguments_before_any_call(
+    make: Callable[..., Browser], transport: FakeTransport, url: Any, wait_until: str
+) -> None:
+    browser = make()
+    with pytest.raises(InvalidArgumentError):
+        browser.wait_for_url(url, wait_until=wait_until)
+    with pytest.raises(InvalidArgumentError):
+        browser.expect_navigation(url, wait_until=wait_until)
+    assert transport.calls == []
+
+
+def test_expect_navigation_waits_for_a_different_url_in_the_entry_tab(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    FakeTab(
+        transport,
+        ["https://a.test/", "https://a.test/", "https://a.test/next"],
+        [("loading", "https://a.test/"), "complete"],
+    )
+    browser = make()
+    browser.bridge.pinned_tab_id = 7
+
+    expectation = browser.expect_navigation()
+    assert repr(expectation) == (
+        "NavigationExpectation(url=None, timeout=30.0, wait_until='load')"
+    )
+    assert transport.calls == []  # neither construction nor repr does I/O
+    with pytest.raises(RuntimeError):
+        _ = expectation.value
+    with expectation as navigation:
+        assert transport.methods() == ["getTabInfo"]
+        browser.bridge.pinned_tab_id = 8  # an action in the block moves the pin
+        with pytest.raises(RuntimeError):
+            _ = navigation.value
+    assert type(navigation.value) is PageInfo
+    assert navigation.value == {
+        "url": "https://a.test/next",
+        "title": "T",
+        "readyState": "complete",
+    }
+    assert {call.tab for call in transport.calls} == {7}
+    # Entry, the old URL, then the new URL twice: its first pageInfo reply
+    # came from the old document.
+    assert transport.methods().count("getTabInfo") == 4
+
+
+def test_expect_navigation_with_url_needs_a_change_and_a_match(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    first, second = "https://a.test/a.html", "https://a.test/b.html"
+    # The start URL already matches the glob: it is not the navigation.
+    FakeTab(transport, [first, first, first, second])
+    browser = make()
+    with browser.expect_navigation("*/*.html") as navigation:
+        pass
+    assert navigation.value.url == second
+    assert transport.methods().count("getTabInfo") == 4
+
+    FakeTab(transport, [first])
+    with (
+        pytest.raises(NavigationTimeoutError) as info,
+        browser.expect_navigation("*/*.html", timeout=1.0),
+    ):
+        pass
+    assert info.value.message == (
+        f"URL did not change from {first!r} and match '*/*.html' within 1.0s "
+        f"(last url: {first})"
+    )
+
+    FakeTab(
+        transport,
+        ["https://a.test/", "https://a.test/redirecting", second],
+        ["complete"],
+    )
+    with browser.expect_navigation("*/b.html", timeout=5.0, wait_until="commit") as nav:
+        pass
+    assert nav.value.ready_state == "complete" and nav.value.url == second
+    assert repr(nav) == (
+        "NavigationExpectation(url='*/b.html', timeout=5.0, wait_until='commit')"
+    )
+
+
+def test_expect_navigation_timeout_and_errors_in_the_block(
+    make: Callable[..., Browser], transport: FakeTransport, clock: list[float]
+) -> None:
+    FakeTab(transport, ["https://a.test/"])
+    browser = make()
+    with (
+        pytest.raises(NavigationTimeoutError) as info,
+        browser.expect_navigation(timeout=1.0),
+    ):
+        pass
+    assert info.value.message == (
+        "URL did not change from 'https://a.test/' within 1.0s "
+        "(last url: https://a.test/)"
+    )
+
+    transport.calls.clear()
+    navigation = browser.expect_navigation()
+    with pytest.raises(KeyError), navigation:
+        raise KeyError("in the block")
+    assert transport.methods() == ["getTabInfo"]  # only the entry read
+    with pytest.raises(RuntimeError):
+        _ = navigation.value

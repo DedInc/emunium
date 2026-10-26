@@ -16,7 +16,11 @@ from emunium._browser import dom, page
 from emunium._browser import tabs as tab_ops
 from emunium._browser.context import BrowserContext
 from emunium._browser.launcher import BrowserSession, close, launch
-from emunium._browser.page import ResponseExpectation
+from emunium._browser.page import (
+    NavigationExpectation,
+    ResponseExpectation,
+    UrlMatcher,
+)
 from emunium._motion import MotionPlanner, TypingRhythm
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
@@ -122,11 +126,31 @@ class Browser:
     def wait_for_element(self, selector: str, timeout: float = 10.0) -> Element | None:
         return dom.wait_for_element(self._ctx, selector, timeout)
 
-    def wait_for_xpath(self, xpath: str, timeout: float = 10.0) -> Element | None:
-        return dom.wait_for_xpath(self._ctx, xpath, timeout)
+    def wait_for_xpath(
+        self,
+        xpath: str,
+        timeout: float = 10.0,
+        *,
+        strategy: WaitStrategy | None = None,
+        condition: Wait | list[dict] | None = None,
+    ) -> Element | None:
+        """First element matching ``xpath``; ``strategy``/``condition`` as in ``wait``."""
+        return dom.wait_for_xpath(
+            self._ctx, xpath, timeout, strategy=strategy, condition=condition
+        )
 
-    def wait_for_text(self, text: str, timeout: float = 10.0) -> Element | None:
-        return dom.wait_for_text(self._ctx, text, timeout)
+    def wait_for_text(
+        self,
+        text: str,
+        timeout: float = 10.0,
+        *,
+        strategy: WaitStrategy | None = None,
+        condition: Wait | list[dict] | None = None,
+    ) -> Element | None:
+        """First element containing ``text``; ``strategy``/``condition`` as in ``wait``."""
+        return dom.wait_for_text(
+            self._ctx, text, timeout, strategy=strategy, condition=condition
+        )
 
     def wait(
         self,
@@ -136,13 +160,7 @@ class Browser:
         timeout: float = 10.0,
         raise_on_timeout: bool = True,
     ) -> Element | None:
-        state = strategy.value if isinstance(strategy, WaitStrategy) else strategy
-        if isinstance(condition, Wait):
-            conditions = condition.to_payload()
-        elif isinstance(condition, list):
-            conditions = condition
-        else:
-            conditions = None
+        state, conditions = dom.wait_arguments(strategy, condition)
         return dom.wait_for_element(
             self._ctx,
             selector,
@@ -335,6 +353,36 @@ class Browser:
 
     def wait_for_idle(self, silence: float = 2.0, timeout: float = 30.0) -> bool:
         return page.wait_for_idle(self._ctx, silence, timeout)
+
+    def wait_for_url(
+        self, url: UrlMatcher, *, timeout: float = 30.0, wait_until: str = "load"
+    ) -> str:
+        """Wait until the pinned tab's URL matches ``url``; return that URL.
+
+        ``url`` is a glob (only ``*`` is a wildcard, as in ``wait_for_response``),
+        a compiled ``re.Pattern`` (``search``) or a ``Callable[[str], bool]``.
+        ``wait_until`` (``commit``, ``domcontentloaded``, ``load``) is the
+        document state reached afterwards, as in ``goto``. Raises
+        ``NavigationTimeoutError`` (a ``TimeoutError``) naming the last URL seen.
+        """
+        return page.wait_for_url(self._ctx, url, timeout=timeout, wait_until=wait_until)
+
+    def expect_navigation(
+        self,
+        url: UrlMatcher | None = None,
+        *,
+        timeout: float = 30.0,
+        wait_until: str = "load",
+    ) -> NavigationExpectation:
+        """``with browser.expect_navigation() as nav: ...``; then ``nav.value``.
+
+        On a clean exit, waits until the URL differs from the one on entry (and
+        matches ``url`` when given) and ``wait_until`` is reached; a navigation
+        to the same URL is not detected.
+        """
+        return NavigationExpectation(
+            self._ctx, url, timeout=timeout, wait_until=wait_until
+        )
 
     # -- tabs ---------------------------------------------------------------
 
