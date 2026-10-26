@@ -111,19 +111,25 @@
     }
   }
 
-  // Listeners are attached before the navigation starts; events for a tab id that
-  // is not bound yet (createTab) are buffered and replayed by bind().
-  // Only events after our own top-frame onBeforeNavigate count (commit, errors,
-  // redirects); same-document completions count only for the target URL. Everything
-  // else belongs to the previous page.
+  // Listeners are attached before the navigation starts; events are buffered until
+  // bind() (after tabs.update/create resolved) and then replayed in arrival order.
+  // Our navigation starts at the first top-frame onBeforeNavigate for the target URL
+  // (or the tab's pendingUrl) that arrived after issue(); only events after it count
+  // (commit, errors, redirects). Same-document completions count only for the target
+  // URL. Earlier onBeforeNavigates are pre-existing navigations (e.g. Chromium's start
+  // page still loading) that ours supersedes: their ERR_ABORTED is not our failure.
   function watchNavigation({ url, waitUntil, timeoutMs }) {
     let tabId = null;
+    let issued = false;
     let committed = false;
     let startedUrl = null;
     let done = false;
     const targetUrl = normalizeUrl(url);
+    const startUrls = new Set([targetUrl]);
     // Normalized URLs of our navigation: its start URL and every main-frame redirect target.
     const ownUrls = new Set();
+    // Current URLs of pre-existing navigations not yet ended by an error (one entry each).
+    const foreignUrls = [];
     const buffered = [];
     const listeners = [];
     let settle = null;
@@ -148,29 +154,44 @@
       settle(error, value);
     };
 
-    const handle = (kind, id, details) => {
+    const handle = (kind, id, details, afterIssue = issued) => {
       if (done) {
         return;
       }
       if (tabId === null) {
-        buffered.push([kind, id, details]);
+        buffered.push([kind, id, details, afterIssue]);
         return;
       }
       if (id !== tabId) {
         return;
       }
       switch (kind) {
-        case "before":
+        case "before": {
+          const beforeUrl = normalizeUrl(details.url);
           if (startedUrl === null) {
+            if (!afterIssue || !startUrls.has(beforeUrl)) {
+              foreignUrls.push(beforeUrl);
+              break;
+            }
             startedUrl = details.url;
           }
-          ownUrls.add(normalizeUrl(details.url));
+          // After our start, a further top-frame navigation (client redirect) is ours too.
+          ownUrls.add(beforeUrl);
           break;
-        case "redirect":
-          if (startedUrl !== null && typeof details.redirectUrl === "string") {
+        }
+        case "redirect": {
+          if (typeof details.redirectUrl !== "string") {
+            break;
+          }
+          const from = normalizeUrl(details.url);
+          const foreign = foreignUrls.indexOf(from);
+          if (foreign !== -1) {
+            foreignUrls[foreign] = normalizeUrl(details.redirectUrl);
+          } else if (startedUrl !== null && ownUrls.has(from)) {
             ownUrls.add(normalizeUrl(details.redirectUrl));
           }
           break;
+        }
         case "committed":
           if (startedUrl === null) {
             break; // a commit of the previous page's own navigation
@@ -199,6 +220,11 @@
           break;
         case "error": {
           const failedUrl = details.url;
+          const foreign = foreignUrls.indexOf(normalizeUrl(failedUrl));
+          if (foreign !== -1) {
+            foreignUrls.splice(foreign, 1); // a pre-existing navigation ended (superseded by ours)
+            break;
+          }
           if (startedUrl === null) {
             break; // our navigation has not started: the previous one failed
           }
@@ -264,10 +290,18 @@
 
     return {
       promise,
-      bind(id) {
+      // Call right before tabs.update/create: earlier navigations cannot be ours.
+      issue() {
+        issued = true;
+      },
+      // tab: the tabs.update/create result; its pendingUrl is our URL as Chrome canonicalized it.
+      bind(id, tab) {
+        if (tab && typeof tab.pendingUrl === "string" && tab.pendingUrl) {
+          startUrls.add(normalizeUrl(tab.pendingUrl));
+        }
         tabId = id;
-        for (const [kind, eventTabId, details] of buffered.splice(0)) {
-          handle(kind, eventTabId, details);
+        for (const [kind, eventTabId, details, afterIssue] of buffered.splice(0)) {
+          handle(kind, eventTabId, details, afterIssue);
         }
       },
       cancel() {
@@ -314,13 +348,15 @@
     ctx.tabId = tabId;
 
     const watcher = watchNavigation({ url, waitUntil, timeoutMs });
-    watcher.bind(tabId);
+    let updated;
     try {
-      await chrome.tabs.update(tabId, { url });
+      watcher.issue();
+      updated = await chrome.tabs.update(tabId, { url });
     } catch (error) {
       watcher.cancel();
       throw navigationApiError(error, tabId, url);
     }
+    watcher.bind(tabId, updated);
     await watcher.promise;
     const after = await scope.getTabOrClosed(tabId);
     return {
@@ -341,6 +377,9 @@
     const watcher = shouldWait ? watchNavigation({ url, waitUntil, timeoutMs }) : null;
     let tab;
     try {
+      if (watcher) {
+        watcher.issue();
+      }
       tab = await chrome.tabs.create({ url, active });
     } catch (error) {
       if (watcher) {
@@ -350,7 +389,7 @@
     }
     ctx.tabId = tab.id;
     if (watcher) {
-      watcher.bind(tab.id);
+      watcher.bind(tab.id, tab);
       await watcher.promise;
     }
     const after = await scope.getTabOrClosed(tab.id);

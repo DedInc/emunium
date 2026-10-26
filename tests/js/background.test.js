@@ -488,6 +488,90 @@ test("navigate: ERR_ABORTED on a main-frame redirect target is our failure (down
   assert.equal(w.chrome.webRequest.onBeforeRedirect.listeners.length, redirectListeners, "redirect listener removed");
 });
 
+test("navigate: an aborted pre-existing start-page navigation is not our failure", async (t) => {
+  const w = makeWorker(t);
+  const ws = await welcomed();
+  const START = "https://start.duckduckgo.com/";
+  const startRedirect = (tabId) =>
+    w.chrome.webRequest.onBeforeRedirect.emit({
+      tabId,
+      frameId: 0,
+      type: "main_frame",
+      url: START,
+      redirectUrl: "https://duckduckgo.com/?t=debian",
+    });
+  const abort = (nav, tabId, url) => nav.onErrorOccurred.emit({ tabId, frameId: 0, url, error: "net::ERR_ABORTED" });
+  const ours = (nav, tabId, url) => nav.onBeforeNavigate.emit({ tabId, frameId: 0, url });
+  const finishOurs = (nav, tabId, url, title) => {
+    w.chrome.__state.tabs.get(tabId).title = title;
+    nav.onCommitted.emit({ tabId, frameId: 0, url });
+    nav.onCompleted.emit({ tabId, frameId: 0, url });
+  };
+  const orders = {
+    // Debian Chromium: the start page's onBeforeNavigate reaches us after the watcher is bound.
+    "abort after our onBeforeNavigate": (nav, tabId, url) => {
+      ours(nav, tabId, START);
+      ours(nav, tabId, url);
+      abort(nav, tabId, START);
+    },
+    "abort before our onBeforeNavigate": (nav, tabId, url) => {
+      ours(nav, tabId, START);
+      abort(nav, tabId, START);
+      ours(nav, tabId, url);
+    },
+    "start page redirected before the abort": (nav, tabId, url) => {
+      ours(nav, tabId, START);
+      startRedirect(tabId);
+      ours(nav, tabId, url);
+      abort(nav, tabId, "https://duckduckgo.com/?t=debian");
+    },
+  };
+  for (const [name, order] of Object.entries(orders)) {
+    scriptUpdate(w, (nav, tabId, props) => {
+      order(nav, tabId, props.url);
+      finishOurs(nav, tabId, props.url, name);
+    });
+    const reply = await request(ws, "navigate", { url: "https://next.test/", timeoutMs: 500 });
+    assert.equal(reply.ok, true, `${name}: ${JSON.stringify(reply)}`);
+    assert.equal(reply.result.title, name);
+  }
+
+  // A pre-existing navigation to the very URL we navigate to: its onBeforeNavigate arrives
+  // before tabs.update is called, so its abort is not ours, whichever side of ours it lands.
+  for (const abortFirst of [true, false]) {
+    const redirect = w.chrome.webRequest.onBeforeRedirect;
+    redirect.addListener = function (fn, ...extra) {
+      Object.getPrototypeOf(redirect).addListener.call(redirect, fn, ...extra);
+      delete redirect.addListener; // the last watcher listener: everything is attached now
+      ours(w.chrome.webNavigation, 1, "https://same.test/");
+    };
+    scriptUpdate(w, (nav, tabId, props) => {
+      if (abortFirst) {
+        abort(nav, tabId, props.url);
+      }
+      ours(nav, tabId, props.url);
+      if (!abortFirst) {
+        abort(nav, tabId, props.url);
+      }
+      finishOurs(nav, tabId, props.url, "same " + abortFirst);
+    });
+    const reply = await request(ws, "navigate", { url: "https://same.test/", timeoutMs: 500 });
+    assert.equal(reply.ok, true, `abortFirst=${abortFirst}: ${JSON.stringify(reply)}`);
+    assert.equal(reply.result.title, "same " + abortFirst);
+  }
+
+  // Our own navigation aborted after it started is still navigation_failed.
+  scriptUpdate(w, (nav, tabId, props) => {
+    ours(nav, tabId, START);
+    ours(nav, tabId, props.url);
+    abort(nav, tabId, START);
+    abort(nav, tabId, props.url);
+  });
+  const failed = await request(ws, "navigate", { url: "https://next.test/", timeoutMs: 500 });
+  assert.equal(failed.error.code, "navigation_failed", JSON.stringify(failed));
+  assert.match(failed.error.message, /next\.test.*ERR_ABORTED/);
+});
+
 test("navigate/createTab: other rejections map to no_target or internal", async (t) => {
   const w = makeWorker(t);
   const ws = await welcomed();
