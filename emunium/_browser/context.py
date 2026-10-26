@@ -16,7 +16,7 @@ from typing import Protocol
 
 from emunium._bridge.facade import Bridge
 from emunium._element_interactor import ElementInteractor
-from emunium._motion import MotionPlanner
+from emunium._motion import DEFAULT_TARGET_SIZE, MotionPlanner
 from emunium._native.win32 import (
     Win32Windows,
     WindowApi,
@@ -48,7 +48,21 @@ class Interactor(Protocol):
 
     def position(self) -> tuple[int, int]: ...
 
-    def move(self, x: float, y: float, *, human: bool = True) -> None: ...
+    def move(
+        self,
+        x: float,
+        y: float,
+        *,
+        human: bool = True,
+        target_size: float | None = None,
+    ) -> None:
+        """Move to ``(x, y)`` (input px).
+
+        ``target_size`` is Fitts' ``W`` in input px: element transactions pass
+        the target's smaller visible side on every human move; instant moves
+        and callers without a target leave it to the interactor's default.
+        """
+        ...
 
     def press(self, button: str = "left", *, clicks: int = 1) -> None: ...
 
@@ -83,6 +97,18 @@ class DragInteractor(ElementInteractor):
     the release cannot be one ``drag()`` call; an aborted drag is cancelled
     with Escape before the button is released.
     """
+
+    def move(
+        self,
+        x: float,
+        y: float,
+        *,
+        human: bool = True,
+        target_size: float | None = None,
+    ) -> None:
+        """``ElementInteractor.move``; ``target_size=None`` is its default ``W``."""
+        size = DEFAULT_TARGET_SIZE if target_size is None else target_size
+        super().move(x, y, human=human, target_size=size)
 
     def button_down(self, button: str = "left") -> None:
         with NATIVE_INPUT_LOCK:

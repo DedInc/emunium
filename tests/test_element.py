@@ -33,6 +33,8 @@ from emunium._browser import dom
 from emunium._browser import facade as facade_module
 from emunium._browser import tabs as tabs_module
 from emunium._browser.context import BrowserContext, DragInteractor
+from emunium._element_interactor import ElementInteractor
+from emunium._motion import DEFAULT_TARGET_SIZE
 from emunium._native.win32 import CHROME_WINDOW_CLASS
 from emunium._screen import (
     NATIVE_INPUT_LOCK,
@@ -114,6 +116,8 @@ class World:
         self.drop_geometry = False
         self.probes: list[dict[str, Any]] = []
         self.lock_checks = 0
+        # (human, target_size) of every interactor move, jiggles included.
+        self.aims: list[tuple[bool, float | None]] = []
         self.virtual_screen = (0, 0, 1920, 1080)
         self.blocked: set[tuple[int, int]] = set()  # e.g. screen corners
         self.move_failures: dict[tuple[int, int], BaseException] = {}
@@ -236,8 +240,16 @@ class FakeInteractor:
     def position(self) -> tuple[int, int]:
         return self.world.cursor
 
-    def move(self, x: float, y: float, *, human: bool = True) -> None:
+    def move(
+        self,
+        x: float,
+        y: float,
+        *,
+        human: bool = True,
+        target_size: float | None = None,
+    ) -> None:
         self._check_lock()
+        self.world.aims.append((human, target_size))
         current = self.world.cursor
         target = (round(x), round(y))
         failure = self.world.move_failures.get(target)
@@ -560,6 +572,41 @@ def test_os_events_are_sent_under_the_native_input_lock(world: World) -> None:
 
     with pytest.raises(AssertionError, match="NATIVE_INPUT_LOCK"):
         FakeInteractor(world).move(1, 1)  # the checker itself catches a bare call
+
+
+def test_human_moves_pass_the_target_size_to_custom_interactors(world: World) -> None:
+    ctx = make_ctx(world)
+    handle(ctx).click()
+
+    live = world.live()
+    smaller_side_input = 20 * input_per_dip(live) * live.zoom  # doc1.1 is 100x20
+    human_aims = [aim for aim in world.aims if aim[0]]
+    assert human_aims == [(True, pytest.approx(smaller_side_input))]
+    # Instant moves (the jiggle) leave Fitts' W to the interactor's default.
+    assert [aim for aim in world.aims if not aim[0]] == [(False, None), (False, None)]
+
+
+def test_drag_interactor_maps_a_missing_target_size_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sizes: list[float] = []
+
+    def record(
+        self: ElementInteractor,
+        x: float,
+        y: float,
+        *,
+        human: bool = True,
+        target_size: float = DEFAULT_TARGET_SIZE,
+    ) -> None:
+        sizes.append(target_size)
+
+    monkeypatch.setattr(ElementInteractor, "move", record)
+    interactor = DragInteractor()
+    interactor.move(10, 20)
+    interactor.move(10, 20, target_size=None)
+    interactor.move(10, 20, target_size=33.0)
+    assert sizes == [DEFAULT_TARGET_SIZE, DEFAULT_TARGET_SIZE, 33.0]
 
 
 def test_every_bridge_call_uses_the_handle_tab(world: World) -> None:

@@ -23,7 +23,6 @@ from typing import Any
 from emunium._bridge.commands import expect_dict
 from emunium._bridge.facade import Bridge
 from emunium._browser.context import BrowserContext
-from emunium._element_interactor import ElementInteractor
 from emunium._motion import DEFAULT_TARGET_SIZE
 from emunium._screen import NATIVE_INPUT_LOCK, Geometry, input_per_dip
 from emunium._standalone.config import ClickType
@@ -547,15 +546,12 @@ class Element:
         ctx = self._ctx
         geometry = self._require_geometry()
         input_x, input_y = ctx.calibration.to_input(geometry, point[0], point[1])
-        interactor = ctx.interactor
-        if human and isinstance(interactor, ElementInteractor):
-            # The ``Interactor`` protocol's move takes no target size; only the
-            # planner-driven interactor aims with Fitts' W.
-            interactor.move(
+        if human:
+            ctx.interactor.move(
                 input_x, input_y, human=True, target_size=self._target_size(geometry)
             )
         else:
-            interactor.move(input_x, input_y, human=human)
+            ctx.interactor.move(input_x, input_y, human=False)
         if not ctx.verify_input:
             return ctx.interactor.position()
         return self._verify(anchor, deadline)
