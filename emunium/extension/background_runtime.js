@@ -24,6 +24,8 @@
   function handleTopFrameCommitted(details) {
     if (details && details.frameId === 0) {
       scope.onTopFrameCommitted(details.tabId, details.documentId);
+      // Attach mode: the hub's start URL carries a single-use claim nonce.
+      scope.handleClaimNavigation(details).catch(() => {});
     }
   }
 

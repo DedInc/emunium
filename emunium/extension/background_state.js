@@ -1,5 +1,5 @@
 // background_state.js - connection lifecycle and shared worker state (bridge protocol v2).
-// Contract: docs/architecture/bridge-protocol.md sections 1-5.
+// Contract: docs/architecture/bridge-protocol.md sections 1-5, docs/architecture/attach-mode.md sections 2-4.
 (() => {
   "use strict";
 
@@ -8,12 +8,19 @@
   const PROTOCOL = 2;
   const WS_CONNECTING = 0;
   const WS_OPEN = 1;
+  const LOOPBACK = "127.0.0.1";
+  const CLAIM_NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+  const MAX_SEEN_NONCES = 256;
 
   // Mutable so tests can shorten waits; read at use time.
   const timing = scope.timing || {
     configRetryMs: 1000,
     backoffMinMs: 1000,
     backoffMaxMs: 5000,
+    // Attach mode: a long-running hub may be down for a while; back off further.
+    attachBackoffMaxMs: 30000,
+    // A start-URL claim nonce is single-use with a 5 min TTL on the hub.
+    claimTtlMs: 5 * 60 * 1000,
     keepAliveMs: 20000,
     welcomeTimeoutMs: 10000,
     timeoutGraceMs: 1000,
@@ -35,8 +42,10 @@
     // tabId -> documentId of the top-frame document whose content script said ready
     // (true when Chrome gave no documentId).
     readyTabs: new Map(),
-    // tabId -> documentId that already received content_main.js (MAIN world).
-    mainWorldTabs: new Map(),
+    // Attach-mode claims waiting for a welcome: [{nonce, hubPort, at}].
+    pendingClaims: [],
+    // Nonces already taken from a navigation (insertion-ordered, bounded).
+    seenClaimNonces: new Set(),
   };
 
   const KNOWN_CODES = new Set([
@@ -77,20 +86,25 @@
     return String((error && error.message) || error || "");
   }
 
-  // The single source of connection settings. Attach mode extends this function only.
-  async function loadConfig() {
-    let data;
+  // {present, data}: present is false when the packaged file does not exist (or cannot be read).
+  async function readPackagedJson(name) {
+    let response;
     try {
-      const response = await fetch(chrome.runtime.getURL("session.json") + "?t=" + Date.now(), {
-        cache: "no-store",
-      });
-      if (!response.ok) {
-        return null;
-      }
-      data = await response.json();
+      response = await fetch(chrome.runtime.getURL(name) + "?t=" + Date.now(), { cache: "no-store" });
     } catch {
-      return null;
+      return { present: false, data: null };
     }
+    if (!response || !response.ok) {
+      return { present: false, data: null };
+    }
+    try {
+      return { present: true, data: await response.json() };
+    } catch {
+      return { present: true, data: null };
+    }
+  }
+
+  function launchConfigFrom(data) {
     if (!data || typeof data !== "object" || data.protocol !== PROTOCOL) {
       return null;
     }
@@ -99,6 +113,109 @@
       return null;
     }
     return { url: `ws://127.0.0.1:${port}`, token: data.token, protocol: PROTOCOL };
+  }
+
+  // hubUrl must be exactly ws://127.0.0.1[:port][/]; returns the numeric port or null.
+  function hubPortOf(hubUrl) {
+    if (typeof hubUrl !== "string") {
+      return null;
+    }
+    let parsed;
+    try {
+      parsed = new URL(hubUrl);
+    } catch {
+      return null;
+    }
+    if (
+      parsed.protocol !== "ws:" ||
+      parsed.hostname !== LOOPBACK ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return null;
+    }
+    const port = parsed.port === "" ? 80 : Number(parsed.port);
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+  }
+
+  // attach.json without the per-profile identity: {mode, url, hubPort, enrollment, protocol}.
+  function attachFileConfigFrom(data) {
+    if (!data || typeof data !== "object" || data.protocol !== PROTOCOL || data.mode !== "attach") {
+      return null;
+    }
+    const hubPort = hubPortOf(data.hubUrl);
+    if (hubPort === null || typeof data.enrollment !== "string" || !data.enrollment) {
+      return null;
+    }
+    return { mode: "attach", url: `ws://${LOOPBACK}:${hubPort}`, hubPort, enrollment: data.enrollment, protocol: PROTOCOL };
+  }
+
+  // session.json wins when present (launch mode, unchanged); otherwise attach.json.
+  async function loadFileConfig() {
+    const session = await readPackagedJson("session.json");
+    if (session.present) {
+      return launchConfigFrom(session.data);
+    }
+    const attach = await readPackagedJson("attach.json");
+    return attach.present ? attachFileConfigFrom(attach.data) : null;
+  }
+
+  let identityCreation = null;
+
+  function isUuid(value) {
+    return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  }
+
+  // {installId, token}: installId is created once per profile and kept in chrome.storage.local.
+  async function loadIdentity() {
+    const stored = (await chrome.storage.local.get(["installId", "token"])) || {};
+    const token = typeof stored.token === "string" && stored.token ? stored.token : null;
+    if (isUuid(stored.installId)) {
+      return { installId: stored.installId, token };
+    }
+    if (!identityCreation) {
+      // Single-flight: concurrent callers must not each mint a different id.
+      identityCreation = (async () => {
+        const installId = crypto.randomUUID();
+        await chrome.storage.local.set({ installId });
+        return installId;
+      })().finally(() => {
+        identityCreation = null;
+      });
+    }
+    return { installId: await identityCreation, token };
+  }
+
+  // The single source of connection settings.
+  async function loadConfig() {
+    const config = await loadFileConfig();
+    if (!config || config.mode !== "attach") {
+      return config;
+    }
+    let identity;
+    try {
+      identity = await loadIdentity();
+    } catch {
+      return null; // storage unavailable: retry like a missing config
+    }
+    return Object.assign(config, identity);
+  }
+
+  function storeToken(token) {
+    if (state.config && state.config.mode === "attach") {
+      state.config.token = token;
+    }
+    try {
+      const stored = chrome.storage.local.set({ token });
+      if (stored && typeof stored.catch === "function") {
+        stored.catch(() => {});
+      }
+    } catch {
+      // the next hello sends the old token; the hub then answers 4001 and needs hub.forget()
+    }
   }
 
   function clearReconnect() {
@@ -118,10 +235,12 @@
     }, delayMs);
   }
 
-  // 1 s, 2 s, 4 s, then 5 s until a welcome resets it.
-  function takeBackoff() {
-    const delay = Math.min(Math.max(state.backoffMs, timing.backoffMinMs), timing.backoffMaxMs);
-    state.backoffMs = Math.min(delay * 2, timing.backoffMaxMs);
+  // Launch: 1 s, 2 s, 4 s, then 5 s; attach: doubling up to 30 s. A welcome resets it.
+  function takeBackoff(config) {
+    const mode = (config || state.config || {}).mode;
+    const max = mode === "attach" ? timing.attachBackoffMaxMs : timing.backoffMaxMs;
+    const delay = Math.min(Math.max(state.backoffMs, timing.backoffMinMs), max);
+    state.backoffMs = Math.min(delay * 2, max);
     return delay;
   }
 
@@ -167,7 +286,7 @@
         try {
           socket = new WebSocket(config.url);
         } catch {
-          scheduleReconnect(takeBackoff());
+          scheduleReconnect(takeBackoff(config));
           return false;
         }
         state.ws = socket;
@@ -197,16 +316,21 @@
       }
       const manifest = chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
       const userAgent = typeof navigator !== "undefined" && navigator ? String(navigator.userAgent || "") : "";
+      const hello =
+        config.mode === "attach"
+          ? {
+              type: "hello",
+              protocol: config.protocol,
+              mode: "attach",
+              installId: config.installId,
+              enrollment: config.enrollment,
+              token: config.token || null,
+            }
+          : { type: "hello", protocol: config.protocol, token: config.token };
+      hello.extensionVersion = (manifest && manifest.version) || "";
+      hello.userAgent = userAgent;
       try {
-        socket.send(
-          JSON.stringify({
-            type: "hello",
-            protocol: config.protocol,
-            token: config.token,
-            extensionVersion: (manifest && manifest.version) || "",
-            userAgent,
-          })
-        );
+        socket.send(JSON.stringify(hello));
       } catch {
         closeSocket(socket, 1000, "hello failed");
         return;
@@ -240,6 +364,9 @@
           closeSocket(socket, 4000, "protocol mismatch");
           return;
         }
+        if (config.mode === "attach" && typeof frame.token === "string" && frame.token) {
+          storeToken(frame.token);
+        }
         onWelcome(socket);
         return;
       }
@@ -257,7 +384,7 @@
       stopTimers();
       state.ws = null;
       state.welcomed = false;
-      scheduleReconnect(takeBackoff());
+      scheduleReconnect(takeBackoff(config));
     };
   }
 
@@ -271,6 +398,84 @@
         sendFrame(socket, { type: "event", event: "ping" });
       }
     }, timing.keepAliveMs);
+    flushClaims();
+  }
+
+  // ── start-URL claim (attach-mode.md section 4.1) ────────────────────────
+
+  // The nonce of a committed URL that is exactly http://127.0.0.1:<hubPort>/pair#n=<nonce>, else null.
+  function parseClaimUrl(url, hubPort) {
+    if (typeof url !== "string" || !Number.isInteger(hubPort) || hubPort <= 0 || hubPort > 65535) {
+      return null;
+    }
+    // Chrome commits canonical URLs, which drop the scheme's default port.
+    const origin = hubPort === 80 ? `http://${LOOPBACK}` : `http://${LOOPBACK}:${hubPort}`;
+    const prefix = `${origin}/pair#n=`;
+    if (!url.startsWith(prefix)) {
+      return null;
+    }
+    const nonce = url.slice(prefix.length);
+    return CLAIM_NONCE_RE.test(nonce) ? nonce : null;
+  }
+
+  function attachClaimTarget(config) {
+    return config && config.mode === "attach" && Number.isInteger(config.hubPort) ? config.hubPort : null;
+  }
+
+  function rememberNonce(nonce) {
+    state.seenClaimNonces.add(nonce);
+    while (state.seenClaimNonces.size > MAX_SEEN_NONCES) {
+      state.seenClaimNonces.delete(state.seenClaimNonces.values().next().value);
+    }
+  }
+
+  // Top-frame commit: a matching claim URL is queued once, sent when welcomed, and the tab is blanked.
+  async function handleClaimNavigation(details) {
+    if (!details || details.frameId !== 0 || typeof details.url !== "string") {
+      return false;
+    }
+    if (!details.url.startsWith(`http://${LOOPBACK}`)) {
+      return false; // cheap reject before touching the config
+    }
+    // Before the first connect the mode is unknown; read the files (no identity side effects).
+    const config = state.config || (await loadFileConfig());
+    const hubPort = attachClaimTarget(config);
+    if (hubPort === null) {
+      return false;
+    }
+    const nonce = parseClaimUrl(details.url, hubPort);
+    if (nonce === null || state.seenClaimNonces.has(nonce)) {
+      return false;
+    }
+    rememberNonce(nonce);
+    state.pendingClaims.push({ nonce, hubPort, at: Date.now() });
+    flushClaims();
+    if (Number.isInteger(details.tabId)) {
+      try {
+        await chrome.tabs.update(details.tabId, { url: "about:blank" });
+      } catch {
+        // tab already gone or navigated away: the nonce is captured either way
+      }
+    }
+    return true;
+  }
+
+  // Sends queued claims on the current welcomed attach socket; drops claims older than claimTtlMs.
+  function flushClaims() {
+    const now = Date.now();
+    state.pendingClaims = state.pendingClaims.filter((claim) => now - claim.at <= timing.claimTtlMs);
+    const hubPort = attachClaimTarget(state.config);
+    if (!state.pendingClaims.length || hubPort === null || !isConnected()) {
+      return;
+    }
+    const remaining = [];
+    for (const claim of state.pendingClaims) {
+      const sent = claim.hubPort === hubPort && sendEvent("claim", { nonce: claim.nonce });
+      if (!sent) {
+        remaining.push(claim);
+      }
+    }
+    state.pendingClaims = remaining;
   }
 
   function closeSocket(socket, code, reason) {
@@ -386,19 +591,16 @@
     return current === null ? true : current === entry;
   }
 
-  // A new top-frame document invalidates readiness and the MAIN-world injection.
+  // A new top-frame document invalidates readiness.
   function onTopFrameCommitted(tabId, documentId) {
-    for (const map of [state.readyTabs, state.mainWorldTabs]) {
-      const entry = map.get(tabId);
-      if (entry !== undefined && (typeof documentId !== "string" || entry !== documentId)) {
-        map.delete(tabId);
-      }
+    const entry = state.readyTabs.get(tabId);
+    if (entry !== undefined && (typeof documentId !== "string" || entry !== documentId)) {
+      state.readyTabs.delete(tabId);
     }
   }
 
   function clearTrackedTab(tabId) {
     state.readyTabs.delete(tabId);
-    state.mainWorldTabs.delete(tabId);
   }
 
   Object.assign(scope, {
@@ -410,6 +612,11 @@
     errorPayload,
     errorMessage,
     loadConfig,
+    loadIdentity,
+    hubPortOf,
+    parseClaimUrl,
+    handleClaimNavigation,
+    flushClaims,
     connect,
     ensureConnected,
     isConnected,
