@@ -806,10 +806,12 @@ class VirtualScreen(NamedTuple):
 
 
 class RawReleases:
-    """``platformModule`` of the backend: releases that skip the fail-safe.
+    """``platformModule`` of the backend: input that skips the fail-safe.
 
     A release must happen even with the cursor in a fail-safe corner, or the
     button / key would stay down. Coordinates are ignored and never read.
+    ``_keyDown`` serves cleanup only (the Escape that cancels an aborted drag
+    before its button is released).
     """
 
     def __init__(self, backend: Win32Backend) -> None:
@@ -822,6 +824,9 @@ class RawReleases:
         # Like pyautogui's platform layer, the release lands where the cursor is.
         self._backend.release_button(button)
 
+    def _keyDown(self, key: str) -> None:
+        self._backend.raw_key_down(key)
+
     def _keyUp(self, key: str) -> None:
         self._backend.release_key(key)
 
@@ -830,7 +835,8 @@ class Win32Backend:
     """pyautogui-compatible input backend (``emunium._native.InputBackend``).
 
     Every action checks the fail-safe first (``EMUNIUM_FAILSAFE``), then the
-    UIPI preflight before any button, wheel or key input. Releases skip both.
+    UIPI preflight before any button, wheel or key input. Releases and the raw
+    key-down of ``platformModule`` skip both.
     ``_pause`` is accepted for compatibility and never sleeps.
     """
 
@@ -928,6 +934,15 @@ class Win32Backend:
         events = self._key_events(key, up=True)
         self._failsafe()
         self._sender.send_keys(events)
+
+    def raw_key_down(self, key: str) -> None:
+        """Key down for a cancel path; no fail-safe, no preflight.
+
+        A UIPI block must not stop the cleanup that follows (the button
+        release), so the send is attempted anyway. A short send still raises;
+        the cleanup records it and continues.
+        """
+        self._sender.send_keys(self._key_events(key, up=False), preflight=False)
 
     def release_key(self, key: str) -> None:
         """Key up; no fail-safe, no preflight."""

@@ -17,6 +17,7 @@ import pytest
 from conftest import REAL_INPUT_MESSAGE, REPO_ROOT, SafetyNet
 
 from emunium import _native, _screen
+from emunium._browser.context import DragInteractor
 from emunium._element_interactor import (
     ElementInteractor,
     WindowsKeyboardSender,
@@ -462,6 +463,40 @@ def test_raw_releases_skip_failsafe() -> None:
         [("key", 0x11, 0x111, UP)],
     ]
     assert user32.moves == []
+
+
+def test_raw_key_down_skips_failsafe_and_preflight() -> None:
+    # Escape that cancels an aborted drag: cursor in a corner, elevated window
+    # in front. Neither may stop the send; the cleanup goes on to the release.
+    backend, user32 = make(cursor=(0, 0))
+    user32.foreground = HIGH
+    backend.platformModule._keyDown("escape")
+    assert user32.batches == [[("key", 0x1B, 0x11B, 0)]]
+    assert user32.integrity_queries == [] and user32.moves == []
+
+
+def test_raw_key_down_still_reports_a_short_send() -> None:
+    backend, user32 = make(cursor=(0, 0))
+    user32.deliver = 0
+    with pytest.raises(NativeInputError, match="delivered 0 of 1 keyboard"):
+        backend.platformModule._keyDown("escape")
+
+
+def test_raw_key_down_rejects_unknown_keys_before_sending() -> None:
+    backend, user32 = make(cursor=(0, 0))
+    with pytest.raises(ValueError, match="unknown key name"):
+        backend.platformModule._keyDown("bogus")
+    assert user32.batches == []
+
+
+def test_drag_escape_is_sent_in_a_failsafe_corner() -> None:
+    backend, user32 = make(cursor=(1919, 1079))
+    user32.foreground = HIGH
+    DragInteractor(backend=backend, platform="win32").press_escape()
+    assert user32.batches == [
+        [("key", 0x1B, 0x11B, 0)],
+        [("key", 0x1B, 0x11B, UP)],
+    ]
 
 
 # -- backend against FakeUser32 ----------------------------------------------------

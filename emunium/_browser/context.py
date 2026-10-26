@@ -78,9 +78,10 @@ class DragInteractor(ElementInteractor):
     def press_escape(self) -> None:
         """Escape down/up; the release always runs and skips the fail-safe.
 
-        The key-down uses the platform layer's raw ``_keyDown`` when the
-        backend has one (pyautogui); the native backends only expose raw
-        releases, so there the key-down passes the fail-safe check.
+        The key-down uses the platform layer's raw ``_keyDown`` whenever the
+        backend has one (pyautogui, the Windows backend), so a cursor in a
+        fail-safe corner cannot refuse the Escape that cancels a drag; other
+        backends fall back to ``keyDown``, which passes the fail-safe check.
         """
         gui = self._gui()
         with NATIVE_INPUT_LOCK:

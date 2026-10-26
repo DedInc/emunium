@@ -765,7 +765,13 @@ class _RawKeys:
 
 
 class _RawKeysWithDown(_RawKeys):
+    def __init__(self, calls: list[tuple[str, str]]) -> None:
+        super().__init__(calls)
+        self.error: Exception | None = None
+
     def _keyDown(self, key: str) -> None:
+        if self.error is not None:
+            raise self.error
         self.calls.append(("_keyDown", key))
 
 
@@ -802,6 +808,16 @@ def test_press_escape_releases_even_when_key_down_fails() -> None:
     backend = _FakeBackend(raw_down=False)
     backend.key_down_error = NativeInputError("fail-safe corner")
     with pytest.raises(NativeInputError):
+        DragInteractor(backend=backend).press_escape()
+    assert backend.calls == [("_keyUp", "escape")]
+
+
+def test_press_escape_releases_even_when_the_raw_key_down_fails() -> None:
+    backend = _FakeBackend(raw_down=True)
+    raw = backend.platformModule
+    assert isinstance(raw, _RawKeysWithDown)
+    raw.error = NativeInputError("SendInput delivered 0 of 1 keyboard events")
+    with pytest.raises(NativeInputError, match="delivered 0 of 1"):
         DragInteractor(backend=backend).press_escape()
     assert backend.calls == [("_keyUp", "escape")]
 
