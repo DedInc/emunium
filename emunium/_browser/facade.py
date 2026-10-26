@@ -1,15 +1,34 @@
+"""The ``Browser`` facade: one Chrome session, one ``BrowserContext``.
+
+Every DOM lookup and element handle shares the browser's context, so the
+``headless`` refusal and the ``verify_input`` switch reach each native-input
+transaction. Commands go to the pinned tab, which follows launch, ``goto``,
+``new_tab``, ``switch_to_tab`` and ``close_tab``. Action methods record the
+action start (``BrowserContext.mark_action``) that network waits default to.
+"""
+
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Any
 
-from emunium._browser import dom, page, tabs
+from emunium._browser import dom, page
+from emunium._browser import tabs as tab_ops
+from emunium._browser.context import BrowserContext
 from emunium._browser.launcher import BrowserSession, close, launch
+from emunium._browser.page import ResponseExpectation
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.element import Element
+from emunium.errors import InvalidArgumentError
 from emunium.wait import Wait, WaitStrategy
 
+if TYPE_CHECKING:
+    from typing_extensions import Self
+
 logger = logging.getLogger("emunium.browser")
+
+_CLICK_TYPES = (ClickType.LEFT, ClickType.DOUBLE, ClickType.RIGHT, ClickType.MIDDLE)
 
 
 class Browser:
@@ -19,41 +38,69 @@ class Browser:
         user_data_dir: str | None = None,
         bridge_port: int = 0,
         bridge_timeout: float = 60.0,
+        *,
+        chrome_path: str | None = None,
+        extra_args: list[str] | None = None,
+        verify_input: bool = True,
     ) -> None:
+        bridge = Bridge(port=bridge_port)
         self._session = BrowserSession()
-        self._session.bridge = Bridge(port=bridge_port)
-        self._session.headless = headless
+        self._session.bridge = bridge
+        self._session.headless = bool(headless)
         self._session.user_data_dir = user_data_dir
+        self._session.chrome_path = chrome_path
+        # Validated by launch(); a str is reported there rather than split here.
+        self._session.extra_args = [] if extra_args is None else extra_args
         self._bridge_timeout = bridge_timeout
+        self._ctx = BrowserContext(
+            bridge, headless=bool(headless), verify_input=verify_input
+        )
 
     @property
     def bridge(self) -> Bridge:
-        return self._session.bridge
+        return self._ctx.bridge
 
-    def launch(self) -> Browser:
+    @property
+    def context(self) -> BrowserContext:
+        return self._ctx
+
+    def launch(self) -> Self:
+        """Start Chrome and pin its initial tab; on failure nothing stays running."""
         launch(self._session, bridge_timeout=self._bridge_timeout)
+        try:
+            tab_ops.pin_active(self._ctx)
+        except BaseException:
+            try:
+                close(self._session)
+            except Exception:
+                logger.exception("Cleanup after a failed launch raised")
+            raise
         return self
 
     def close(self) -> None:
         close(self._session)
 
-    def goto(self, url: str, *, timeout: float = 30.0) -> dict:
-        return page.goto(self._session.bridge, url, timeout=timeout)
+    # -- navigation and lookups ---------------------------------------------
+
+    def goto(
+        self, url: str, *, timeout: float = 30.0, wait_until: str = "load"
+    ) -> dict[str, Any]:
+        return page.goto(self._ctx, url, timeout=timeout, wait_until=wait_until)
 
     def query_selector(self, selector: str) -> Element | None:
-        return dom.query_selector(self._session.bridge, selector)
+        return dom.query_selector(self._ctx, selector)
 
     def query_selector_all(self, selector: str) -> list[Element]:
-        return dom.query_selector_all(self._session.bridge, selector)
+        return dom.query_selector_all(self._ctx, selector)
 
-    def wait_for_element(self, selector: str, timeout: float = 10.0) -> Element:
-        return dom.wait_for_element(self._session.bridge, selector, timeout)
+    def wait_for_element(self, selector: str, timeout: float = 10.0) -> Element | None:
+        return dom.wait_for_element(self._ctx, selector, timeout)
 
-    def wait_for_xpath(self, xpath: str, timeout: float = 10.0) -> Element:
-        return dom.wait_for_xpath(self._session.bridge, xpath, timeout)
+    def wait_for_xpath(self, xpath: str, timeout: float = 10.0) -> Element | None:
+        return dom.wait_for_xpath(self._ctx, xpath, timeout)
 
-    def wait_for_text(self, text: str, timeout: float = 10.0) -> Element:
-        return dom.wait_for_text(self._session.bridge, text, timeout)
+    def wait_for_text(self, text: str, timeout: float = 10.0) -> Element | None:
+        return dom.wait_for_text(self._ctx, text, timeout)
 
     def wait(
         self,
@@ -71,7 +118,7 @@ class Browser:
         else:
             conditions = None
         return dom.wait_for_element(
-            self._session.bridge,
+            self._ctx,
             selector,
             timeout,
             state=state,
@@ -80,21 +127,27 @@ class Browser:
         )
 
     def get_by_text(self, text: str, *, exact: bool = False) -> list[Element]:
-        return dom.get_by_text(self._session.bridge, text, exact=exact)
+        return dom.get_by_text(self._ctx, text, exact=exact)
 
     def get_all_interactive(self) -> list[Element]:
-        return dom.get_all_interactive(self._session.bridge)
+        return dom.get_all_interactive(self._ctx)
 
     def _resolve_element(
         self, target: str | Element, *, timeout: float = 10.0
     ) -> Element:
         if isinstance(target, Element):
             return target
-        return dom.wait_for_element(self._session.bridge, target, timeout)
+        el = dom.wait_for_element(self._ctx, target, timeout)
+        if el is None:
+            # Only an element-less match (e.g. a detached state) returns None.
+            raise LookupError(f"{target!r} matched without an element to act on")
+        return el
+
+    # -- native input -------------------------------------------------------
 
     def click(
         self,
-        selector: str,
+        selector: str | Element,
         *,
         human: bool = True,
         click_type: ClickType = ClickType.LEFT,
@@ -118,7 +171,9 @@ class Browser:
         human: bool = True,
         timeout: float = 10.0,
     ) -> Element:
+        self._ctx.require_native_input()
         el = self._resolve_element(target, timeout=timeout)
+        self._ctx.mark_action()
         el.move_to(offset_x=offset_x, offset_y=offset_y, human=human)
         return el
 
@@ -147,7 +202,11 @@ class Browser:
         human: bool = True,
         timeout: float = 10.0,
     ) -> Element:
+        if click_type not in _CLICK_TYPES:
+            raise InvalidArgumentError(f"unsupported click_type {click_type!r}")
+        self._ctx.require_native_input()
         el = self._resolve_element(target, timeout=timeout)
+        self._ctx.mark_action()
         if click_type == ClickType.LEFT:
             el.click(human=human)
         elif click_type == ClickType.DOUBLE:
@@ -160,21 +219,22 @@ class Browser:
 
     def type(
         self,
-        selector: str,
+        selector: str | Element,
         text: str,
         *,
         characters_per_minute: int = 280,
         offset: int = 20,
         human: bool = True,
+        timeout: float = 10.0,
     ) -> Element:
-        el = self._resolve_element(selector)
-        el.type(
+        return self.type_at(
+            selector,
             text,
             characters_per_minute=characters_per_minute,
             offset=offset,
             human=human,
+            timeout=timeout,
         )
-        return el
 
     def type_at(
         self,
@@ -187,7 +247,9 @@ class Browser:
         click_type: ClickType = ClickType.LEFT,
         timeout: float = 10.0,
     ) -> Element:
+        self._ctx.require_native_input()
         el = self._resolve_element(target, timeout=timeout)
+        self._ctx.mark_action()
         el.type(
             text,
             characters_per_minute=characters_per_minute,
@@ -198,50 +260,95 @@ class Browser:
         return el
 
     def drag_and_drop(
-        self, source_selector: str, target_selector: str, *, human: bool = True
+        self,
+        source_selector: str | Element,
+        target_selector: str | Element,
+        *,
+        human: bool = True,
+        timeout: float = 10.0,
     ) -> None:
-        source = self._resolve_element(source_selector)
-        target = self._resolve_element(target_selector)
+        self._ctx.require_native_input()
+        source = self._resolve_element(source_selector, timeout=timeout)
+        target = self._resolve_element(target_selector, timeout=timeout)
+        self._ctx.mark_action()
         source.drag_to(target, human=human)
 
-    def execute_script(self, code: str) -> str | None:
-        return page.execute_script(self._session.bridge, code)
+    # -- page ---------------------------------------------------------------
 
-    def page_info(self) -> dict:
-        return page.page_info(self._session.bridge)
+    def execute_script(self, code: str) -> Any:
+        """JSON value of the script's completion value (``None`` for undefined)."""
+        return page.execute_script(self._ctx, code)
 
-    def scroll_to(self, target: int | str | Element, y: int | None = None) -> dict:
+    def page_info(self) -> dict[str, Any]:
+        return page.page_info(self._ctx)
+
+    def scroll_to(
+        self, target: int | str | Element, y: int | None = None
+    ) -> dict[str, Any]:
         if isinstance(target, (str, Element)):
-            return self._resolve_element(target).scroll_into_view()
+            el = self._resolve_element(target)
+            self._ctx.mark_action()
+            return el.scroll_into_view()
         if y is None:
             raise TypeError("scroll_to() missing y coordinate")
-        return page.scroll_to(self._session.bridge, target, y)
+        return page.scroll_to(self._ctx, target, y)
 
     @property
     def url(self) -> str:
-        return page.get_url(self._session.bridge)
+        return page.get_url(self._ctx)
 
     @property
     def title(self) -> str:
-        return page.get_title(self._session.bridge)
-
-    def new_tab(self, url: str = "about:blank") -> dict:
-        return tabs.new_tab(self._session.bridge, url)
-
-    def close_tab(self, tab_id: int | None = None) -> dict:
-        return tabs.close_tab(self._session.bridge, tab_id)
-
-    def tab_info(self) -> dict:
-        return tabs.tab_info(self._session.bridge)
+        return page.get_title(self._ctx)
 
     def wait_for_idle(self, silence: float = 2.0, timeout: float = 30.0) -> bool:
-        return page.wait_for_idle(self._session.bridge, silence, timeout)
+        return page.wait_for_idle(self._ctx, silence, timeout)
 
-    def wait_for_response(self, url_pattern: str, timeout: float = 10.0) -> dict | None:
-        """Wait for a network response matching *url_pattern* (glob)."""
-        return self._session.bridge.wait_for_response(url_pattern, timeout)
+    # -- tabs ---------------------------------------------------------------
 
-    def __enter__(self) -> Browser:
+    def new_tab(
+        self, url: str = "about:blank", *, switch: bool = True
+    ) -> dict[str, Any]:
+        return tab_ops.new_tab(self._ctx, url, switch=switch)
+
+    def switch_to_tab(self, tab_id: int) -> dict[str, Any]:
+        return tab_ops.switch_to_tab(self._ctx, tab_id)
+
+    def tabs(self) -> list[dict[str, Any]]:
+        return tab_ops.list_tabs(self._ctx)
+
+    def close_tab(self, tab_id: int | None = None) -> dict[str, Any]:
+        return tab_ops.close_tab(self._ctx, tab_id)
+
+    def tab_info(self) -> dict[str, Any]:
+        return tab_ops.tab_info(self._ctx)
+
+    # -- network ------------------------------------------------------------
+
+    def wait_for_response(
+        self,
+        url_pattern: str,
+        timeout: float = 10.0,
+        *,
+        since: float | None = None,
+        any_tab: bool = False,
+    ) -> dict[str, Any] | None:
+        """First response matching ``url_pattern`` (glob) in the pinned tab.
+
+        ``since`` (epoch ms) defaults to the start of the last action, so a
+        response that finished before it is not matched; ``None`` on timeout.
+        """
+        return page.wait_for_response(
+            self._ctx, url_pattern, timeout, since=since, any_tab=any_tab
+        )
+
+    def expect_response(
+        self, url_pattern: str, timeout: float = 10.0, *, any_tab: bool = False
+    ) -> ResponseExpectation:
+        """``with browser.expect_response("*/api/*") as resp: ...``; then ``resp.value``."""
+        return ResponseExpectation(self._ctx, url_pattern, timeout, any_tab=any_tab)
+
+    def __enter__(self) -> Self:
         return self.launch()
 
     def __exit__(self, *exc: object) -> None:

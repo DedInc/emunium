@@ -1,6 +1,18 @@
 from __future__ import annotations
 
+import copy
 from enum import Enum
+
+from emunium.errors import InvalidArgumentError
+
+
+def _count(name: str, n: object) -> int:
+    """``n`` as a non-negative int; bools and other types are rejected."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise InvalidArgumentError(f"{name}() expects a non-negative int, got {n!r}")
+    if n < 0:
+        raise InvalidArgumentError(f"{name}() expects a non-negative int, got {n}")
+    return n
 
 
 class WaitStrategy(str, Enum):
@@ -64,11 +76,11 @@ class Wait:
         return self
 
     def count_gt(self, n: int) -> Wait:
-        self._conditions.append({"type": "count_gt", "value": n})
+        self._conditions.append({"type": "count_gt", "value": _count("count_gt", n)})
         return self
 
     def count_eq(self, n: int) -> Wait:
-        self._conditions.append({"type": "count_eq", "value": n})
+        self._conditions.append({"type": "count_eq", "value": _count("count_eq", n)})
         return self
 
     def custom_js(self, code: str) -> Wait:
@@ -106,7 +118,8 @@ class Wait:
         return self
 
     def to_payload(self) -> list[dict]:
-        return self._conditions
+        """A deep copy: mutating the payload never changes this builder."""
+        return copy.deepcopy(self._conditions)
 
     def __repr__(self) -> str:
         return f"Wait(conditions={self._conditions})"
