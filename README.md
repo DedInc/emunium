@@ -9,8 +9,8 @@ No CDP, no WebDriver.
 
 - **Verified clicks** at any DPI, page zoom or monitor layout: a click that
   would land on the wrong element raises an error instead of pressing.
-- **Unicode typing on Windows that ignores the keyboard layout**: Cyrillic, CJK
-  and emoji go out as keystrokes, not through the clipboard.
+- **Unicode typing on Windows and Linux that ignores the keyboard layout**:
+  Cyrillic, CJK and emoji go out as keystrokes, not through the clipboard.
 - **Typed errors instead of silent failures**: stale elements, closed tabs, lost
   focus and blocked scripts each raise their own exception.
 - **Isolated sessions**: every browser has its own extension copy, port and
@@ -45,6 +45,7 @@ matching and OCR.
 - [PageParser and Locator](#pageparser-and-locator)
 - [Advanced utilities](#advanced-utilities)
 - [Limitations](#limitations)
+- [Running the Linux suite](#running-the-linux-suite)
 
 ---
 
@@ -60,11 +61,15 @@ Requires Python 3.10 or newer. Runtime dependencies per platform:
 |---|---|---|
 | Windows | `websockets` | built-in backend: Win32 `SendInput` / `SetCursorPos` via `ctypes` |
 | macOS | `websockets`, `pyautogui`, `pyperclip` | `pyautogui` |
-| Linux | `websockets`, `pyautogui`, `pyperclip` | `pyautogui` (X11, or XWayland) |
+| Linux | `websockets`, `pyperclip` | built-in backend: X11 XTest via `ctypes` (X11, or XWayland) |
 
-`pyperclip` is used on macOS and Linux to paste characters that cannot be sent
-as key presses (see [Keyboard](#keyboard)). Windows needs neither it nor
-pyautogui, and never imports pyautogui.
+On Linux, native input needs an X server or XWayland (`DISPLAY` set) and the
+system libraries `libX11.so.6` and `libXtst.so.6` (Debian/Ubuntu packages
+`libx11-6` and `libxtst6`); no Python package is involved.
+
+`pyperclip` is used on macOS to paste characters that cannot be sent as key
+presses (see [Keyboard](#keyboard)); on Linux it is only reached for control
+characters. Windows and Linux do not install pyautogui and never import it.
 
 Optional extras:
 
@@ -73,7 +78,7 @@ Optional extras:
 | `standalone` | `opencv-python-headless`, `numpy`, `mss` | `Emunium.find_elements()` image matching |
 | `ocr` | `opencv-python-headless`, `numpy`, `mss`, `easyocr` | `Emunium.find_text_elements()` OCR |
 | `parsing` | `selectolax` | `PageParser` / `Locator` queries |
-| `keyboard` | `keyboard` | non-ASCII keystrokes on macOS/Linux when running as root |
+| `keyboard` | `keyboard` | non-ASCII keystrokes on macOS when running as root |
 
 ```bash
 pip install "emunium[standalone,parsing]"
@@ -394,11 +399,17 @@ How characters are delivered:
   (`KEYEVENTF_UNICODE`). The active keyboard layout does not matter: Cyrillic,
   CJK, accented letters and emoji are typed as keystrokes, never pasted. `\n`
   is sent as Enter and `\t` as Tab.
-- **macOS and Linux**: printable ASCII, `\n` and `\t` are typed as key presses.
+- **Linux**: every character is typed as a keystroke through X11 XTest,
+  whatever the keyboard layout. A character the layout lacks (Cyrillic on a US
+  layout, CJK, emoji) is typed on a spare keycode that emunium maps to it for a
+  moment and restores afterwards; nothing is pasted. Run one emunium process
+  per X display (one worker per display or Xvfb): two processes typing such
+  characters on the same display can interfere.
+- **macOS**: printable ASCII, `\n` and `\t` are typed as key presses.
   Other characters are typed with the `keyboard` package when it is installed
   and the process runs as root; otherwise they are pasted through the clipboard
-  (`Cmd+V` / `Ctrl+V`). The previous clipboard text is restored afterwards if
-  the clipboard still holds the pasted text.
+  (`Cmd+V`). The previous clipboard text is restored afterwards if the
+  clipboard still holds the pasted text.
 
 `human=True` waits between keystrokes as the browser's typing rhythm draws it
 (see [Typing rhythm](#typing-rhythm)). `characters_per_minute` (60 to 900)
@@ -411,10 +422,10 @@ ranges raises `InvalidArgumentError` before any key is sent.
 
 ### Fail-safe
 
-- **Windows**: with the cursor in a corner of the primary screen, the next
-  native action is refused with `NativeInputError`. Set `EMUNIUM_FAILSAFE=0` to
-  disable this check.
-- **macOS and Linux**: pyautogui's own fail-safe applies and raises
+- **Windows and Linux**: with the cursor in a corner of the primary screen (on
+  Linux, of the X screen), the next native action is refused with
+  `NativeInputError`. Set `EMUNIUM_FAILSAFE=0` to disable this check.
+- **macOS**: pyautogui's own fail-safe applies and raises
   `pyautogui.FailSafeException`. `EMUNIUM_FAILSAFE` has no effect there.
 
 ---
@@ -891,12 +902,32 @@ when no `chrome_path` is given.
   Linux it relies on the extension focusing the window. Real input moves the
   real cursor: do not use the mouse or keyboard while a script runs.
 - **No native input in headless mode** (see [Headless mode](#headless-mode)).
-- **Linux** native input goes through pyautogui and requires an X11 session
-  (XWayland included); pure Wayland sessions are not supported.
+- **Linux** native input goes through X11 XTest and requires an X server or
+  XWayland (`DISPLAY` set) plus `libx11-6` and `libxtst6`; a pure Wayland
+  session without XWayland raises `NativeInputError`. Use one emunium process
+  per X display.
 - **macOS** requires the Accessibility (and, for standalone screenshots, Screen
   Recording) permission for the terminal or Python process.
 - Standalone clicks are not verified, and OCR quality depends on EasyOCR and the
   screen content.
+
+---
+
+## Running the Linux suite
+
+```bash
+python tests/docker/run_linux.py
+```
+
+Needs Docker. The script builds the `emunium-linux-tests:local` image
+(`tests/docker/Dockerfile`: Python 3.10, Debian's Chromium, Xvfb and openbox)
+from a temporary context holding only the package, the tests and the project
+metadata, then runs the unit suite and the e2e suite (real X11 input against
+Chromium) under Xvfb in one container. It prints the tail of the log and exits
+with the container's status, non-zero when either suite failed. Options:
+`--tail N` (log lines to print, default 60), `--log PATH` (full log, default
+`emunium-linux-tests.log` in the temp directory), `--timeout S` (container run
+limit, default 1800).
 
 ---
 

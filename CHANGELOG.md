@@ -84,8 +84,19 @@ observe; they are listed first.
   and before every native action, without sending keys or clicks; when Windows
   keeps another window in front, the action raises `NativeInputError`.
 - On Windows, `EMUNIUM_FAILSAFE=0` disables the screen-corner fail-safe of the
-  built-in input backend (which raises `NativeInputError`). On macOS and Linux
-  pyautogui's own fail-safe (`pyautogui.FailSafeException`) still applies.
+  built-in input backend (which raises `NativeInputError`); the same holds for
+  the Linux backend. On macOS pyautogui's own fail-safe
+  (`pyautogui.FailSafeException`) still applies.
+- Native X11 input backend on Linux: pointer, buttons, wheel and keys go through
+  libX11 and the XTest extension via `ctypes` (needs an X server or XWayland
+  and the system packages `libx11-6` and `libxtst6`). A pure Wayland session
+  without XWayland raises `NativeInputError`.
+- Unicode typing on Linux without the clipboard: Cyrillic, CJK and emoji are
+  typed as keystrokes whatever the keyboard layout, characters the layout lacks
+  on briefly remapped spare keycodes that are restored afterwards. Run one
+  emunium process per X display.
+- `python tests/docker/run_linux.py` builds a Docker image (Xvfb, openbox,
+  Chromium) and runs the unit and e2e suites on Linux in it.
 
 ### Changed
 
@@ -103,8 +114,10 @@ observe; they are listed first.
 - Standalone mode captures the screen with `mss` and uses
   `opencv-python-headless`; matches are ranked by score and de-duplicated, and
   coordinates are correct on Retina displays.
-- Dependencies: `websockets>=14,<18`; `pyautogui` only on macOS and Linux,
-  which keep using it for native input; `pyperclip`
+- On Linux, mouse and keyboard input use the built-in X11 backend; pyautogui is
+  no longer installed or imported there.
+- Dependencies: `websockets>=14,<18`; `pyautogui` only on macOS, which keeps
+  using it for native input; `pyperclip`
   only on macOS and Linux; `HumanCursor` removed. The `standalone` and `ocr`
   extras now include `mss` and `opencv-python-headless` instead of
   `opencv-python`.

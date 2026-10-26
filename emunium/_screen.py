@@ -113,7 +113,10 @@ def input_backend() -> InputBackend:
     """The process-wide OS input backend, chosen once (native-input.md 5a).
 
     Windows: ``emunium._native.win32`` (ctypes, pyautogui is never imported).
-    Elsewhere: pyautogui, imported lazily. DPI awareness is chosen first.
+    Linux with ``DISPLAY`` (X11 or XWayland): ``emunium._native.x11`` (ctypes
+    over libX11/libXtst, pyautogui is never imported); Wayland without
+    XWayland raises ``NativeInputError``. macOS: pyautogui, imported lazily.
+    DPI awareness is chosen first.
     """
     global _BACKEND
     backend = _BACKEND
