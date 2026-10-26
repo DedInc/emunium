@@ -22,45 +22,115 @@ class ElementRecord:
         )
 
 
+_TAG_RE = re.compile(r"[a-zA-Z][\w-]*")
+_ID_RE = re.compile(r"#([\w-]+)")
+_CLASS_RE = re.compile(r"\.([\w-]+)")
+_ATTR_RE = re.compile(r"\[([^\]]+)\]")
+_ATTR_OP_RE = re.compile(
+    r"^\s*([\w:_-]+)\s*(\*=|\^=|\$=|~=|=)\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"']*))\s*$"
+)
+_ATTR_PRESENT_RE = re.compile(r"^\s*([\w:_-]+)\s*$")
+
+
+def _split_selector_list(selector: str) -> list[str]:
+    """Split on top-level commas, ignoring commas inside ``[...]`` or quotes."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote = ""
+    for ch in selector:
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(depth - 1, 0)
+        elif ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    parts.append("".join(current))
+    return parts
+
+
 def _parse_selector(selector: str) -> list[dict]:
-    conditions: list[dict] = []
+    """Parse one compound selector (tag, ``#id``, ``.class``, ``[attr]``).
+
+    The store holds a flat list of records with no tree, so anything that
+    needs structure or state raises ``ValueError`` instead of being dropped:
+    dropping ``" .btn"`` from ``"div .btn"`` would match every div.
+    """
     s = selector.strip()
+    if not s:
+        raise ValueError(f"empty selector in {selector!r}")
+    conditions: list[dict] = []
+    pos = 0
 
-    m = re.match(r"^([a-zA-Z][a-zA-Z0-9]*)", s)
-    if m:
-        conditions.append({"type": "tag", "value": m.group(1).lower()})
-        s = s[m.end() :]
+    if s.startswith("*"):
+        pos = 1
+    else:
+        m = _TAG_RE.match(s)
+        if m:
+            conditions.append({"type": "tag", "value": m.group(0).lower()})
+            pos = m.end()
 
-    m = re.match(r"^#([\w-]+)", s)
-    if m:
-        conditions.append(
-            {"type": "attr", "name": "id", "op": "=", "value": m.group(1)}
-        )
-        s = s[m.end() :]
-
-    while m := re.match(r"^\.([\w-]+)", s):
-        conditions.append({"type": "class", "value": m.group(1)})
-        s = s[m.end() :]
-
-    while m := re.match(r"^\[([^\]]+)\]", s):
-        inner = m.group(1)
-        op_m = re.match(
-            r"^([\w:_-]+)\s*(\*=|\^=|\$=|~=|=)\s*[\"']?([^\"']*)[\"']?$", inner
-        )
-        if op_m:
+    while pos < len(s):
+        ch = s[pos]
+        m = _ID_RE.match(s, pos)
+        if m:
             conditions.append(
-                {
-                    "type": "attr",
-                    "name": op_m.group(1),
-                    "op": op_m.group(2),
-                    "value": op_m.group(3),
-                }
+                {"type": "attr", "name": "id", "op": "=", "value": m.group(1)}
             )
-        elif re.match(r"^[\w:_-]+$", inner.strip()):
-            conditions.append({"type": "attr_present", "name": inner.strip()})
-        s = s[m.end() :]
+            pos = m.end()
+            continue
+        m = _CLASS_RE.match(s, pos)
+        if m:
+            conditions.append({"type": "class", "value": m.group(1)})
+            pos = m.end()
+            continue
+        m = _ATTR_RE.match(s, pos)
+        if m:
+            inner = m.group(1)
+            op_m = _ATTR_OP_RE.match(inner)
+            present_m = _ATTR_PRESENT_RE.match(inner)
+            if op_m:
+                value = next(g for g in op_m.group(3, 4, 5) if g is not None)
+                conditions.append(
+                    {
+                        "type": "attr",
+                        "name": op_m.group(1),
+                        "op": op_m.group(2),
+                        "value": value,
+                    }
+                )
+            elif present_m:
+                conditions.append({"type": "attr_present", "name": present_m.group(1)})
+            else:
+                raise ValueError(
+                    f"unsupported attribute selector [{inner}] in {selector!r}"
+                )
+            pos = m.end()
+            continue
+        if ch.isspace() or ch in ">+~":
+            raise ValueError(
+                f"combinators (descendant, child, sibling) are not supported "
+                f"by CoordsStore: {selector!r}"
+            )
+        if ch == ":":
+            raise ValueError(
+                f"pseudo-classes are not supported by CoordsStore: {selector!r}"
+            )
+        raise ValueError(f"unsupported selector syntax at {s[pos:]!r} in {selector!r}")
 
     return conditions
+
+
+def _parse_selector_list(selector: str) -> list[list[dict]]:
+    return [_parse_selector(part) for part in _split_selector_list(selector)]
 
 
 def _attr_match(val: str, op: str, target: str) -> bool:
@@ -149,9 +219,13 @@ class CoordsStore:
             return self._inner_height
 
     def query(self, selector: str) -> list[ElementRecord]:
-        conds = _parse_selector(selector)
+        groups = _parse_selector_list(selector)
         with self._lock:
-            return [r for r in self._records if _record_matches(r, conds)]
+            return [
+                r
+                for r in self._records
+                if any(_record_matches(r, conds) for conds in groups)
+            ]
 
     def query_first(self, selector: str) -> ElementRecord | None:
         results = self.query(selector)

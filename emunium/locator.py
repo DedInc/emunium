@@ -17,6 +17,25 @@ ROLE_SELECTOR_MAP = {
 }
 
 
+_PARSING_HINT = (
+    "PageParser queries require selectolax; install it with "
+    "pip install emunium[parsing]"
+)
+
+
+def _node_text(node: object, *, deep: bool = True) -> str | None:
+    """Return the text of a selectolax node (``text()``) or a live Element
+    (``text`` is a plain str property); ``None`` when the node has no text."""
+    if hasattr(node, "text"):
+        text = node.text
+        if callable(text):
+            return text(deep=deep)
+        return text
+    if hasattr(node, "_text"):
+        return node._text
+    return None
+
+
 class Locator:
     """Playwright-like locator for static HTML and live bridge elements."""
 
@@ -27,15 +46,9 @@ class Locator:
         result = self._nodes
         if has_text is not None:
             target = has_text.lower()
-            result = []
-            for n in self._nodes:
-                text = ""
-                if hasattr(n, "text"):
-                    text = n.text() or "" if callable(n.text) else n.text or ""
-                elif hasattr(n, "_text"):
-                    text = n._text or ""
-                if target in text.lower():
-                    result.append(n)
+            result = [
+                n for n in self._nodes if target in (_node_text(n) or "").lower()
+            ]
         return Locator(result)
 
     @property
@@ -61,11 +74,7 @@ class Locator:
         node = self.first
         if node is None:
             return None
-        if hasattr(node, "text") and callable(node.text):
-            return node.text(deep=True)
-        if hasattr(node, "text"):
-            return node.text
-        return None
+        return _node_text(node)
 
     def get_attribute(self, name: str) -> str | None:
         node = self.first
@@ -88,7 +97,8 @@ class Locator:
 class PageParser:
     """Parses a static HTML snapshot and provides Playwright-style query methods.
 
-    Uses selectolax if available, otherwise falls back to basic regex parsing.
+    Query methods require selectolax (``pip install emunium[parsing]``) and
+    raise ``ImportError`` without it; ``title`` falls back to a regex.
     """
 
     def __init__(self, html: str) -> None:
@@ -96,14 +106,20 @@ class PageParser:
         self._tree = None
         try:
             from selectolax.lexbor import LexborHTMLParser
-
-            self._tree = LexborHTMLParser(html)
         except ImportError:
-            pass
+            return
+        self._tree = LexborHTMLParser(html)
+
+    def _require_tree(self):
+        # An empty Locator would be indistinguishable from "no match", so a
+        # missing parser must fail loudly rather than return nothing.
+        if self._tree is None:
+            raise ImportError(_PARSING_HINT)
+        return self._tree
 
     @property
     def title(self) -> str | None:
-        if self._tree:
+        if self._tree is not None:
             node = self._tree.css_first("title")
             return node.text() if node else None
         import re
@@ -114,13 +130,11 @@ class PageParser:
         return m.group(1).strip() if m else None
 
     def locator(self, css: str, *, has_text: str | None = None) -> Locator:
-        if self._tree:
-            nodes = list(self._tree.css(css))
-            loc = Locator(nodes)
-            if has_text is not None:
-                loc = loc.filter(has_text=has_text)
-            return loc
-        return Locator([])
+        tree = self._require_tree()
+        loc = Locator(list(tree.css(css)))
+        if has_text is not None:
+            loc = loc.filter(has_text=has_text)
+        return loc
 
     @staticmethod
     def _css_escape(value: str) -> str:
@@ -132,19 +146,17 @@ class PageParser:
         )
 
     def get_by_text(self, text: str, *, exact: bool = False) -> Locator:
-        if not self._tree:
-            return Locator([])
+        tree = self._require_tree()
         safe = self._css_escape(text)
-        candidates = list(self._tree.css(f':lexbor-contains("{safe}" i)'))
+        candidates = list(tree.css(f':lexbor-contains("{safe}" i)'))
         if exact:
             candidates = [n for n in candidates if (n.text(strip=True) or "") == text]
         return Locator(candidates)
 
     def get_by_role(self, role: str, *, name: str | None = None) -> Locator:
-        if not self._tree:
-            return Locator([])
+        tree = self._require_tree()
         selector = ROLE_SELECTOR_MAP.get(role, f'[role="{role}"]')
-        nodes = list(self._tree.css(selector))
+        nodes = list(tree.css(selector))
         if name is not None:
             target = name.lower()
             nodes = [
@@ -158,13 +170,12 @@ class PageParser:
         return Locator(nodes)
 
     def get_by_placeholder(self, text: str, *, exact: bool = False) -> Locator:
-        if not self._tree:
-            return Locator([])
+        tree = self._require_tree()
         if exact:
-            nodes = list(self._tree.css(f'[placeholder="{self._css_escape(text)}"]'))
+            nodes = list(tree.css(f'[placeholder="{self._css_escape(text)}"]'))
         else:
             target = text.lower()
-            all_inputs = self._tree.css("[placeholder]")
+            all_inputs = tree.css("[placeholder]")
             nodes = [
                 n
                 for n in all_inputs
@@ -173,17 +184,18 @@ class PageParser:
         return Locator(nodes)
 
     def get_by_label(self, text: str) -> Locator:
-        if not self._tree:
-            return Locator([])
+        tree = self._require_tree()
         target = text.lower()
-        labels = self._tree.css("label")
+        labels = tree.css("label")
         results = []
         for label in labels:
             if target not in (label.text(strip=True) or "").lower():
                 continue
             for_attr = label.attrs.get("for")
             if for_attr:
-                el = self._tree.css_first(f"#{for_attr}")
+                # An attribute selector accepts any id ("1st", "a.b", "x:y");
+                # "#id" would misparse or reject those.
+                el = tree.css_first(f'[id="{self._css_escape(for_attr)}"]')
                 if el:
                     results.append(el)
             else:
@@ -193,7 +205,6 @@ class PageParser:
         return Locator(results)
 
     def get_by_test_id(self, test_id: str) -> Locator:
-        if not self._tree:
-            return Locator([])
-        nodes = list(self._tree.css(f'[data-testid="{self._css_escape(test_id)}"]'))
+        tree = self._require_tree()
+        nodes = list(tree.css(f'[data-testid="{self._css_escape(test_id)}"]'))
         return Locator(nodes)
