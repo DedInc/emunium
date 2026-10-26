@@ -211,7 +211,7 @@ def test_typing_ascii_cyrillic_and_emoji(headed: Browser) -> None:
     # Element.type with a human rhythm; it settles before returning. The field
     # is emptied first: its own click places the caret wherever it lands.
     headed.execute_script("document.getElementById('field').value = ''")
-    field.type("Ёж ok ✓ 🙂", human=True, characters_per_minute=1200, offset=5)
+    field.type("Ёж ok ✓ 🙂", human=True, characters_per_minute=900, offset=5)
     assert (
         headed.execute_script("return document.getElementById('field').value")
         == "Ёж ok ✓ 🙂"
