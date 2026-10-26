@@ -20,7 +20,7 @@ from emunium._browser.page import ResponseExpectation
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.element import Element
-from emunium.errors import InvalidArgumentError
+from emunium.errors import InvalidArgumentError, NativeInputError
 from emunium.wait import Wait, WaitStrategy
 
 if TYPE_CHECKING:
@@ -65,7 +65,11 @@ class Browser:
         return self._ctx
 
     def launch(self) -> Self:
-        """Start Chrome and pin its initial tab; on failure nothing stays running."""
+        """Start Chrome and pin its initial tab; on failure nothing stays running.
+
+        Then the window is brought to the foreground once (best effort: a
+        browser started from a background process opens behind other windows).
+        """
         launch(self._session, bridge_timeout=self._bridge_timeout)
         try:
             tab_ops.pin_active(self._ctx)
@@ -75,9 +79,17 @@ class Browser:
             except Exception:
                 logger.exception("Cleanup after a failed launch raised")
             raise
+        process = self._session.process
+        self._ctx.pid = None if process is None else process.pid
+        try:
+            self._ctx.ensure_foreground(None)
+        except NativeInputError as exc:
+            # Every native action raises the window again before its input.
+            logger.info("Browser window not brought to the foreground: %s", exc)
         return self
 
     def close(self) -> None:
+        self._ctx.pid = None
         close(self._session)
 
     # -- navigation and lookups ---------------------------------------------

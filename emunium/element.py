@@ -519,9 +519,19 @@ class Element:
     # -- pointer transaction -------------------------------------------------
 
     def _begin(self) -> None:
-        """Headless refusal and tab activation (native-input.md 4.1-4.2)."""
-        self._ctx.require_native_input()
-        self._ctx.bridge.activate_tab(tab_id=self._tab())
+        """Headless refusal, tab activation (native-input.md 4.1-4.2), then the
+        browser window to the foreground.
+
+        The window is matched by the handle's geometry; a handle without one is
+        described first.
+        """
+        ctx = self._ctx
+        ctx.require_native_input()
+        ctx.bridge.activate_tab(tab_id=self._tab())
+        if ctx.manages_foreground:
+            if self._geometry is None:
+                self._describe()
+            ctx.ensure_foreground(self._geometry)
 
     def _acquire(
         self,

@@ -17,7 +17,9 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,8 +28,12 @@ from emunium import _screen as screen_module
 from emunium import element as element_module
 from emunium._bridge.facade import Bridge
 from emunium._bridge.transport import PINNED, Reply
+from emunium._browser import context as context_module
 from emunium._browser import dom
+from emunium._browser import facade as facade_module
+from emunium._browser import tabs as tabs_module
 from emunium._browser.context import BrowserContext, DragInteractor
+from emunium._native.win32 import CHROME_WINDOW_CLASS
 from emunium._screen import (
     NATIVE_INPUT_LOCK,
     Calibration,
@@ -481,6 +487,16 @@ class FakeBridge(Bridge):
 @pytest.fixture(autouse=True)
 def seeded_rng(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(element_module, "_RNG", random.Random(3))
+
+
+@pytest.fixture(autouse=True)
+def no_real_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A context that would reach the real window API fails the test instead."""
+
+    def refuse() -> None:
+        raise AssertionError("unit test reached the real window API")
+
+    monkeypatch.setattr(context_module, "Win32Windows", refuse)
 
 
 @pytest.fixture
@@ -1589,6 +1605,297 @@ def test_element_module_imports_without_pyautogui() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+# -- foreground window ---------------------------------------------------------------
+
+BROWSER_PID = 100
+BROWSER_HWND = 0x10
+OTHER_HWND = 0x30
+# GEOMETRY's window in physical px at dpr 1: (left, top, right, bottom).
+BROWSER_RECT = (0, 0, 1000, 800)
+
+
+@dataclass
+class FakeWindow:
+    hwnd: int
+    pid: int
+    thread_id: int
+    rect: tuple[int, int, int, int]
+    class_name: str = CHROME_WINDOW_CLASS
+    minimized: bool = False
+
+
+class FakeWindows:
+    """``WindowApi`` over an in-memory desktop, logging into the world.
+
+    The browser (pid 100) owns no window itself; its child (pid 101) owns the
+    browser window, and a foreign process (pid 200) owns the window in front.
+    """
+
+    def __init__(self, world: World) -> None:
+        self.world = world
+        self.windows = [
+            FakeWindow(OTHER_HWND, 200, 30, BROWSER_RECT, class_name="ConsoleWindow"),
+            FakeWindow(BROWSER_HWND, 101, 10, BROWSER_RECT),
+        ]
+        self.parents = [(BROWSER_PID, 1), (101, BROWSER_PID), (200, 1)]
+        self.foreground = OTHER_HWND
+        self.refuse = False
+        self.enum_error: Exception | None = None
+
+    def _window(self, hwnd: int) -> FakeWindow:
+        return next(window for window in self.windows if window.hwnd == hwnd)
+
+    def _log(self, *entry: Any) -> None:
+        self.world.log.append(("window", *entry))
+
+    def enum_windows(self) -> list[int]:
+        if self.enum_error is not None:
+            raise self.enum_error
+        return [window.hwnd for window in self.windows]
+
+    def window_thread_process_id(self, hwnd: int) -> tuple[int, int]:
+        window = self._window(hwnd)
+        return window.thread_id, window.pid
+
+    def is_window_visible(self, hwnd: int) -> bool:
+        return True
+
+    def class_name(self, hwnd: int) -> str:
+        return self._window(hwnd).class_name
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        return self._window(hwnd).rect
+
+    def is_iconic(self, hwnd: int) -> bool:
+        return self._window(hwnd).minimized
+
+    def ex_style(self, hwnd: int) -> int:
+        return 0
+
+    def process_parents(self) -> list[tuple[int, int]]:
+        return list(self.parents)
+
+    def foreground_window(self) -> int:
+        return self.foreground
+
+    def current_thread_id(self) -> int:
+        return 1
+
+    def attach_thread_input(self, attach: int, attach_to: int, on: bool) -> bool:
+        self._log("attach" if on else "detach", attach_to)
+        return True
+
+    def show_window(self, hwnd: int, command: int) -> bool:
+        self._log("show", hwnd, command)
+        return True
+
+    def set_foreground_window(self, hwnd: int) -> bool:
+        self._log("set_foreground", hwnd)
+        if self.refuse:
+            return False
+        self.foreground = hwnd
+        return True
+
+    def bring_window_to_top(self, hwnd: int) -> bool:
+        self._log("bring_to_top", hwnd)
+        return True
+
+    def set_focus(self, hwnd: int) -> int:
+        self._log("set_focus", hwnd)
+        return self.foreground
+
+
+def _window_steps(world: World) -> list[str]:
+    """The transaction order with window calls named by what they do."""
+    return [
+        entry[1] if entry[0] in ("bridge", "window") else entry[0]
+        for entry in world.log
+    ]
+
+
+@pytest.fixture
+def desktop(world: World) -> FakeWindows:
+    return FakeWindows(world)
+
+
+def test_click_raises_the_browser_window_after_activating_the_tab(
+    world: World, desktop: FakeWindows
+) -> None:
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+    handle(ctx).click()
+
+    steps = _window_steps(world)
+    assert steps[:2] == ["activateTab", "attach"]
+    assert steps.index("set_foreground") < steps.index("scrollIntoView")
+    assert desktop.foreground == BROWSER_HWND
+    attached = [entry[2] for entry in world.kinds("window") if entry[1] == "attach"]
+    detached = [entry[2] for entry in world.kinds("window") if entry[1] == "detach"]
+    assert sorted(attached) == sorted(detached) == [10, 30]
+    assert pressed_inside(world, "doc1.1")
+
+
+def test_window_matching_the_page_geometry_is_raised(
+    world: World, desktop: FakeWindows
+) -> None:
+    world.geometry = {**GEOMETRY, "screenX": 200, "screenY": 100}
+    # A second browser window sits where the page's window is not.
+    desktop.windows.insert(0, FakeWindow(0x20, BROWSER_PID, 20, BROWSER_RECT))
+    desktop.windows.append(FakeWindow(BROWSER_HWND + 1, 101, 10, (203, 96, 1205, 902)))
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+    handle(ctx).hover()
+
+    assert desktop.foreground == BROWSER_HWND + 1
+
+
+def test_window_already_in_front_is_left_alone(
+    world: World, desktop: FakeWindows
+) -> None:
+    desktop.foreground = BROWSER_HWND
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+    handle(ctx).click()
+
+    assert world.kinds("window") == []
+    assert len(world.presses()) == 1
+
+
+def test_window_kept_behind_refuses_before_any_input(
+    world: World, desktop: FakeWindows
+) -> None:
+    desktop.refuse = True
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+
+    with pytest.raises(
+        NativeInputError, match="could not be brought to the foreground"
+    ):
+        handle(ctx).click()
+    assert world.bridge_methods() == ["activateTab"]
+    assert world.moves() == [] and world.presses() == []
+    # Every thread input attachment is undone.
+    assert [entry[1] for entry in world.kinds("window")].count("detach") == 2
+
+
+def test_no_browser_window_refuses_before_any_input(
+    world: World, desktop: FakeWindows
+) -> None:
+    desktop.windows = [desktop.windows[0]]  # only the foreign window is left
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+
+    with pytest.raises(
+        NativeInputError, match="could not be brought to the foreground"
+    ):
+        handle(ctx).click()
+    assert world.kinds("window") == [] and world.moves() == []
+
+
+def test_window_api_failure_becomes_native_input_error(
+    world: World, desktop: FakeWindows
+) -> None:
+    desktop.enum_error = OSError("EnumWindows failed")
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+
+    with pytest.raises(NativeInputError, match="foreground: EnumWindows") as info:
+        handle(ctx).click()
+    assert isinstance(info.value.__cause__, OSError)
+    assert world.moves() == []
+
+
+def test_handle_without_geometry_is_described_before_the_raise(
+    world: World, desktop: FakeWindows
+) -> None:
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+    Element(ctx, "doc1.1", tab_id=TAB).click()
+
+    steps = _window_steps(world)
+    assert steps[:3] == ["activateTab", "describeElement", "attach"]
+    assert desktop.foreground == BROWSER_HWND
+
+
+def test_drag_raises_the_window_once_before_scrolling(
+    world: World, desktop: FakeWindows
+) -> None:
+    world.add("src", 100, 300, 100, 40)
+    world.add("dst", 600, 400, 100, 40)
+    ctx = make_ctx(world, pid=BROWSER_PID, windows=desktop)
+    handle(ctx, "src").drag_to(handle(ctx, "dst"))
+
+    steps = _window_steps(world)
+    assert steps.count("set_foreground") == 1
+    assert steps.index("set_foreground") < steps.index("scrollIntoView")
+
+
+@pytest.mark.parametrize("case", ["no pid", "headless", "not windows"])
+def test_foreground_is_a_no_op_without_pid_window_or_windows(
+    world: World,
+    desktop: FakeWindows,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    pid = None if case == "no pid" else BROWSER_PID
+    ctx = make_ctx(world, pid=pid, headless=case == "headless", windows=desktop)
+    if case == "not windows":
+        monkeypatch.setattr(context_module, "_on_windows", lambda: False)
+
+    assert ctx.manages_foreground is False
+    ctx.ensure_foreground(world.live())
+    if case != "headless":
+        Element(ctx, "doc1.1", tab_id=TAB).click()
+        # No describe for the missing geometry either: the order is unchanged.
+        assert world.sequence()[:2] == ["activateTab", "scrollIntoView"]
+    assert world.kinds("window") == [] and desktop.foreground == OTHER_HWND
+
+
+@pytest.fixture
+def launched(
+    world: World, desktop: FakeWindows, monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    """``Browser.launch`` without Chrome: a fake process with ``BROWSER_PID``."""
+    events: list[str] = []
+
+    def fake_launch(session: Any, bridge_timeout: float = 60.0) -> None:
+        session.process = SimpleNamespace(pid=BROWSER_PID)
+        events.append("launch")
+
+    monkeypatch.setattr(facade_module, "Bridge", lambda port=0: FakeBridge(world))
+    monkeypatch.setattr(facade_module, "launch", fake_launch)
+    monkeypatch.setattr(facade_module, "close", lambda session: events.append("close"))
+    monkeypatch.setattr(tabs_module, "pin_active", lambda ctx: events.append("pin"))
+    monkeypatch.setattr(context_module, "Win32Windows", lambda: desktop)
+    return events
+
+
+def test_launch_raises_the_window_once_and_close_forgets_the_pid(
+    launched: list[str], desktop: FakeWindows
+) -> None:
+    browser = facade_module.Browser().launch()
+
+    assert launched == ["launch", "pin"]
+    assert browser.context.pid == BROWSER_PID
+    assert desktop.foreground == BROWSER_HWND
+    browser.close()
+    assert browser.context.pid is None and launched[-1] == "close"
+
+
+def test_launch_survives_a_window_that_stays_behind(
+    launched: list[str], desktop: FakeWindows, caplog: pytest.LogCaptureFixture
+) -> None:
+    desktop.refuse = True
+    with caplog.at_level("INFO", logger="emunium.browser"):
+        browser = facade_module.Browser().launch()
+
+    assert browser.context.pid == BROWSER_PID
+    assert desktop.foreground == OTHER_HWND
+    assert "could not be brought to the foreground" in caplog.text
+
+
+def test_headless_launch_leaves_windows_alone(
+    launched: list[str], desktop: FakeWindows
+) -> None:
+    browser = facade_module.Browser(headless=True).launch()
+
+    assert browser.context.pid == BROWSER_PID
+    assert desktop.world.kinds("window") == []
 
 
 # -- dom ----------------------------------------------------------------------------

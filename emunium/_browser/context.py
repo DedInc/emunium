@@ -1,19 +1,31 @@
 """Per-browser state shared by every element handle.
 
 Contract: ``docs/architecture/python-internals.md`` (Browser context). Holds the
-bridge, the headless / verify-input switches, the pointer calibration and the OS
-interactor; ``Element`` transactions (``native-input.md`` section 4) read them.
+bridge, the headless / verify-input switches, the pointer calibration, the OS
+interactor and the browser's process id; ``Element`` transactions
+(``native-input.md`` section 4) read them.
 """
 
 from __future__ import annotations
 
+import ctypes
+import sys
 import threading
 import time
 from typing import Protocol
 
 from emunium._bridge.facade import Bridge
 from emunium._element_interactor import ElementInteractor
-from emunium._screen import NATIVE_INPUT_LOCK, Calibration
+from emunium._native.win32 import (
+    Win32Windows,
+    WindowApi,
+    bring_to_foreground,
+    descendant_pids,
+    is_foreground,
+    pick_browser_window,
+    top_level_windows,
+)
+from emunium._screen import NATIVE_INPUT_LOCK, Calibration, Geometry, input_per_dip
 from emunium.errors import NativeInputError
 
 __all__ = ["BrowserContext", "DragInteractor", "Interactor"]
@@ -22,6 +34,12 @@ __all__ = ["BrowserContext", "DragInteractor", "Interactor"]
 # (not in a registry keyed by it) lets both be collected together.
 _DEFAULT_ATTR = "_emunium_default_context"
 _DEFAULTS_LOCK = threading.Lock()
+# Window API failures that mean "the window could not be raised".
+_WINDOW_ERRORS = (NativeInputError, OSError, ctypes.ArgumentError)
+
+
+def _on_windows() -> bool:
+    return sys.platform == "win32"
 
 
 class Interactor(Protocol):
@@ -126,6 +144,8 @@ class BrowserContext:
         verify_input: bool = True,
         calibration: Calibration | None = None,
         interactor: Interactor | None = None,
+        pid: int | None = None,
+        windows: WindowApi | None = None,
     ) -> None:
         self.bridge = bridge
         self.headless = bool(headless)
@@ -136,6 +156,11 @@ class BrowserContext:
             interactor if interactor is not None else DragInteractor()
         )
         self.last_action_ms: float | None = None
+        # The browser process launched for this context (set by Browser.launch);
+        # None when the context only wraps a bridge.
+        self.pid = pid
+        # Window API, created on first use (Win32Windows needs Windows).
+        self._windows = windows
 
     @classmethod
     def of(cls, ctx_or_bridge: BrowserContext | Bridge) -> BrowserContext:
@@ -165,3 +190,71 @@ class BrowserContext:
                 "native input is unavailable for a headless browser: there is no "
                 "window to send OS events to"
             )
+
+    @property
+    def manages_foreground(self) -> bool:
+        """True when ``ensure_foreground`` acts: Windows, headed, pid known."""
+        return self.pid is not None and not self.headless and _on_windows()
+
+    def ensure_foreground(self, geometry: Geometry | None) -> None:
+        """Make the session's browser window the foreground window (Windows).
+
+        The window is a visible top-level window of the browser process or a
+        descendant whose rectangle matches ``geometry`` (``screenX``,
+        ``screenY``, ``outerWidth``, ``outerHeight`` in DIP, scaled by
+        ``input_per_dip``); without geometry only a single candidate counts.
+        It is raised only when it is not already the foreground window. Sends
+        no keyboard or mouse input.
+
+        A no-op on other platforms (the extension's ``chrome.windows`` focus is
+        all there is there), for a headless browser and when no pid is known
+        (a context built around a bare bridge instead of ``Browser.launch``).
+
+        Raises ``NativeInputError`` when the window cannot be found or raised.
+        """
+        pid = self.pid
+        if pid is None or not self.manages_foreground:
+            return
+        try:
+            api = self._window_api()
+            candidates = top_level_windows(descendant_pids(pid, api), api)
+            if geometry is None:
+                window = pick_browser_window(candidates, None, 1.0)
+            else:
+                window = pick_browser_window(
+                    candidates,
+                    (
+                        geometry.screen_x,
+                        geometry.screen_y,
+                        geometry.outer_width,
+                        geometry.outer_height,
+                    ),
+                    input_per_dip(geometry),
+                )
+            if window is None:
+                reason = (
+                    f"none of the {len(candidates)} visible top-level window(s) of "
+                    f"browser pid {pid} matches the page's window geometry"
+                )
+            elif is_foreground(window.hwnd, api) or bring_to_foreground(
+                window.hwnd, api
+            ):
+                return
+            else:
+                reason = (
+                    f"Windows kept another window in front of window {window.hwnd:#x} "
+                    "(foreground lock)"
+                )
+        except _WINDOW_ERRORS as exc:
+            raise NativeInputError(
+                f"the browser window could not be brought to the foreground: {exc}"
+            ) from exc
+        raise NativeInputError(
+            f"the browser window could not be brought to the foreground: {reason}; "
+            "an occluded window receives no pointer events"
+        )
+
+    def _window_api(self) -> WindowApi:
+        if self._windows is None:
+            self._windows = Win32Windows()
+        return self._windows

@@ -15,9 +15,7 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import time
-import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -59,24 +57,18 @@ def _launch(
 ) -> Browser:
     browser = make_browser(extra_args=[*WINDOW_ARGS, *(extra or [])], **kwargs)
     browser.goto(site_url + "/input.html")
-    _await_foreground(browser)
+    _await_visible(browser)
     return browser
 
 
-def _await_foreground(browser: Browser, timeout: float = 10.0) -> None:
-    """Precondition for real input: the test window is on top and visible.
+def _await_visible(browser: Browser, timeout: float = 10.0) -> None:
+    """Precondition for real input: the page reports itself visible.
 
-    Windows' foreground lock stops a Chrome started from a background process
-    from coming to the front, so it can open behind the terminal; an occluded
-    window receives no pointer events (the product then correctly raises
-    ``NativeInputError``). The window is made topmost (z-order only, no input);
-    the first verified click then activates it the way a user click does.
+    No foreground workaround here: ``Browser.launch`` raises the window, and
+    every native action raises it again before its input, even when another
+    window has been put in front since (a Chrome started from a background
+    process otherwise opens behind the terminal and receives no pointer events).
     """
-    if sys.platform == "win32":
-        token = f"e2e-{uuid.uuid4().hex}"
-        browser.execute_script(f"document.title = {json.dumps(token)}")
-        _raise_window_topmost(token, timeout)
-        browser.execute_script("document.title = 'E2E Input'")
     deadline = time.monotonic() + timeout
     while True:
         visibility = browser.execute_script("return document.visibilityState")
@@ -87,59 +79,6 @@ def _await_foreground(browser: Browser, timeout: float = 10.0) -> None:
         if time.monotonic() >= deadline:
             pytest.fail(f"Chrome window not visible within {timeout}s: {visibility!r}")
         time.sleep(0.1)
-
-
-def _raise_window_topmost(title_prefix: str, timeout: float) -> None:
-    """``SetWindowPos(HWND_TOPMOST)`` on the visible top-level window titled ``title_prefix...``."""
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = (enum_proc, wintypes.LPARAM)
-    user32.EnumWindows.restype = wintypes.BOOL
-    user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
-    user32.GetWindowTextW.restype = ctypes.c_int
-    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
-    user32.IsWindowVisible.restype = wintypes.BOOL
-    user32.SetWindowPos.argtypes = (
-        wintypes.HWND,
-        wintypes.HWND,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        wintypes.UINT,
-    )
-    user32.SetWindowPos.restype = wintypes.BOOL
-
-    hwnd_topmost = wintypes.HWND(-1)
-    swp_nosize, swp_nomove, swp_showwindow = 0x0001, 0x0002, 0x0040
-
-    found: list[int] = []
-
-    def visit(hwnd: int, _lparam: int) -> bool:
-        if user32.IsWindowVisible(hwnd):
-            buffer = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(hwnd, buffer, 512)
-            if buffer.value.startswith(title_prefix):
-                found.append(hwnd)
-                return False
-        return True
-
-    callback = enum_proc(visit)
-    deadline = time.monotonic() + timeout
-    while not found:
-        user32.EnumWindows(callback, 0)
-        if found:
-            break
-        if time.monotonic() >= deadline:
-            pytest.fail(f"no visible window titled {title_prefix!r} within {timeout}s")
-        time.sleep(0.1)
-    if not user32.SetWindowPos(
-        found[0], hwnd_topmost, 0, 0, 0, 0, swp_nosize | swp_nomove | swp_showwindow
-    ):
-        pytest.fail(f"SetWindowPos(HWND_TOPMOST) failed: {ctypes.get_last_error()}")
 
 
 def _state(browser: Browser) -> dict[str, Any]:
