@@ -8,17 +8,26 @@ holds ``NATIVE_INPUT_LOCK`` so concurrent callers cannot interleave OS events.
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import functools
 import importlib
-import math
 import os
 import random
 import sys
 import threading
 import time
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any
 
 from emunium import _screen
+from emunium._motion import (
+    DEFAULT_TARGET_SIZE,
+    MotionPlanner,
+    MotionStep,
+    ScreenBounds,
+    resolve_motion,
+)
 from emunium._native.win32 import (
     INPUT,
     KEYBDINPUT,
@@ -72,6 +81,8 @@ _CLICK_TYPES = {
     ClickType.DOUBLE: ("left", 2),
 }
 _UNSET: Any = object()
+# winmm's success code for timeBeginPeriod.
+_TIMERR_NOERROR = 0
 
 
 def _win_input_types() -> tuple[type[INPUT], type[KEYBDINPUT]]:
@@ -139,17 +150,52 @@ def _off_corner(point: tuple[int, int], box: tuple[int, int] | None) -> tuple[in
     return point
 
 
-def _ease(t: float) -> float:
-    """Minimum-jerk profile: slow start, fast middle, slow landing."""
-    return t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+def _load_winmm() -> Any:
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        raise OSError("ctypes.WinDLL is unavailable")
+    return win_dll("winmm")
 
 
-def _bezier(p0: float, p1: float, p2: float, p3: float, t: float) -> float:
-    u = 1.0 - t
-    return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3
+@contextlib.contextmanager
+def _fine_timer(
+    platform: str, load_winmm: Callable[[], Any] | None = None
+) -> Iterator[None]:
+    """1 ms Windows timer resolution while a human move plays.
+
+    The default 15.6 ms tick would stretch every short sleep of the
+    playback. ``timeBeginPeriod(1)`` is undone by ``timeEndPeriod(1)`` on any
+    exit; nothing happens off Windows or when winmm cannot be used.
+    """
+    end_period: Any = None
+    if platform == "win32":
+        try:
+            winmm = (load_winmm or _load_winmm)()
+            begin, end = winmm.timeBeginPeriod, winmm.timeEndPeriod
+            for function in (begin, end):
+                function.argtypes = [ctypes.c_uint]
+                function.restype = ctypes.c_uint
+            if begin(1) == _TIMERR_NOERROR:
+                end_period = end
+        except (OSError, AttributeError):
+            end_period = None
+    try:
+        yield
+    finally:
+        if end_period is not None:
+            end_period(1)
 
 
 class ElementInteractor:
+    """OS input; ``move(human=True)`` follows the ``motion`` planner.
+
+    ``motion`` is a preset name (``natural``, ``careful``, ``brisk``), a
+    ``MotionPlanner`` or None (``SigmaDriftPlanner.preset("natural")``); see
+    ``emunium._motion``. ``rng`` feeds every random choice, the planner's too.
+    ``clock`` (default ``time.perf_counter``, also when only ``sleep`` is
+    injected) times the playback of a planned move.
+    """
+
     def __init__(
         self,
         *,
@@ -161,14 +207,18 @@ class ElementInteractor:
         double_click_time: float | None = None,
         sleep: Callable[[float], None] | None = None,
         rng: random.Random | None = None,
+        motion: MotionPlanner | str | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
+        self._motion = resolve_motion(motion)
         self._backend = backend
         self._platform = platform or sys.platform
         self._unicode_sender = unicode_sender
         self._clipboard = clipboard
         self._keyboard = keyboard
         self._double_click_time = double_click_time
-        self._sleep = sleep or time.sleep
+        self._sleep: Callable[[float], None] = sleep or time.sleep
+        self._clock: Callable[[], float] = clock or time.perf_counter
         self._rng = rng or random.Random()
         self._init_lock = threading.Lock()
 
@@ -216,11 +266,24 @@ class ElementInteractor:
         point = self._gui().position()
         return int(point[0]), int(point[1])
 
-    def move(self, x: float, y: float, *, human: bool = True) -> None:
+    @property
+    def motion(self) -> MotionPlanner:
+        """The planner ``move(human=True)`` follows."""
+        return self._motion
+
+    def move(
+        self,
+        x: float,
+        y: float,
+        *,
+        human: bool = True,
+        target_size: float = DEFAULT_TARGET_SIZE,
+    ) -> None:
+        """Move to ``(x, y)``; ``target_size`` (input px) is Fitts' ``W``."""
         target = (int(round(x)), int(round(y)))
         with NATIVE_INPUT_LOCK:
             if human:
-                self._human_move(target)
+                self._human_move(target, target_size)
             self._land(target)
 
     def press(self, button: str = "left", *, clicks: int = 1) -> None:
@@ -270,7 +333,7 @@ class ElementInteractor:
                 gui.mouseDown(button="left", _pause=False)
                 self._sleep(self._rng.uniform(0.05, 0.1) if human else 0.05)
                 if human:
-                    self._human_move(target)
+                    self._human_move(target, DEFAULT_TARGET_SIZE)
                 else:
                     self._linear_move(target, steps=10, duration=0.2)
                 self._land(target)
@@ -376,10 +439,6 @@ class ElementInteractor:
             f"cursor did not land on {target!r} (at {self.position()!r}); the point may be off-screen"
         )
 
-    def _move_duration(self, distance: float) -> float:
-        base = 0.08 + 0.085 * math.log2(1.0 + distance / 12.0)
-        return min(1.2, base * self._rng.uniform(0.85, 1.15))
-
     def _screen_box(self) -> tuple[int, int] | None:
         try:
             size = self._gui().size()
@@ -387,54 +446,72 @@ class ElementInteractor:
         except Exception:
             return None
 
-    def _human_path(
-        self, start: tuple[int, int], end: tuple[int, int], steps: int
-    ) -> list[tuple[int, int]]:
-        sx, sy = start
-        ex, ey = end
-        dx, dy = ex - sx, ey - sy
-        distance = math.hypot(dx, dy)
-        nx, ny = -dy / distance, dx / distance
-        side = self._rng.choice((-1.0, 1.0))
-        bend = min(160.0, distance * self._rng.uniform(0.05, 0.18))
-        bend2 = bend * self._rng.uniform(0.3, 1.0)
-        if self._rng.random() < 0.2:
-            bend2 = -bend2  # occasional S-curve
-        c1 = (sx + dx * 0.3 + nx * bend * side, sy + dy * 0.3 + ny * bend * side)
-        c2 = (sx + dx * 0.7 + nx * bend2 * side, sy + dy * 0.7 + ny * bend2 * side)
+    def _motion_bounds(
+        self, start: tuple[int, int], end: tuple[int, int]
+    ) -> ScreenBounds | None:
+        """Virtual screen (else the primary monitor), widened to hold both ends.
 
-        box = self._screen_box()
-        inside = box is not None and all(
-            0 <= px < box[0] and 0 <= py < box[1] for px, py in (start, end)
-        )
-        points: list[tuple[int, int]] = []
-        for index in range(1, steps + 1):
-            t = _ease(index / float(steps))
-            px = int(round(_bezier(sx, c1[0], c2[0], ex, t)))
-            py = int(round(_bezier(sy, c1[1], c2[1], ey, t)))
-            if inside and box is not None:
-                # Stay on the primary screen and off the pyautogui fail-safe corners.
-                px = min(max(px, 1), box[0] - 2)
-                py = min(max(py, 1), box[1] - 2)
-            points.append(_off_corner((px, py), box))
-        points[-1] = end
-        return points
+        A backend without ``virtual_screen`` only reports the primary
+        monitor; an end outside it proves the screen extends there.
+        """
+        primary = self._screen_box()
+        virtual: tuple[int, int, int, int] | None = None
+        virtual_screen = getattr(self._gui(), "virtual_screen", None)
+        if callable(virtual_screen):
+            try:
+                left, top, width, height = virtual_screen()
+                virtual = (int(left), int(top), int(width), int(height))
+            except (OSError, RuntimeError, TypeError, ValueError):
+                virtual = None
+        if virtual is None and primary is not None:
+            virtual = (0, 0, primary[0], primary[1])
+        if virtual is None or virtual[2] < 1 or virtual[3] < 1:
+            return None
+        if primary is not None and (primary[0] < 1 or primary[1] < 1):
+            primary = None
+        return ScreenBounds(*virtual, primary=primary).covering(start, end)
 
-    def _human_move(self, target: tuple[int, int]) -> None:
+    def _human_move(self, target: tuple[int, int], target_size: float) -> None:
+        """Walk the planner's steps; the caller lands on ``target``."""
         gui = self._gui()
         start = self.position()
-        distance = math.hypot(target[0] - start[0], target[1] - start[1])
-        if distance < 2:
-            return
-        duration = self._move_duration(distance)
-        steps = max(8, min(100, int(round(duration * 90))))
-        step_sleep = duration / steps
-        last = start
-        for point in self._human_path(start, target, steps)[:-1]:
-            if point != last:
-                gui.moveTo(point[0], point[1], _pause=False)
-                last = point
-            self._sleep(step_sleep)
+        steps = self._motion.plan(
+            start,
+            target,
+            target_size=target_size,
+            rng=self._rng,
+            bounds=self._motion_bounds(start, target),
+        )
+        with _fine_timer(self._platform):
+            self._play(gui, steps)
+
+    def _play(self, gui: Any, steps: Sequence[MotionStep]) -> None:
+        """Play ``steps`` against absolute deadlines from the clock.
+
+        Step ``i`` is due at ``t0 + dt_1 + ... + dt_i``; each wait sleeps only
+        the time left to its deadline, so coarse sleeps cannot add up. A wait
+        never exceeds the step's own ``dt``: after a sleep that returned at
+        or past the previous deadline the time left is at most ``dt`` anyway,
+        and a sleep that returned early (or a stub that does not sleep)
+        cannot turn into one long stall. An
+        intermediate step is dropped rather than delayed once it is late by
+        one step, i.e. the next step is already due: a sleep that overran a
+        15.6 ms tick yields one move per tick, never a burst. The last step's
+        deadline is always waited for (the caller then lands on it).
+        """
+        deadline = self._clock()
+        last = len(steps) - 1
+        for index, step in enumerate(steps):
+            deadline += step.dt
+            now = self._clock()
+            if now < deadline:
+                self._sleep(min(deadline - now, step.dt))
+                now = self._clock()
+            if index == last:
+                break
+            if now >= deadline + steps[index + 1].dt:
+                continue
+            gui.moveTo(step.x, step.y, _pause=False)
 
     def _linear_move(
         self, target: tuple[int, int], *, steps: int, duration: float

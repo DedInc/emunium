@@ -16,6 +16,7 @@ from typing import Protocol
 
 from emunium._bridge.facade import Bridge
 from emunium._element_interactor import ElementInteractor
+from emunium._motion import MotionPlanner
 from emunium._native.win32 import (
     Win32Windows,
     WindowApi,
@@ -26,7 +27,7 @@ from emunium._native.win32 import (
     top_level_windows,
 )
 from emunium._screen import NATIVE_INPUT_LOCK, Calibration, Geometry, input_per_dip
-from emunium.errors import NativeInputError
+from emunium.errors import InvalidArgumentError, NativeInputError
 
 __all__ = ["BrowserContext", "DragInteractor", "Interactor"]
 
@@ -146,14 +147,24 @@ class BrowserContext:
         interactor: Interactor | None = None,
         pid: int | None = None,
         windows: WindowApi | None = None,
+        motion: MotionPlanner | str | None = None,
     ) -> None:
+        """``motion`` picks the human pointer planner of the default interactor
+        (a preset name, a ``MotionPlanner`` or None for the ``natural``
+        ``SigmaDriftPlanner``); it cannot be combined with ``interactor``.
+        """
+        if motion is not None and interactor is not None:
+            raise InvalidArgumentError(
+                "motion configures the default interactor; pass motion or "
+                "interactor, not both"
+            )
         self.bridge = bridge
         self.headless = bool(headless)
         self.verify_input = bool(verify_input)
         self.calibration = calibration if calibration is not None else Calibration()
         # The interactor resolves its OS backend lazily, on the first event.
         self.interactor: Interactor = (
-            interactor if interactor is not None else DragInteractor()
+            interactor if interactor is not None else DragInteractor(motion=motion)
         )
         self.last_action_ms: float | None = None
         # The browser process launched for this context (set by Browser.launch);

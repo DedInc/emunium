@@ -17,6 +17,7 @@ from emunium._browser import tabs as tab_ops
 from emunium._browser.context import BrowserContext
 from emunium._browser.launcher import BrowserSession, close, launch
 from emunium._browser.page import ResponseExpectation
+from emunium._motion import MotionPlanner
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.element import Element
@@ -42,7 +43,12 @@ class Browser:
         chrome_path: str | None = None,
         extra_args: list[str] | None = None,
         verify_input: bool = True,
+        motion: MotionPlanner | str | None = None,
     ) -> None:
+        """``motion``: human pointer planner, a preset name (``natural``,
+        ``careful``, ``brisk``), a ``MotionPlanner`` or None (``natural``
+        ``SigmaDriftPlanner``); ``human=False`` actions stay instant.
+        """
         bridge = Bridge(port=bridge_port)
         self._session = BrowserSession()
         self._session.bridge = bridge
@@ -53,7 +59,7 @@ class Browser:
         self._session.extra_args = [] if extra_args is None else extra_args
         self._bridge_timeout = bridge_timeout
         self._ctx = BrowserContext(
-            bridge, headless=bool(headless), verify_input=verify_input
+            bridge, headless=bool(headless), verify_input=verify_input, motion=motion
         )
 
     @property
