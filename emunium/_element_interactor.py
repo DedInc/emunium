@@ -1,31 +1,61 @@
 """OS-level mouse and keyboard input.
 
-Every call passes ``_pause=False`` to pyautogui; no pyautogui global
-(``PAUSE``, ``FAILSAFE`` ...) is changed. Every public method holds
-``NATIVE_INPUT_LOCK`` so concurrent callers cannot interleave OS events.
+Mouse and keys go through ``emunium._screen.input_backend()`` (native ctypes
+on Windows, pyautogui elsewhere). Every call passes ``_pause=False``; no
+pyautogui global (``PAUSE``, ``FAILSAFE`` ...) is changed. Every public method
+holds ``NATIVE_INPUT_LOCK`` so concurrent callers cannot interleave OS events.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib
 import math
 import os
 import random
 import sys
 import threading
 import time
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Sequence
 
 from emunium import _screen
+from emunium._native.win32 import (
+    INPUT,
+    KEYBDINPUT,
+    KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE,
+    VK_RETURN,
+    VK_TAB,
+    InputSender,
+    KeyEvent,
+    RawReleases,
+    RawUser32,
+    User32,
+    keyboard_events,
+    split_strokes,
+    stroke_events,
+)
 from emunium._screen import CLIPBOARD_LOCK, NATIVE_INPUT_LOCK
 from emunium._standalone.config import ClickType
 from emunium.errors import NativeInputError
 
-INPUT_KEYBOARD = 1
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_UNICODE = 0x0004
-VK_RETURN = 0x0D
-VK_TAB = 0x09
+# The Windows keystroke helpers live in emunium._native.win32 and stay
+# importable from here.
+__all__ = [
+    "DEFAULT_DOUBLE_CLICK_TIME",
+    "KEYEVENTF_KEYUP",
+    "KEYEVENTF_UNICODE",
+    "MAX_DOUBLE_CLICK_INTERVAL",
+    "PASTE_SETTLE_SECONDS",
+    "VK_RETURN",
+    "VK_TAB",
+    "ElementInteractor",
+    "KeyEvent",
+    "WindowsKeyboardSender",
+    "keyboard_events",
+    "stroke_events",
+]
+
 # Held by the user, these turn injected text into shortcuts (Ctrl+A, Win+L ...).
 _BLOCKING_MODIFIERS = ((0x11, "ctrl"), (0x12, "alt"), (0x5B, "lwin"), (0x5C, "rwin"))
 
@@ -43,180 +73,44 @@ _CLICK_TYPES = {
 }
 _UNSET: Any = object()
 
-KeyEvent = Tuple[int, int, int]  # (virtual key, scan / UTF-16 unit, flags)
 
-
-def _strokes(text: str) -> List[str]:
-    """Split text into keystrokes; ``\\r\\n`` is one Enter."""
-    strokes: List[str] = []
-    index = 0
-    while index < len(text):
-        if text.startswith("\r\n", index):
-            strokes.append("\n")
-            index += 2
-            continue
-        character = text[index]
-        strokes.append("\n" if character == "\r" else character)
-        index += 1
-    return strokes
-
-
-def stroke_events(stroke: str) -> List[KeyEvent]:
-    """SendInput keyboard events for one keystroke (layout independent)."""
-    if stroke == "\n":
-        return [(VK_RETURN, 0, 0), (VK_RETURN, 0, KEYEVENTF_KEYUP)]
-    if stroke == "\t":
-        return [(VK_TAB, 0, 0), (VK_TAB, 0, KEYEVENTF_KEYUP)]
-    encoded = stroke.encode("utf-16-le")
-    events: List[KeyEvent] = []
-    for offset in range(0, len(encoded), 2):
-        unit = int.from_bytes(encoded[offset : offset + 2], "little")
-        events.append((0, unit, KEYEVENTF_UNICODE))
-        events.append((0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
-    return events
-
-
-def _stroke_groups(events: Sequence[KeyEvent]) -> List[List[KeyEvent]]:
-    """Group flat events into keystrokes; a surrogate pair stays one group."""
-    groups: List[List[KeyEvent]] = []
-    current: List[KeyEvent] = []
-    for event in events:
-        current.append(event)
-        vk, scan, flags = event
-        released = bool(flags & KEYEVENTF_KEYUP)
-        high_surrogate = bool(flags & KEYEVENTF_UNICODE) and 0xD800 <= scan <= 0xDBFF
-        if released and not high_surrogate:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    return groups
-
-
-def keyboard_events(text: str) -> List[KeyEvent]:
-    events: List[KeyEvent] = []
-    for stroke in _strokes(text):
-        events.extend(stroke_events(stroke))
-    return events
-
-
-@functools.lru_cache(maxsize=None)
-def _win_input_types() -> Tuple[Any, Any]:
-    """ctypes INPUT layout (40 bytes on x64, 28 on x86)."""
-    import ctypes
-
-    ulong_ptr = ctypes.c_size_t
-
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [
-            ("dx", ctypes.c_long),
-            ("dy", ctypes.c_long),
-            ("mouseData", ctypes.c_ulong),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
-            ("dwExtraInfo", ulong_ptr),
-        ]
-
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [
-            ("wVk", ctypes.c_ushort),
-            ("wScan", ctypes.c_ushort),
-            ("dwFlags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
-            ("dwExtraInfo", ulong_ptr),
-        ]
-
-    class HARDWAREINPUT(ctypes.Structure):
-        _fields_ = [
-            ("uMsg", ctypes.c_ulong),
-            ("wParamL", ctypes.c_ushort),
-            ("wParamH", ctypes.c_ushort),
-        ]
-
-    class _INPUTUNION(ctypes.Union):
-        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _anonymous_ = ("u",)
-        _fields_ = [("type", ctypes.c_ulong), ("u", _INPUTUNION)]
-
+def _win_input_types() -> tuple[type[INPUT], type[KEYBDINPUT]]:
+    """ctypes INPUT layout (40 bytes on x64, 28 on x86), shared with the backend."""
     return INPUT, KEYBDINPUT
 
 
 class WindowsKeyboardSender:
-    """Sends keyboard events through ``user32.SendInput``."""
+    """Sends keyboard events through the win32 backend's ``InputSender``.
 
-    _CHUNK = 64
+    ``user32`` is a raw user32-like object (``SendInput``/``GetAsyncKeyState``
+    attributes); by default the backend's private ``WinDLL`` wrapper is used.
+    """
 
     def __init__(self, user32: Any = None) -> None:
-        import ctypes
-
-        self._ctypes = ctypes
-        self._input_type, _ = _win_input_types()
+        api: User32 | RawUser32
         if user32 is None:
-            # A private WinDLL keeps argtypes off the shared windll.user32
-            # that pyautogui uses.
-            user32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
-            user32.SendInput.argtypes = [
-                ctypes.c_uint,
-                ctypes.POINTER(self._input_type),
-                ctypes.c_int,
-            ]
-            user32.SendInput.restype = ctypes.c_uint
-            user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-            user32.GetAsyncKeyState.restype = ctypes.c_short
+            api = User32()
+            user32 = api.library
+        else:
+            api = RawUser32(user32)
         self._user32 = user32
+        self._api = api
+        self._sender = InputSender(api)
 
-    def held_modifiers(self) -> List[str]:
+    def held_modifiers(self) -> list[str]:
         """Names of user-held modifiers that would turn text into shortcuts."""
-        held = []
-        for vk, name in _BLOCKING_MODIFIERS:
-            if self._user32.GetAsyncKeyState(vk) & 0x8000:
-                held.append(name)
-        return held
-
-    def build(self, events: Sequence[KeyEvent]) -> Any:
-        array = (self._input_type * len(events))()
-        for index, (vk, scan, flags) in enumerate(events):
-            array[index].type = INPUT_KEYBOARD
-            array[index].ki.wVk = vk
-            array[index].ki.wScan = scan
-            array[index].ki.dwFlags = flags
-            array[index].ki.time = 0
-            array[index].ki.dwExtraInfo = 0
-        return array
-
-    def _chunks(self, events: Sequence[KeyEvent]) -> List[List[KeyEvent]]:
-        """Chunks of at most _CHUNK events, cut only between keystrokes."""
-        chunks: List[List[KeyEvent]] = []
-        current: List[KeyEvent] = []
-        for stroke in _stroke_groups(events):
-            if current and len(current) + len(stroke) > self._CHUNK:
-                chunks.append(current)
-                current = []
-            current.extend(stroke)
-        if current:
-            chunks.append(current)
-        return chunks
+        return [name for vk, name in _BLOCKING_MODIFIERS if self._api.key_held(vk)]
 
     def send(self, events: Sequence[KeyEvent]) -> None:
-        size = self._ctypes.sizeof(self._input_type)
-        for chunk in self._chunks(events):
-            array = self.build(chunk)
-            sent = self._user32.SendInput(len(chunk), array, size)
-            if sent != len(chunk):
-                error = self._ctypes.get_last_error()
-                raise NativeInputError(
-                    "SendInput delivered %d of %d keyboard events (error %d); "
-                    "input may be blocked by a higher-integrity window"
-                    % (sent, len(chunk), error)
-                )
+        self._sender.send_keys(events)
 
 
 def _windows_double_click_time() -> float:
     import ctypes
 
-    milliseconds = ctypes.windll.user32.GetDoubleClickTime()  # type: ignore[attr-defined]
+    if sys.platform != "win32":
+        return DEFAULT_DOUBLE_CLICK_TIME
+    milliseconds = ctypes.windll.user32.GetDoubleClickTime()
     return milliseconds / 1000.0 if milliseconds else DEFAULT_DOUBLE_CLICK_TIME
 
 
@@ -228,15 +122,13 @@ def _usable_keyboard_module(platform: str) -> Any:
         if geteuid is None or geteuid() != 0:
             return None
     try:
-        import keyboard
+        # Optional extra (``emunium[keyboard]``), resolved only at runtime.
+        return importlib.import_module("keyboard")
     except Exception:
         return None
-    return keyboard
 
 
-def _off_corner(
-    point: Tuple[int, int], box: Optional[Tuple[int, int]]
-) -> Tuple[int, int]:
+def _off_corner(point: tuple[int, int], box: tuple[int, int] | None) -> tuple[int, int]:
     """Move an intermediate path point off a primary-screen fail-safe corner."""
     if box is None:
         return point
@@ -262,13 +154,13 @@ class ElementInteractor:
         self,
         *,
         backend: Any = None,
-        platform: Optional[str] = None,
+        platform: str | None = None,
         unicode_sender: Any = None,
         clipboard: Any = None,
         keyboard: Any = _UNSET,
-        double_click_time: Optional[float] = None,
-        sleep: Optional[Callable[[float], None]] = None,
-        rng: Optional[random.Random] = None,
+        double_click_time: float | None = None,
+        sleep: Callable[[float], None] | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._backend = backend
         self._platform = platform or sys.platform
@@ -284,7 +176,7 @@ class ElementInteractor:
 
     def _gui(self) -> Any:
         if self._backend is None:
-            self._backend = _screen.pyautogui()
+            self._backend = _screen.input_backend()
         return self._backend
 
     def _sender(self) -> Any:
@@ -320,7 +212,7 @@ class ElementInteractor:
 
     # -- mouse ---------------------------------------------------------------
 
-    def position(self) -> Tuple[int, int]:
+    def position(self) -> tuple[int, int]:
         point = self._gui().position()
         return int(point[0]), int(point[1])
 
@@ -333,9 +225,9 @@ class ElementInteractor:
 
     def press(self, button: str = "left", *, clicks: int = 1) -> None:
         if button not in _BUTTONS:
-            raise ValueError("button must be one of %s, got %r" % (_BUTTONS, button))
+            raise ValueError(f"button must be one of {_BUTTONS}, got {button!r}")
         if isinstance(clicks, bool) or not isinstance(clicks, int) or clicks < 1:
-            raise ValueError("clicks must be a positive int, got %r" % (clicks,))
+            raise ValueError(f"clicks must be a positive int, got {clicks!r}")
         gui = self._gui()
         with NATIVE_INPUT_LOCK:
             interval = self.double_click_interval() if clicks > 1 else 0.0
@@ -356,7 +248,7 @@ class ElementInteractor:
         human: bool = True,
     ) -> None:
         if click_type not in _CLICK_TYPES:
-            raise ValueError("unsupported click_type %r" % (click_type,))
+            raise ValueError(f"unsupported click_type {click_type!r}")
         button, clicks = _CLICK_TYPES[click_type]
         with NATIVE_INPUT_LOCK:
             self.move(x, y, human=human)
@@ -395,9 +287,9 @@ class ElementInteractor:
         screen_x: float,
         screen_y: float,
         *,
-        offset_x: Optional[float] = None,
-        offset_y: Optional[float] = None,
-    ) -> Tuple[int, int]:
+        offset_x: float | None = None,
+        offset_y: float | None = None,
+    ) -> tuple[int, int]:
         x_offset = offset_x if offset_x is not None else self._rng.uniform(0.0, 1.5)
         y_offset = offset_y if offset_y is not None else self._rng.uniform(0.0, 1.5)
         return int(round(screen_x + x_offset)), int(round(screen_y + y_offset))
@@ -424,6 +316,11 @@ class ElementInteractor:
         if release is None:
             gui.mouseUp(button=button, _pause=False)
             return
+        if isinstance(platform_module, RawReleases):
+            # The native layer releases where the cursor is and ignores the
+            # coordinates; reading them could fail and leave the button down.
+            release(0, 0, button)
+            return
         raw_position = getattr(platform_module, "_position", None)
         point = raw_position() if raw_position is not None else gui.position()
         release(int(point[0]), int(point[1]), button)
@@ -441,9 +338,9 @@ class ElementInteractor:
     @staticmethod
     def _run_releases(
         releases: Sequence[Callable[[], None]],
-    ) -> Optional[BaseException]:
+    ) -> BaseException | None:
         """Run every release even if one is interrupted; return the first error."""
-        first: Optional[BaseException] = None
+        first: BaseException | None = None
         for release in releases:
             try:
                 release()
@@ -455,10 +352,10 @@ class ElementInteractor:
     @staticmethod
     def _guarded(
         action: Callable[[], None],
-        release_all: Callable[[], Optional[BaseException]],
+        release_all: Callable[[], BaseException | None],
     ) -> None:
         """Run ``action`` then ``release_all`` no matter what; the action's error wins."""
-        error: Optional[BaseException] = None
+        error: BaseException | None = None
         try:
             action()
         except BaseException as exc:
@@ -469,22 +366,21 @@ class ElementInteractor:
         if release_error is not None:
             raise release_error
 
-    def _land(self, target: Tuple[int, int]) -> None:
+    def _land(self, target: tuple[int, int]) -> None:
         gui = self._gui()
         for _ in range(2):
             gui.moveTo(target[0], target[1], _pause=False)
             if self.position() == target:
                 return
         raise NativeInputError(
-            "cursor did not land on %r (at %r); the point may be off-screen"
-            % (target, self.position())
+            f"cursor did not land on {target!r} (at {self.position()!r}); the point may be off-screen"
         )
 
     def _move_duration(self, distance: float) -> float:
         base = 0.08 + 0.085 * math.log2(1.0 + distance / 12.0)
         return min(1.2, base * self._rng.uniform(0.85, 1.15))
 
-    def _screen_box(self) -> Optional[Tuple[int, int]]:
+    def _screen_box(self) -> tuple[int, int] | None:
         try:
             size = self._gui().size()
             return int(size[0]), int(size[1])
@@ -492,8 +388,8 @@ class ElementInteractor:
             return None
 
     def _human_path(
-        self, start: Tuple[int, int], end: Tuple[int, int], steps: int
-    ) -> List[Tuple[int, int]]:
+        self, start: tuple[int, int], end: tuple[int, int], steps: int
+    ) -> list[tuple[int, int]]:
         sx, sy = start
         ex, ey = end
         dx, dy = ex - sx, ey - sy
@@ -511,7 +407,7 @@ class ElementInteractor:
         inside = box is not None and all(
             0 <= px < box[0] and 0 <= py < box[1] for px, py in (start, end)
         )
-        points: List[Tuple[int, int]] = []
+        points: list[tuple[int, int]] = []
         for index in range(1, steps + 1):
             t = _ease(index / float(steps))
             px = int(round(_bezier(sx, c1[0], c2[0], ex, t)))
@@ -524,7 +420,7 @@ class ElementInteractor:
         points[-1] = end
         return points
 
-    def _human_move(self, target: Tuple[int, int]) -> None:
+    def _human_move(self, target: tuple[int, int]) -> None:
         gui = self._gui()
         start = self.position()
         distance = math.hypot(target[0] - start[0], target[1] - start[1])
@@ -540,14 +436,19 @@ class ElementInteractor:
                 last = point
             self._sleep(step_sleep)
 
-    def _linear_move(self, target: Tuple[int, int], *, steps: int, duration: float) -> None:
+    def _linear_move(
+        self, target: tuple[int, int], *, steps: int, duration: float
+    ) -> None:
         gui = self._gui()
         sx, sy = self.position()
         box = self._screen_box()
         for index in range(1, steps):
             t = index / float(steps)
             point = _off_corner(
-                (int(round(sx + (target[0] - sx) * t)), int(round(sy + (target[1] - sy) * t))),
+                (
+                    int(round(sx + (target[0] - sx) * t)),
+                    int(round(sy + (target[1] - sy) * t)),
+                ),
                 box,
             )
             gui.moveTo(point[0], point[1], _pause=False)
@@ -564,10 +465,12 @@ class ElementInteractor:
         human: bool = True,
     ) -> None:
         if not isinstance(text, str):
-            raise TypeError("text must be str, got %r" % (type(text).__name__,))
+            raise TypeError(f"text must be str, got {type(text).__name__!r}")
         if not text:
             return
-        delay = 60.0 / characters_per_minute if human and characters_per_minute > 0 else 0.0
+        delay = (
+            60.0 / characters_per_minute if human and characters_per_minute > 0 else 0.0
+        )
         with NATIVE_INPUT_LOCK:
             if self._platform == "win32":
                 self._type_windows(text, delay, offset)
@@ -588,7 +491,7 @@ class ElementInteractor:
             try:
                 clipboard.copy(text)
             except Exception as exc:
-                raise NativeInputError("clipboard is unavailable: %s" % exc) from exc
+                raise NativeInputError(f"clipboard is unavailable: {exc}") from exc
             try:
                 self.hotkey(modifier, "v")
                 # Restoring before the target has read the clipboard pastes the old text.
@@ -606,7 +509,7 @@ class ElementInteractor:
             raise ValueError("hotkey needs at least one key")
         gui = self._gui()
         with NATIVE_INPUT_LOCK:
-            pressed: List[str] = []
+            pressed: list[str] = []
 
             def press_all() -> None:
                 for key in keys:
@@ -617,7 +520,10 @@ class ElementInteractor:
             self._guarded(
                 press_all,
                 lambda: self._run_releases(
-                    [functools.partial(self._key_release, gui, key) for key in reversed(pressed)]
+                    [
+                        functools.partial(self._key_release, gui, key)
+                        for key in reversed(pressed)
+                    ]
                 ),
             )
 
@@ -634,8 +540,8 @@ class ElementInteractor:
         held = held_modifiers()
         if held:
             raise NativeInputError(
-                "modifier key held by the user (%s); typing would trigger "
-                "shortcuts, release it and retry" % ", ".join(held)
+                "modifier key held by the user ({}); typing would trigger "
+                "shortcuts, release it and retry".format(", ".join(held))
             )
 
     def _type_windows(self, text: str, delay: float, offset: int) -> None:
@@ -644,7 +550,7 @@ class ElementInteractor:
             self._check_modifiers(sender)
             sender.send(keyboard_events(text))
             return
-        for stroke in _strokes(text):
+        for stroke in split_strokes(text):
             self._check_modifiers(sender)
             sender.send(stroke_events(stroke))
             self._pace(delay, offset)
@@ -655,7 +561,7 @@ class ElementInteractor:
 
     def _type_posix(self, text: str, delay: float, offset: int) -> None:
         gui = self._gui()
-        strokes = _strokes(text)
+        strokes = split_strokes(text)
         index = 0
         while index < len(strokes):
             stroke = strokes[index]
@@ -670,7 +576,9 @@ class ElementInteractor:
                 index += 1
                 continue
             run_end = index
-            while run_end < len(strokes) and not self._is_pyautogui_stroke(strokes[run_end]):
+            while run_end < len(strokes) and not self._is_pyautogui_stroke(
+                strokes[run_end]
+            ):
                 run_end += 1
             self._type_other("".join(strokes[index:run_end]), delay, offset)
             index = run_end

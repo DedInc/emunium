@@ -4,10 +4,11 @@ Units (see ``docs/architecture/native-input.md``):
 
 - CSS: layout-viewport CSS px (``getBoundingClientRect``).
 - DIP: Chrome screen space (``window.screenX`` / ``outerWidth`` ...).
-- INPUT: what ``pyautogui.moveTo`` / ``pyautogui.position`` use.
+- INPUT: what ``input_backend().moveTo`` / ``.position`` use.
 
-On Windows the process is made per-monitor-v2 DPI aware before pyautogui is
-imported, so INPUT is physical px on every monitor. On macOS INPUT is points.
+On Windows the process is made per-monitor-v2 DPI aware before the input
+backend is built, so INPUT is physical px on every monitor. On macOS INPUT is
+points.
 """
 
 from __future__ import annotations
@@ -16,7 +17,10 @@ import math
 import sys
 import threading
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any
+
+from emunium import _native
+from emunium._native import InputBackend
 
 NATIVE_INPUT_LOCK = threading.RLock()
 CLIPBOARD_LOCK = threading.Lock()
@@ -35,18 +39,22 @@ _DPI_LOCK = threading.Lock()
 _DPI_DONE = False
 _PYAUTOGUI_LOCK = threading.Lock()
 _PYAUTOGUI: Any = None
+_BACKEND_LOCK = threading.Lock()
+_BACKEND: InputBackend | None = None
 
 
 def _platform() -> str:
     return sys.platform
 
 
-def _apply_windows_dpi_awareness(windll: Any = None) -> Optional[str]:
+def _apply_windows_dpi_awareness(windll: Any = None) -> str | None:
     """Try PMv2 -> shcore per-monitor -> system aware. Returns the API that won."""
     import ctypes
 
     if windll is None:
-        windll = ctypes.windll  # type: ignore[attr-defined]
+        if sys.platform != "win32":
+            return None
+        windll = ctypes.windll
 
     try:
         user32 = windll.user32
@@ -101,8 +109,30 @@ def ensure_dpi_awareness() -> None:
             pass
 
 
+def input_backend() -> InputBackend:
+    """The process-wide OS input backend, chosen once (native-input.md 5a).
+
+    Windows: ``emunium._native.win32`` (ctypes, pyautogui is never imported).
+    Elsewhere: pyautogui, imported lazily. DPI awareness is chosen first.
+    """
+    global _BACKEND
+    backend = _BACKEND
+    if backend is not None:
+        return backend
+    with _BACKEND_LOCK:
+        if _BACKEND is None:
+            ensure_dpi_awareness()
+            native = _native.native_backend(_platform())
+            _BACKEND = native if native is not None else pyautogui()
+        return _BACKEND
+
+
 def pyautogui() -> Any:
-    """Import pyautogui lazily, after DPI awareness has been chosen."""
+    """Import pyautogui lazily, after DPI awareness has been chosen.
+
+    Only standalone mode still calls this (screenshots, HumanCursor, wheel
+    amounts in pyautogui units); input paths use ``input_backend``.
+    """
     global _PYAUTOGUI
     if _PYAUTOGUI is not None:
         return _PYAUTOGUI
@@ -115,13 +145,13 @@ def pyautogui() -> Any:
     return _PYAUTOGUI
 
 
-def _number(payload: dict, key: str, default: Optional[float] = None) -> float:
+def _number(payload: dict, key: str, default: float | None = None) -> float:
     value = payload.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("geometry.%s must be a number, got %r" % (key, value))
+        raise ValueError(f"geometry.{key} must be a number, got {value!r}")
     value = float(value)
     if not math.isfinite(value):
-        raise ValueError("geometry.%s must be finite, got %r" % (key, value))
+        raise ValueError(f"geometry.{key} must be finite, got {value!r}")
     return value
 
 
@@ -137,17 +167,17 @@ class Geometry:
     zoom: float
 
     @classmethod
-    def from_payload(cls, geometry: dict, zoom: Optional[float]) -> "Geometry":
+    def from_payload(cls, geometry: dict, zoom: float | None) -> Geometry:
         if not isinstance(geometry, dict):
-            raise ValueError("geometry must be a dict, got %r" % (geometry,))
+            raise ValueError(f"geometry must be a dict, got {geometry!r}")
         if zoom is None:
             zoom_value = 1.0
         elif isinstance(zoom, bool) or not isinstance(zoom, (int, float)):
-            raise ValueError("zoom must be a number, got %r" % (zoom,))
+            raise ValueError(f"zoom must be a number, got {zoom!r}")
         else:
             zoom_value = float(zoom)
         if not math.isfinite(zoom_value) or zoom_value <= 0:
-            raise ValueError("zoom must be positive, got %r" % (zoom,))
+            raise ValueError(f"zoom must be positive, got {zoom!r}")
         result = cls(
             screen_x=_number(geometry, "screenX"),
             screen_y=_number(geometry, "screenY"),
@@ -162,7 +192,7 @@ class Geometry:
             raise ValueError("geometry.devicePixelRatio must be positive")
         for name in ("outer_width", "outer_height", "inner_width", "inner_height"):
             if getattr(result, name) < 0:
-                raise ValueError("geometry.%s must not be negative" % name)
+                raise ValueError(f"geometry.{name} must not be negative")
         return result
 
     @property
@@ -192,7 +222,7 @@ def _input_per_css(geometry: Geometry) -> float:
 
 def estimate_to_input(
     geometry: Geometry, css_x: float, css_y: float
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Window-chrome estimate of a CSS viewport point in INPUT units."""
     zoom = geometry.zoom
     border = max(0.0, (geometry.outer_width - geometry.inner_width * zoom) / 2.0)
@@ -208,8 +238,8 @@ def estimate_to_input(
 
 
 def _fit_axis(
-    clients: List[float], inputs: List[float], platform_k: float
-) -> Tuple[float, float]:
+    clients: list[float], inputs: list[float], platform_k: float
+) -> tuple[float, float]:
     """Return (origin, k) for one axis.
 
     Least-squares fit when the samples span enough CSS px and the slope is
@@ -239,8 +269,8 @@ class Calibration:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._signature: Optional[tuple] = None
-        self._samples: List[Tuple[float, float, float, float]] = []
+        self._signature: tuple | None = None
+        self._samples: list[tuple[float, float, float, float]] = []
 
     def _sync(self, geometry: Geometry) -> None:
         signature = geometry.signature
@@ -256,12 +286,12 @@ class Calibration:
         input_x: float,
         input_y: float,
     ) -> None:
-        sample = tuple(float(v) for v in (client_x, client_y, input_x, input_y))
+        sample = (float(client_x), float(client_y), float(input_x), float(input_y))
         if not all(math.isfinite(v) for v in sample):
-            raise ValueError("calibration sample must be finite: %r" % (sample,))
+            raise ValueError(f"calibration sample must be finite: {sample!r}")
         with self._lock:
             self._sync(geometry)
-            self._samples.append(sample)  # type: ignore[arg-type]
+            self._samples.append(sample)
             del self._samples[:-_MAX_SAMPLES]
 
     def is_calibrated(self, geometry: Geometry) -> bool:
@@ -276,7 +306,7 @@ class Calibration:
 
     def to_input(
         self, geometry: Geometry, css_x: float, css_y: float
-    ) -> Tuple[float, float]:
+    ) -> tuple[float, float]:
         with self._lock:
             self._sync(geometry)
             samples = list(self._samples)
