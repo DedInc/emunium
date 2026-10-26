@@ -489,6 +489,7 @@ def test_concurrent_failed_sends_retire_once(transport, caplog):
 def test_cancelled_send_fails_quietly(transport, caplog):
     with _connect(transport) as ext:
         assert ext.wait_welcomed(5)
+        assert transport.wait_for_connection(5)  # welcome precedes activation
         conn = transport._active
         pending = concurrent.futures.Future()
         conn._pending[999] = pending
