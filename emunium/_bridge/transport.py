@@ -65,6 +65,8 @@ CLOSE_FORBIDDEN_ORIGIN = 4003
 CLOSE_GOING_AWAY = 1001
 
 EXTENSION_ORIGIN_PREFIX = "chrome-extension://"
+FIREFOX_EXTENSION_ORIGIN_PREFIX = "moz-extension://"
+EXTENSION_ORIGIN_PREFIXES = (EXTENSION_ORIGIN_PREFIX, FIREFOX_EXTENSION_ORIGIN_PREFIX)
 
 PINNED: Any = object()  # sentinel: use Transport.pinned_tab_id
 
@@ -72,8 +74,12 @@ EventHandler = Callable[[dict], None]
 
 
 def _default_allow_origin(origin: str | None) -> bool:
-    """No Origin (CLI tools, tests) or an extension origin is allowed; web pages are not."""
-    return origin is None or origin.startswith(EXTENSION_ORIGIN_PREFIX)
+    """No Origin (CLI tools, tests) or an extension origin is allowed; web pages are not.
+
+    The per-session token still authenticates every connection; the Origin
+    check only keeps web pages (and opaque ``null`` origins) out.
+    """
+    return origin is None or origin.startswith(EXTENSION_ORIGIN_PREFIXES)
 
 
 def _request_origin(ws: ServerConnection) -> str | None:

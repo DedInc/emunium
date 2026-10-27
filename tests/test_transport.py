@@ -212,6 +212,41 @@ def test_extension_origin_accepted(transport):
         assert transport.wait_for_connection(5)
 
 
+def test_firefox_extension_origin_accepted(transport):
+    with _raw_client(
+        transport, "moz-extension://1b2c3d4e-0000-4000-8000-000000000000"
+    ) as ws:
+        ws.send(json.dumps({"type": "hello", "protocol": 2, "token": TOKEN}))
+        assert json.loads(ws.recv(timeout=5)) == {"type": "welcome", "protocol": 2}
+        assert transport.wait_for_connection(5)
+
+
+def test_firefox_extension_origin_still_needs_token(transport):
+    with _raw_client(transport, "moz-extension://abc") as ws:
+        ws.send(json.dumps({"type": "hello", "protocol": 2, "token": "wrong"}))
+        with pytest.raises(ConnectionClosed) as info:
+            ws.recv(timeout=5)
+        assert info.value.rcvd is not None and info.value.rcvd.code == 4001
+    assert not transport.connected
+
+
+@pytest.mark.parametrize(
+    ("origin", "allowed"),
+    [
+        (None, True),
+        ("chrome-extension://abc", True),
+        ("moz-extension://abc", True),
+        ("null", False),
+        ("http://evil.example", False),
+        ("https://evil.example", False),
+        ("moz-extension:abc", False),
+        ("http://moz-extension://abc", False),
+    ],
+)
+def test_default_allow_origin(origin, allowed):
+    assert transport_mod._default_allow_origin(origin) is allowed
+
+
 def test_repeated_origin_headers_refused_at_handshake(transport):
     """Two Origin headers never reach allow_origin as one picked value."""
     seen = []
