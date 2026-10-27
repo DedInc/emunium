@@ -50,6 +50,10 @@ parsing = [
 keyboard = [
     "keyboard>=0.13",
 ]
+# Attach-mode hub: RSA key and signed CRX3 builds (emunium._attach).
+hub = [
+    "cryptography>=42",
+]
 
 [dependency-groups]
 dev = [

@@ -28,6 +28,7 @@ import json
 import logging
 import queue
 import secrets
+import socket
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -520,24 +521,11 @@ class Transport:
             await _close_quietly(ws, CLOSE_FORBIDDEN_ORIGIN, "origin not allowed")
             return
         frames = ws.__aiter__()
-        try:
-            raw = await asyncio.wait_for(frames.__anext__(), HELLO_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("Extension sent no hello within %.1f s", HELLO_TIMEOUT)
-            await _close_quietly(ws, CLOSE_UNAUTHORIZED, "hello timeout")
-            return
-        except (StopAsyncIteration, ConnectionClosed):
-            return
-        hello = self._parse_hello(raw)
+        hello = await self._accept(ws, frames)
         if hello is None:
-            await _close_quietly(ws, CLOSE_UNAUTHORIZED, "unauthorized")
             return
         loop = asyncio.get_running_loop()
         conn = _Connection(ws, hello, loop, self._on_event, self._on_close)
-        try:
-            await ws.send(json.dumps({"type": "welcome", "protocol": PROTOCOL_VERSION}))
-        except ConnectionClosed:
-            return
         with self._cond:
             if self._shut:
                 previous = None
@@ -555,6 +543,33 @@ class Transport:
             previous.fail_all(BridgeDisconnectedError("superseded by a new connection"))
             asyncio.ensure_future(previous.close(CLOSE_SUPERSEDED, "superseded"))
         await conn.run(frames)
+
+    async def _accept(
+        self, ws: ServerConnection, frames: AsyncIterator[Data]
+    ) -> dict[str, Any] | None:
+        """Read the opening frames, authenticate and send the welcome.
+
+        Returns the hello to publish the connection with, or ``None`` once the
+        socket was closed (or is closing). Runs on the loop thread after the
+        Origin check. The default is the launch-mode token hello.
+        """
+        try:
+            raw = await asyncio.wait_for(frames.__anext__(), HELLO_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("Extension sent no hello within %.1f s", HELLO_TIMEOUT)
+            await _close_quietly(ws, CLOSE_UNAUTHORIZED, "hello timeout")
+            return None
+        except (StopAsyncIteration, ConnectionClosed):
+            return None
+        hello = self._parse_hello(raw)
+        if hello is None:
+            await _close_quietly(ws, CLOSE_UNAUTHORIZED, "unauthorized")
+            return None
+        try:
+            await ws.send(json.dumps({"type": "welcome", "protocol": PROTOCOL_VERSION}))
+        except ConnectionClosed:
+            return None
+        return hello
 
     def _parse_hello(self, raw: Data) -> dict[str, Any] | None:
         try:
@@ -625,18 +640,38 @@ class Transport:
         finally:
             loop.close()
 
+    def _listen_socket(self) -> socket.socket | None:
+        """A bound, listening socket to serve on; ``None`` lets ``serve`` bind ``host:port``.
+
+        Runs on the loop thread inside ``start()``; an exception is raised from
+        ``start()`` as ``BridgeError``.
+        """
+        return None
+
     async def _serve(self) -> None:
         self._stop = asyncio.Event()
+        sock: socket.socket | None = None
         try:
-            server = await serve(
-                self._handle_socket,
-                self.host,
-                self.port,
-                max_size=MAX_SIZE,
-                max_queue=MAX_QUEUE,
-            )
+            sock = self._listen_socket()
+            if sock is None:
+                server = await serve(
+                    self._handle_socket,
+                    self.host,
+                    self.port,
+                    max_size=MAX_SIZE,
+                    max_queue=MAX_QUEUE,
+                )
+            else:
+                server = await serve(
+                    self._handle_socket,
+                    sock=sock,
+                    max_size=MAX_SIZE,
+                    max_queue=MAX_QUEUE,
+                )
         except Exception as exc:  # surfaced from start()
             logger.debug("serve() failed", exc_info=True)
+            if sock is not None:
+                sock.close()
             self._start_error = exc
             self._ready.set()
             return

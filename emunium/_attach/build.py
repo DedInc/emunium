@@ -22,6 +22,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any, Union
@@ -66,6 +67,8 @@ PROTOBUF_WIRE_LENGTH_DELIMITED = 2
 # Fixed entry timestamp so the same tree always yields the same zip bytes.
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 ZIP_FILE_MODE = 0o644
+# Build folders hold attach.json (the enrollment secret).
+PRIVATE_DIR_MODE = 0o700
 
 # Checked independently of EXTENSION_COPY_IGNORE: a build must never carry these.
 FORBIDDEN_BUILD_NAMES = frozenset(("session.json", "port.json", "__pycache__"))
@@ -73,6 +76,8 @@ FORBIDDEN_BUILD_NAMES = frozenset(("session.json", "port.json", "__pycache__"))
 _INSTALL_HINT = "pip install emunium[hub]"
 _ID_ALPHABET = str.maketrans("0123456789abcdef", "abcdefghijklmnop")
 _IS_POSIX = os.name != "nt"
+# Serializes read-modify-write of hub.json within this process.
+_HUB_LOCK = threading.Lock()
 
 PathLike = Union[str, "os.PathLike[str]"]
 
@@ -205,7 +210,8 @@ def build_extension(
         unpacked = out / FIREFOX_ARTIFACT_NAME
         xpi_path = out / (FIREFOX_ARTIFACT_NAME + ".xpi")
         _stage(target, unpacked, attach, public_der=None)
-        _write_atomic(xpi_path, _zip_tree(unpacked))
+        # The archive carries attach.json: owner-only, like the folder.
+        _write_atomic(xpi_path, _zip_tree(unpacked), private=True)
         return {
             "extension_id": FIREFOX_GECKO_ID,
             "unpacked_dir": str(unpacked),
@@ -226,8 +232,9 @@ def build_extension(
     _stage(target, unpacked, attach, public_der=public_der)
 
     zip_bytes = _zip_tree(unpacked)
-    _write_atomic(zip_path, zip_bytes)
-    _write_atomic(crx_path, _crx3(private_key, public_der, zip_bytes))
+    # Both archives carry attach.json: owner-only, like the folder.
+    _write_atomic(zip_path, zip_bytes, private=True)
+    _write_atomic(crx_path, _crx3(private_key, public_der, zip_bytes), private=True)
 
     return {
         "extension_id": ext_id,
@@ -352,10 +359,14 @@ def _stage(
             source_dir=EXTENSION_SOURCE_DIR,
             ignore=EXTENSION_COPY_IGNORE,
         )
+        # attach.json carries the enrollment secret: only this user (and the
+        # browser running as this user) may read the folder and the file.
+        if _IS_POSIX:
+            os.chmod(str(unpacked), PRIVATE_DIR_MODE)
         _verify_clean(unpacked)
         if public_der is not None:
             _write_manifest_key(unpacked / MANIFEST_FILE, public_der)
-        (unpacked / ATTACH_FILE).write_bytes(_dump_json(attach))
+        _write_atomic(unpacked / ATTACH_FILE, _dump_json(attach), private=True)
         _verify_clean(unpacked)
     except BaseException:
         # Never leave a half-built (or session-carrying) folder that could be installed.
@@ -443,14 +454,67 @@ def _read_hub(hub_path: Path) -> dict[str, Any] | None:
 
 def _store_port(state: dict[str, Any], port: int) -> dict[str, Any]:
     hub_path = Path(state["hub_path"])
-    hub = _read_hub(hub_path)
-    if hub is None:
-        raise ExtensionBuildError(f"{hub_path} is missing")
-    hub["port"] = port
-    _write_atomic(hub_path, _dump_json(hub), private=True)
+    with _HUB_LOCK:
+        hub = _read_hub(hub_path)
+        if hub is None:
+            raise ExtensionBuildError(f"{hub_path} is missing")
+        hub["port"] = port
+        _write_atomic(hub_path, _dump_json(hub), private=True)
     updated = dict(state)
     updated["port"] = port
     return updated
+
+
+def load_install(hub_path: PathLike, install_id: str) -> dict[str, Any] | None:
+    """A copy of ``hub.json`` ``installs[install_id]``, ``None`` when unknown.
+
+    Blocking file I/O: call it off the event-loop thread.
+    """
+    path = Path(hub_path)
+    hub = _read_hub(path)
+    if hub is None:
+        raise ExtensionBuildError(f"{path} is missing")
+    installs = hub.get("installs")
+    record = installs.get(install_id) if isinstance(installs, dict) else None
+    return dict(record) if isinstance(record, dict) else None
+
+
+def record_install(
+    hub_path: PathLike,
+    install_id: str,
+    *,
+    token: str,
+    confirmed: bool,
+    user_agent: str,
+    now: str,
+) -> None:
+    """Store ``installs[install_id]`` read-modify-write, keeping every other key.
+
+    The token is stored in clear: the hub verifies an HMAC keyed by it, and
+    ``hub.json`` is private and already holds the enrollment secret.
+    ``confirmed`` is false until a hello proved the install holds the token (its
+    welcome may have been lost). ``firstSeen`` is kept from an earlier record.
+    Blocking file I/O: call it off the event-loop thread.
+    """
+    path = Path(hub_path)
+    with _HUB_LOCK:
+        hub = _read_hub(path)
+        if hub is None:
+            raise ExtensionBuildError(f"{path} is missing")
+        installs = hub.get("installs")
+        if not isinstance(installs, dict):
+            installs = {}
+            hub["installs"] = installs
+        previous = installs.get(install_id)
+        record = dict(previous) if isinstance(previous, dict) else {}
+        if not isinstance(record.get("firstSeen"), str):
+            record["firstSeen"] = now
+        record["token"] = token
+        record["confirmed"] = confirmed
+        record["lastSeen"] = now
+        record["userAgent"] = user_agent
+        installs[install_id] = record
+        _write_atomic(path, _dump_json(hub), private=True)
 
 
 def _dump_json(data: dict[str, Any]) -> bytes:
