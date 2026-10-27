@@ -1243,7 +1243,8 @@ when no `chrome_path` is given.
 Native input is the desktop's one mouse and keyboard, and the X11 Unicode
 remap pool belongs to one process, so run one headed worker per X display.
 Headless browsers have no native input and can share a machine.
-[`examples/parallel/`](examples/parallel/) has ready-made templates:
+[`examples/parallel/`](https://github.com/DedInc/emunium/tree/main/examples/parallel)
+has ready-made templates:
 
 - `Dockerfile.worker`, `entrypoint.sh` and `docker-compose.yml`: a headed
   worker image (Chromium, Xvfb and openbox, non-root) that gives each container
@@ -1259,7 +1260,9 @@ cd examples/parallel
 python run_pool.py --mode docker --workers 3
 ```
 
-See [examples/parallel/README.md](examples/parallel/README.md) for sizing
+See
+[examples/parallel/README.md](https://github.com/DedInc/emunium/blob/main/examples/parallel/README.md)
+for sizing
 (about 300-500 MB RAM per headed Chromium, `shm_size`) and the options.
 
 ---
