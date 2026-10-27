@@ -5,12 +5,15 @@ No real Chrome, no network: Popen, taskkill, urlopen and the bridge are fakes.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import logging
 import os
 import stat
 import subprocess
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import ClassVar
@@ -478,6 +481,76 @@ def test_close_without_launch_is_noop(env):
     assert bridge.calls == []
 
 
+class FakeStderr(io.BytesIO):
+    def __init__(self, events, error=None, block=None):
+        super().__init__()
+        self.events = events
+        self.error = error
+        # Stands in for the reader lock held by a drain stuck in readline().
+        self.block = block
+
+    def close(self):
+        self.events.append("stderr_close")
+        if self.block is not None:
+            self.block.wait()
+        super().close()
+        if self.error is not None:
+            raise self.error
+
+
+def _session_with_stderr(monkeypatch, error=None, block=None):
+    events = []
+    monkeypatch.setattr(
+        launcher, "_stop_process_tree", lambda *a, **k: events.append("stop")
+    )
+    proc = FakePopen(["firefox"])
+    proc.stderr = FakeStderr(events, error, block)
+    log_files = contextlib.ExitStack()
+    log_files.callback(events.append, "log_close")
+    session = _session(process=proc, headless=True)
+    session._log_files = log_files
+    return session, proc, events
+
+
+def test_close_closes_stderr_after_the_tree_and_before_the_log(env, monkeypatch):
+    session, proc, events = _session_with_stderr(monkeypatch)
+    launcher.close(session)
+    assert events == ["stop", "stderr_close", "log_close"]
+    assert proc.stderr.closed
+    launcher.close(session)
+    assert events == ["stop", "stderr_close", "log_close"]
+
+
+@pytest.mark.parametrize("error", [OSError(9, "bad fd"), ValueError("busy")])
+def test_close_survives_a_failing_stderr_close(env, monkeypatch, error):
+    session, _, events = _session_with_stderr(monkeypatch, error)
+    launcher.close(session)
+    assert events == ["stop", "stderr_close", "log_close"]
+    assert session.process is None and session._log_files is None
+
+
+def test_close_does_not_hang_on_a_blocked_stderr_close(env, monkeypatch, caplog):
+    assert launcher.STDERR_CLOSE_BUDGET_SECONDS <= 1.0
+    budget = 0.3
+    monkeypatch.setattr(launcher, "STDERR_CLOSE_BUDGET_SECONDS", budget)
+    never_set = threading.Event()
+    session, proc, events = _session_with_stderr(monkeypatch, block=never_set)
+    try:
+        started = time.monotonic()
+        with caplog.at_level(logging.DEBUG, logger="emunium.browser"):
+            launcher.close(session)
+        elapsed = time.monotonic() - started
+        # Upper bound only: join() may return a clock tick (~15.6 ms on
+        # Windows) before monotonic() shows the full budget.
+        assert elapsed < budget + 2.0
+        assert events == ["stop", "stderr_close", "log_close"]
+        assert not proc.stderr.closed  # left to the reader and GC
+        assert session._log_files is None
+        assert any("still busy" in r.getMessage() for r in caplog.records)
+    finally:
+        never_set.set()  # release the daemon closer only after the assertions
+
+
 def _launch_windows(env, monkeypatch, **attrs):
     monkeypatch.setattr(launcher, "_IS_WINDOWS", True)
     session = _session(**attrs)
@@ -575,7 +648,30 @@ def test_windows_no_job_and_parent_gone_warns(env, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="emunium.browser"):
         launcher.close(session)
     assert not any(e[0] == "taskkill" and "/F" in e for e in env["events"])
-    assert any("child processes may remain" in r.getMessage() for r in caplog.records)
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if "child processes may remain" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    # The resolved browser (Chrome for Testing here), never a hard-coded "Chrome".
+    assert warnings[0].startswith(f"{session.resolved.label} (pid ")
+
+
+def test_parent_gone_warning_without_a_resolved_browser_is_neutral(
+    env, monkeypatch, caplog
+):
+    monkeypatch.setattr(launcher, "_IS_WINDOWS", True)
+    proc = FakePopen(["msedge"])
+    proc.returncode = 0
+    session = _session(process=proc, headless=True)
+    with caplog.at_level(logging.WARNING, logger="emunium.browser"):
+        launcher.close(session)
+    expected = (
+        f"Browser (pid {proc.pid}) exited before its process tree could be killed;"
+        " child processes may remain"
+    )
+    assert [r.getMessage() for r in caplog.records] == [expected]
 
 
 def test_windows_job_api_unavailable_falls_back(env, monkeypatch):
@@ -948,8 +1044,14 @@ def test_browser_path_must_exist():
             "brave",
             "load-extension",
         ),
+        # discovery.LINUX_COMMANDS["edge"] names, as resolved on PATH.
+        ("/usr/bin/microsoft-edge", "edge", "load-extension"),
+        ("/usr/bin/microsoft-edge-stable", "edge", "load-extension"),
+        ("/opt/microsoft/msedge/microsoft-edge-beta", "edge", "load-extension"),
+        (r"D:\Portable\Edge\Microsoft-Edge-Dev.exe", "edge", "load-extension"),
         ("/usr/lib/chromium/chrome", "chromium", "load-extension"),
         ("/opt/tools/chrome", "custom", "load-extension"),
+        ("/opt/tools/edge-microsoft", "custom", "load-extension"),
     ],
 )
 def test_path_classification(path, name, method):

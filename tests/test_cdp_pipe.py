@@ -273,6 +273,34 @@ def test_close_before_spawn_releases_every_end():
     assert cdp._command_write is None and cdp._reply_read is None
 
 
+def test_create_pipes_closes_the_first_pipe_when_the_second_fails(monkeypatch):
+    real_pipe = os.pipe
+    real_close_quietly = cdp_pipe._close_quietly
+    made: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    def failing_pipe() -> tuple[int, int]:
+        if made:
+            raise OSError(24, "Too many open files")
+        made.append(real_pipe())
+        return made[0]
+
+    def recording_close(fd: int) -> None:
+        closed.append(fd)
+        real_close_quietly(fd)
+
+    monkeypatch.setattr(cdp_pipe.os, "pipe", failing_pipe)
+    monkeypatch.setattr(cdp_pipe, "_close_quietly", recording_close)
+    cdp = CdpPipe()
+    with pytest.raises(OSError, match="Too many open files"):
+        cdp._create_pipes()
+    monkeypatch.undo()
+
+    assert len(made) == 1
+    assert sorted(closed) == sorted(made[0])
+    assert cdp._child_read is None and cdp._command_write is None
+
+
 # -- load_unpacked ---------------------------------------------------------------
 
 

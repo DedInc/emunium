@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -70,6 +71,8 @@ TERMINATE_GRACE_SECONDS = 5.0
 CLOSE_TABS_BUDGET_SECONDS = 1.0
 GRACEFUL_TASKKILL_GRACE_SECONDS = 2.0
 TASKKILL_TIMEOUT_SECONDS = 10.0
+# Upper bound on closing Firefox's stderr pipe (see _close_stream_bounded).
+STDERR_CLOSE_BUDGET_SECONDS = 1.0
 RMTREE_ATTEMPTS = 10
 RMTREE_RETRY_DELAY = 0.3
 LOG_TAIL_LINES = 20
@@ -410,7 +413,9 @@ def close(session: BrowserSession) -> None:
         if _IS_WINDOWS and not session.headless and process.poll() is None:
             # Chrome ignores the graceful taskkill; closing its last tab exits it.
             _close_all_tabs(session.bridge, CLOSE_TABS_BUDGET_SECONDS)
-        _stop_process_tree(process, job, headless=session.headless)
+        _stop_process_tree(
+            process, job, headless=session.headless, label=_label(session)
+        )
     elif job is not None:
         _close_job(job, terminate=True)
 
@@ -428,6 +433,10 @@ def close(session: BrowserSession) -> None:
             bidi.close()
         except Exception:
             logger.exception("WebDriver BiDi session close raised")
+    # Firefox's stderr pipe, after the tree is gone so the drain thread sees EOF.
+    stderr = process.stderr if process is not None else None
+    if stderr is not None:
+        _close_stream_bounded(stderr, STDERR_CLOSE_BUDGET_SECONDS)
     log_files, session._log_files = session._log_files, None
     if log_files is not None:
         try:
@@ -451,6 +460,31 @@ def close(session: BrowserSession) -> None:
         _remove_tree(session_dir)
     if process is not None:
         logger.info("Browser closed")
+
+
+def _close_stream_bounded(stream: Any, budget: float) -> None:
+    """Close *stream* without letting ``close()`` wait more than *budget* seconds.
+
+    A surviving child can keep the pipe's write end open; the Firefox stderr
+    drain then sits in ``readline()`` holding the reader's lock, and
+    ``stream.close()`` would block on that lock forever. The close runs on a
+    daemon thread instead; past the budget the stream is left to the drain and GC.
+    """
+
+    def run() -> None:
+        try:
+            stream.close()
+        except (OSError, ValueError) as exc:
+            logger.debug("Closing the browser stderr pipe failed: %s", exc)
+
+    closer = threading.Thread(target=run, name="emunium-stderr-close", daemon=True)
+    closer.start()
+    closer.join(budget)
+    if closer.is_alive():
+        logger.debug(
+            "Browser stderr pipe still busy after %.1f s; leaving it to the reader",
+            budget,
+        )
 
 
 def _resolve_executable(session: BrowserSession) -> ResolvedBrowser:
@@ -518,7 +552,9 @@ def resolve_browser(
     ):
         if override:
             if not is_file(override):
-                raise LaunchError(f"Chrome executable not found: {override} ({source})")
+                raise LaunchError(
+                    f"Browser executable not found: {override} ({source})"
+                )
             return _from_path(override, cft_dir)
     return _auto(discover, install_cft)
 
@@ -557,7 +593,12 @@ def _from_path(path: str, cft_dir: str | None) -> ResolvedBrowser:
     if any("google" in p for p in parts) and any("chrome" in p for p in parts):
         # Google-branded Chrome ignores --load-extension.
         return ResolvedBrowser("chrome", path, "chromium", CDP_PIPE)
-    if "msedge" in basename or "microsoft edge" in basename:
+    if (
+        "msedge" in basename
+        or "microsoft edge" in basename
+        # Linux: microsoft-edge, microsoft-edge-stable, -beta, -dev.
+        or basename.startswith("microsoft-edge")
+    ):
         name = "edge"
     elif "brave" in basename:
         name = "brave"
@@ -678,7 +719,10 @@ def _read_log_tail(log_path: str | None, count: int = LOG_TAIL_LINES) -> list[st
 
 
 def _stop_process_tree(
-    process: subprocess.Popen, job: int | None = None, headless: bool = False
+    process: subprocess.Popen,
+    job: int | None = None,
+    headless: bool = False,
+    label: str = "Browser",
 ) -> None:
     pid = process.pid
     if _IS_WINDOWS:
@@ -697,8 +741,9 @@ def _stop_process_tree(
                     _kill_quietly(process)
             else:
                 logger.warning(
-                    "Chrome (pid %s) exited before its process tree could be killed;"
+                    "%s (pid %s) exited before its process tree could be killed;"
                     " child processes may remain",
+                    label,
                     pid,
                 )
     else:

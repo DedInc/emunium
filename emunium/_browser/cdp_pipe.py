@@ -283,7 +283,14 @@ class CdpPipe:
     def _create_pipes(self) -> tuple[int, int]:
         """Create both pipes; return Chrome's ends ``(read, write)``."""
         child_read, command_write = os.pipe()
-        reply_read, child_write = os.pipe()
+        try:
+            reply_read, child_write = os.pipe()
+        except BaseException:
+            # EMFILE and the like: the first pipe is not recorded yet, so
+            # _close_all would never see it.
+            _close_quietly(child_read)
+            _close_quietly(command_write)
+            raise
         self._child_read, self._command_write = child_read, command_write
         self._reply_read, self._child_write = reply_read, child_write
         return child_read, child_write
