@@ -1,29 +1,59 @@
-"""Chrome process lifecycle for one ``Browser``.
+"""Browser process lifecycle for one ``Browser``.
 
 Contract: ``docs/architecture/bridge-protocol.md`` section 1 (session bootstrap).
 
 ``launch()`` is transactional: every resource it creates (bridge, session
-directory, Chrome process tree) is released by ``close()`` before the error
-propagates. The packaged ``emunium/extension/`` directory is only ever read.
+directory, browser process tree, CDP pipe, BiDi session) is released by
+``close()`` before the error propagates. The packaged ``emunium/extension/``
+directory is only ever read.
+
+``resolve_browser()`` picks the binary and how the extension gets in:
+``load-extension`` (command-line flag), ``cdp-pipe`` (Google Chrome, over
+``--remote-debugging-pipe``) or ``bidi`` (Firefox, over WebDriver BiDi).
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from emunium.chrome_installer import CHROME_PATH_ENV, ensure_chrome
+from emunium._browser.cdp_pipe import CdpPipe
+from emunium._browser.discovery import (
+    APP_PATHS_KEY,
+    BROWSER_ORDER,
+    DEFAULT_PREFERENCE,
+    LINUX_COMMANDS,
+    MACOS_RELATIVE,
+    MACOS_ROOTS,
+    WINDOWS_APP_PATHS,
+    WINDOWS_RELATIVE,
+    WINDOWS_ROOT_ENV,
+    InstalledBrowser,
+    find_browser,
+    find_browsers,
+)
+from emunium._browser.extension_targets import materialize
+from emunium._browser.firefox import (
+    BidiSession,
+    firefox_args,
+    read_bidi_url,
+    write_user_prefs,
+)
+from emunium.chrome_installer import CHROME_PATH_ENV, _install_dir, ensure_chrome
 from emunium.errors import EmuniumError, LaunchError
 
 logger = logging.getLogger("emunium.browser")
@@ -57,12 +87,47 @@ CHROME_FLAGS = (
     "--hide-crash-restore-bubble",
 )
 
+# Install methods (discovery.INSTALL_METHODS values).
+LOAD_EXTENSION = "load-extension"
+CDP_PIPE = "cdp-pipe"
+BIDI = "bidi"
+# Names resolve_browser() accepts besides the discovery names.
+CFT_NAME = "cft"
+AUTO_NAME = "auto"
+CUSTOM_NAME = "custom"
+CHROME_FOR_TESTING = "chrome for testing"
+# The Windows Firefox launcher stub exits once the real browser is up unless
+# told to wait; the stub's pid is the one launch() watches and stops.
+FIREFOX_WAIT_FLAG = "-wait-for-browser"
+CHROMIUM_LOG_NAME = "chrome.log"
+FIREFOX_LOG_NAME = "firefox.log"
+
+_PATH_SEPARATORS = re.compile(r"[\\/]+")
+
+
+@dataclass(frozen=True)
+class ResolvedBrowser:
+    """The browser ``launch()`` starts and how the extension gets into it."""
+
+    name: str
+    path: str
+    family: str
+    install_method: str
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} ({self.path})"
+
 
 class BrowserSession:
     __slots__ = (
+        "_bidi",
         "_bridge_started",
+        "_cdp_pipe",
         "_job",
+        "_log_files",
         "bridge",
+        "browser",
         "chrome_path",
         "executable_path",
         "extension_dir",
@@ -71,6 +136,7 @@ class BrowserSession:
         "log_path",
         "process",
         "profile_dir",
+        "resolved",
         "session_dir",
         "user_data_dir",
     )
@@ -80,18 +146,27 @@ class BrowserSession:
         self.process: subprocess.Popen | None = None
         self.headless: bool = False
         self.user_data_dir: str | None = None
-        # Explicit Chrome binary; None -> EMUNIUM_CHROME_PATH -> Chrome for Testing.
+        # Browser name, "cft", "auto" or an executable path; None falls back to
+        # chrome_path -> EMUNIUM_CHROME_PATH -> "auto" (see resolve_browser).
+        self.browser: str | None = None
+        # Explicit Chrome binary, used when ``browser`` is None.
         self.chrome_path: str | None = None
         self.extra_args: list[str] = []
         self.session_dir: str | None = None
         self.extension_dir: str | None = None
         self.profile_dir: str | None = None
         self.log_path: str | None = None
-        # Binary actually started by the last launch().
+        # Browser and binary actually started by the last launch().
+        self.resolved: ResolvedBrowser | None = None
         self.executable_path: str | None = None
         self._bridge_started: bool = False
-        # Windows Job Object handle owning the Chrome process tree, if any.
+        # Windows Job Object handle owning the browser process tree, if any.
         self._job: int | None = None
+        # Google Chrome: the debugging pipe; closing it makes Chrome exit.
+        self._cdp_pipe: CdpPipe | None = None
+        # Firefox: the WebDriver BiDi session and the stderr log it copies into.
+        self._bidi: BidiSession | None = None
+        self._log_files: contextlib.ExitStack | None = None
 
 
 def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
@@ -106,7 +181,7 @@ def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
             logger.exception("Cleanup after a failed launch raised")
         if isinstance(exc, EmuniumError):
             raise
-        raise LaunchError(f"Chrome launch failed: {exc}") from exc
+        raise LaunchError(f"{_label(session)} launch failed: {exc}") from exc
     except BaseException:
         # KeyboardInterrupt / SystemExit: still release everything, never wrap.
         try:
@@ -117,7 +192,7 @@ def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
 
 
 def _launch(session: BrowserSession, bridge_timeout: float) -> None:
-    executable = _resolve_executable(session)
+    resolved = _resolve_executable(session)
     extra_args = _validated_extra_args(session.extra_args)
 
     session._bridge_started = True
@@ -132,13 +207,22 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
 
     session.session_dir = tempfile.mkdtemp(prefix=SESSION_DIR_PREFIX)
     session_dir = Path(session.session_dir)
-
     extension_dir = session_dir / "extension"
-    shutil.copytree(
-        EXTENSION_SOURCE_DIR,
-        str(extension_dir),
-        ignore=shutil.ignore_patterns(*EXTENSION_COPY_IGNORE),
-    )
+
+    if resolved.install_method == BIDI:
+        # The packaged manifest is Chromium's; Firefox gets its overlay.
+        materialize(
+            "firefox",
+            extension_dir,
+            source_dir=EXTENSION_SOURCE_DIR,
+            ignore=EXTENSION_COPY_IGNORE,
+        )
+    else:
+        shutil.copytree(
+            EXTENSION_SOURCE_DIR,
+            str(extension_dir),
+            ignore=shutil.ignore_patterns(*EXTENSION_COPY_IGNORE),
+        )
     session.extension_dir = str(extension_dir)
     _write_session_file(extension_dir, port, token)
 
@@ -149,38 +233,169 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
         profile_dir = session_dir / "profile"
         profile_dir.mkdir()
     session.profile_dir = str(profile_dir)
-    _seed_profile(str(profile_dir))
 
-    session.log_path = str(session_dir / "chrome.log")
-    args = build_args(
-        executable,
-        session.profile_dir,
-        session.extension_dir,
-        headless=session.headless,
-        extra_args=extra_args,
-    )
-    process = _spawn(args, session.log_path)
-    session.process = process
-    if _IS_WINDOWS:
-        session._job = _attach_job(process)
-    logger.info("Chrome started (pid %s), session dir %s", process.pid, session_dir)
+    if resolved.install_method == BIDI:
+        write_user_prefs(profile_dir)
+        log_path = str(session_dir / FIREFOX_LOG_NAME)
+        session.log_path = log_path
+        process = _spawn_firefox(
+            session,
+            resolved,
+            _Paths(str(profile_dir), str(extension_dir), log_path),
+            extra_args,
+            bridge_timeout,
+        )
+    else:
+        _seed_profile(str(profile_dir))
+        log_path = str(session_dir / CHROMIUM_LOG_NAME)
+        session.log_path = log_path
+        process = _spawn_chromium(
+            session,
+            resolved,
+            _Paths(str(profile_dir), str(extension_dir), log_path),
+            extra_args,
+        )
 
     _await_connection(session, process, bridge_timeout)
     logger.info("Extension connected to bridge")
 
 
+@dataclass(frozen=True)
+class _Paths:
+    profile_dir: str
+    extension_dir: str
+    log_path: str
+
+
+def _spawn_chromium(
+    session: BrowserSession,
+    resolved: ResolvedBrowser,
+    paths: _Paths,
+    extra_args: list[str],
+) -> subprocess.Popen:
+    pipe: CdpPipe | None = None
+    if resolved.install_method == CDP_PIPE:
+        pipe = CdpPipe()
+        session._cdp_pipe = pipe
+        args = build_args(
+            resolved.path,
+            paths.profile_dir,
+            None,
+            headless=session.headless,
+            extra_args=extra_args,
+            browser_flags=pipe.prepare(),
+        )
+        process = _spawn(pipe.wrap_args(args), paths.log_path, pipe.popen_kwargs())
+    else:
+        args = build_args(
+            resolved.path,
+            paths.profile_dir,
+            paths.extension_dir,
+            headless=session.headless,
+            extra_args=extra_args,
+        )
+        process = _spawn(args, paths.log_path)
+    _register_process(session, resolved, process)
+
+    if pipe is not None:
+        try:
+            pipe.after_spawn()
+            extension_id = pipe.load_unpacked(paths.extension_dir)
+        except LaunchError as exc:
+            raise _install_failure(session, resolved, process, "CDP pipe", exc) from exc
+        logger.info("Extension %s loaded over the CDP pipe", extension_id)
+    return process
+
+
+def _spawn_firefox(
+    session: BrowserSession,
+    resolved: ResolvedBrowser,
+    paths: _Paths,
+    extra_args: list[str],
+    bridge_timeout: float,
+) -> subprocess.Popen:
+    args = firefox_args(resolved.path, paths.profile_dir, headless=session.headless)
+    if _IS_WINDOWS:
+        args.append(FIREFOX_WAIT_FLAG)
+    args.extend(extra_args)
+    # Kept open until close(): the stderr drain copies every Firefox line into it.
+    with contextlib.ExitStack() as stack:
+        log_file = stack.enter_context(open(paths.log_path, "wb"))
+        # Ownership moves to the session; close() releases it.
+        session._log_files = stack.pop_all()
+    process = subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=not _IS_WINDOWS,
+    )
+    _register_process(session, resolved, process)
+
+    try:
+        stream = process.stderr
+        if stream is None:
+            raise LaunchError("Firefox stderr is not piped")
+        url = read_bidi_url(stream, bridge_timeout, sink=log_file)
+        bidi = BidiSession(url)
+        session._bidi = bidi
+        bidi.new_session()
+        extension_id = bidi.install_extension(paths.extension_dir)
+    except LaunchError as exc:
+        raise _install_failure(
+            session, resolved, process, "WebDriver BiDi", exc
+        ) from exc
+    logger.info("Extension %s installed over WebDriver BiDi", extension_id)
+    return process
+
+
+def _register_process(
+    session: BrowserSession, resolved: ResolvedBrowser, process: subprocess.Popen
+) -> None:
+    session.process = process
+    if _IS_WINDOWS:
+        session._job = _attach_job(process)
+    logger.info(
+        "%s started (pid %s), session dir %s",
+        resolved.label,
+        process.pid,
+        session.session_dir,
+    )
+
+
+def _install_failure(
+    session: BrowserSession,
+    resolved: ResolvedBrowser,
+    process: subprocess.Popen,
+    channel: str,
+    exc: LaunchError,
+) -> LaunchError:
+    code = process.poll()
+    if code is not None:
+        return LaunchError(_early_exit_message(session, code))
+    return LaunchError(
+        f"Could not install the extension into {resolved.label} over {channel}:"
+        f" {exc}{_log_tail_suffix(session.log_path)}",
+        method=exc.method,
+    )
+
+
 def build_args(
     executable: str,
     profile_dir: str,
-    extension_dir: str,
+    extension_dir: str | None,
     *,
     headless: bool = False,
     extra_args: list[str] | None = None,
+    browser_flags: Sequence[str] = (),
 ) -> list[str]:
+    """Chromium command line; ``extension_dir=None`` leaves out the extension flags."""
     args = [executable, f"--user-data-dir={profile_dir}"]
     args.extend(CHROME_FLAGS)
-    args.append(f"--disable-extensions-except={extension_dir}")
-    args.append(f"--load-extension={extension_dir}")
+    if extension_dir is not None:
+        args.append(f"--disable-extensions-except={extension_dir}")
+        args.append(f"--load-extension={extension_dir}")
+    args.extend(browser_flags)
     if headless:
         args.append("--headless=new")
     args.extend(extra_args or ())
@@ -198,6 +413,27 @@ def close(session: BrowserSession) -> None:
         _stop_process_tree(process, job, headless=session.headless)
     elif job is not None:
         _close_job(job, terminate=True)
+
+    # After the tree is gone: closing the pipe earlier would make Chrome exit
+    # on its own, ahead of the tab close / taskkill sequence above.
+    pipe, session._cdp_pipe = session._cdp_pipe, None
+    if pipe is not None:
+        try:
+            pipe.close()
+        except Exception:
+            logger.exception("CDP pipe close raised")
+    bidi, session._bidi = session._bidi, None
+    if bidi is not None:
+        try:
+            bidi.close()
+        except Exception:
+            logger.exception("WebDriver BiDi session close raised")
+    log_files, session._log_files = session._log_files, None
+    if log_files is not None:
+        try:
+            log_files.close()
+        except OSError as exc:
+            logger.debug("Closing %s failed: %s", session.log_path, exc)
 
     if session._bridge_started:
         session._bridge_started = False
@@ -217,16 +453,145 @@ def close(session: BrowserSession) -> None:
         logger.info("Browser closed")
 
 
-def _resolve_executable(session: BrowserSession) -> str:
-    override = session.chrome_path or os.environ.get(CHROME_PATH_ENV)
-    if override:
-        if not os.path.isfile(override):
-            raise LaunchError(f"Chrome executable not found: {override}")
-        executable = override
+def _resolve_executable(session: BrowserSession) -> ResolvedBrowser:
+    resolved = resolve_browser(session.browser, session.chrome_path)
+    session.resolved = resolved
+    session.executable_path = resolved.path
+    logger.info(
+        "Browser %s via %s (%s)",
+        resolved.label,
+        resolved.install_method,
+        resolved.family,
+    )
+    return resolved
+
+
+def resolve_browser(
+    browser: str | None = None,
+    chrome_path: str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    discover: Callable[[], Sequence[InstalledBrowser]] | None = None,
+    find: Callable[[str], InstalledBrowser | None] | None = None,
+    install_cft: Callable[[], str] | None = None,
+    is_file: Callable[[str], bool] | None = None,
+    cft_dir: str | None = None,
+    platform: str | None = None,
+) -> ResolvedBrowser:
+    """Pick the browser to launch; every OS dependency is injectable.
+
+    ``browser`` is a discovery name (``chrome``, ``edge``, ``brave``,
+    ``chromium``, ``firefox``), ``cft`` (Chrome for Testing), ``auto`` or an
+    executable path. When it is None: ``chrome_path``, then
+    ``EMUNIUM_CHROME_PATH``, then ``auto`` (the first installed browser of
+    ``DEFAULT_PREFERENCE``, else Chrome for Testing).
+    """
+    env = os.environ if env is None else env
+    is_file = os.path.isfile if is_file is None else is_file
+    if browser is not None:
+        if not isinstance(browser, str) or not browser.strip():
+            raise LaunchError(f"browser must be a non-empty string, got {browser!r}")
+        spec = browser.strip()
+        key = spec.lower()
+        if key in BROWSER_ORDER:
+            found = (find_browser if find is None else find)(key)
+            if found is None:
+                raise LaunchError(
+                    f"Browser {key!r} is not installed;"
+                    f" searched {_searched_locations(key, platform)}"
+                )
+            return _from_installed(found)
+        if key == CFT_NAME:
+            return _chrome_for_testing(install_cft)
+        if key == AUTO_NAME:
+            return _auto(discover, install_cft)
+        if is_file(spec):
+            return _from_path(spec, cft_dir)
+        names = ", ".join((*BROWSER_ORDER, CFT_NAME, AUTO_NAME))
+        raise LaunchError(
+            f"Browser executable not found: {spec} (browser= is neither one of"
+            f" {names} nor an existing file)"
+        )
+    for override, source in (
+        (chrome_path, "chrome_path"),
+        (env.get(CHROME_PATH_ENV), CHROME_PATH_ENV),
+    ):
+        if override:
+            if not is_file(override):
+                raise LaunchError(f"Chrome executable not found: {override} ({source})")
+            return _from_path(override, cft_dir)
+    return _auto(discover, install_cft)
+
+
+def _from_installed(found: InstalledBrowser) -> ResolvedBrowser:
+    return ResolvedBrowser(found.name, found.path, found.family, found.install_method)
+
+
+def _chrome_for_testing(install_cft: Callable[[], str] | None) -> ResolvedBrowser:
+    path = (ensure_chrome if install_cft is None else install_cft)()
+    return ResolvedBrowser(CFT_NAME, path, "chromium", LOAD_EXTENSION)
+
+
+def _auto(
+    discover: Callable[[], Sequence[InstalledBrowser]] | None,
+    install_cft: Callable[[], str] | None,
+) -> ResolvedBrowser:
+    installed = {b.name: b for b in (find_browsers if discover is None else discover)()}
+    for name in DEFAULT_PREFERENCE:
+        found = installed.get(name)
+        if found is not None:
+            return _from_installed(found)
+    logger.info(
+        "No installed browser of %s; using Chrome for Testing", DEFAULT_PREFERENCE
+    )
+    return _chrome_for_testing(install_cft)
+
+
+def _from_path(path: str, cft_dir: str | None) -> ResolvedBrowser:
+    parts = [p.lower() for p in _PATH_SEPARATORS.split(path) if p]
+    basename = parts[-1] if parts else ""
+    if "firefox" in basename:
+        return ResolvedBrowser("firefox", path, "firefox", BIDI)
+    if _is_chrome_for_testing(parts, cft_dir):
+        return ResolvedBrowser(CFT_NAME, path, "chromium", LOAD_EXTENSION)
+    if any("google" in p for p in parts) and any("chrome" in p for p in parts):
+        # Google-branded Chrome ignores --load-extension.
+        return ResolvedBrowser("chrome", path, "chromium", CDP_PIPE)
+    if "msedge" in basename or "microsoft edge" in basename:
+        name = "edge"
+    elif "brave" in basename:
+        name = "brave"
+    elif any("chromium" in p for p in parts):
+        name = "chromium"
     else:
-        executable = ensure_chrome()
-    session.executable_path = executable
-    return executable
+        name = CUSTOM_NAME
+    return ResolvedBrowser(name, path, "chromium", LOAD_EXTENSION)
+
+
+def _is_chrome_for_testing(parts: list[str], cft_dir: str | None) -> bool:
+    if any(CHROME_FOR_TESTING in p for p in parts):
+        return True
+    root = str(_install_dir()) if cft_dir is None else cft_dir
+    root_parts = [p.lower() for p in _PATH_SEPARATORS.split(root) if p]
+    return bool(root_parts) and parts[: len(root_parts)] == root_parts
+
+
+def _searched_locations(name: str, platform: str | None) -> str:
+    platform = sys.platform if platform is None else platform
+    if platform == "win32":
+        places = [f"%{root}%\\{WINDOWS_RELATIVE[name]}" for root in WINDOWS_ROOT_ENV]
+        exe = WINDOWS_APP_PATHS.get(name)
+        if exe is not None:
+            places.append(f"HKCU/HKLM\\{APP_PATHS_KEY}\\{exe}")
+        return ", ".join(places)
+    if platform == "darwin":
+        return ", ".join(f"{root}/{MACOS_RELATIVE[name]}" for root in MACOS_ROOTS)
+    return "PATH for " + ", ".join(LINUX_COMMANDS[name])
+
+
+def _label(session: BrowserSession) -> str:
+    resolved = session.resolved
+    return "Browser" if resolved is None else resolved.label
 
 
 def _validated_extra_args(extra_args: Any) -> list[str]:
@@ -246,18 +611,22 @@ def _write_session_file(extension_dir: Path, port: int, token: str) -> None:
     (extension_dir / "session.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _spawn(args: list[str], log_path: str) -> subprocess.Popen:
+def _spawn(
+    args: list[str], log_path: str, popen_kwargs: Mapping[str, Any] | None = None
+) -> subprocess.Popen:
     # The child keeps its own handle to the log; ours can close right away.
     with open(log_path, "wb") as log_file:
-        return subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-            # POSIX: own process group, so close() can signal the whole tree with
-            # killpg. Windows Popen ignores the flag.
-            start_new_session=not _IS_WINDOWS,
-        )
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": log_file,
+            # POSIX: own process group, so close() can signal the whole tree
+            # with killpg. Windows Popen ignores the flag.
+            "start_new_session": not _IS_WINDOWS,
+        }
+        # The CDP pipe hands its ends over (pass_fds / handle_list startupinfo).
+        kwargs.update(popen_kwargs or {})
+        return subprocess.Popen(args, **kwargs)
 
 
 def _await_connection(
@@ -272,18 +641,18 @@ def _await_connection(
             raise LaunchError(_early_exit_message(session, code))
         if time.monotonic() >= deadline:
             raise LaunchError(
-                f"The emunium extension did not connect within {bridge_timeout:.1f} s."
-                f"{_log_tail_suffix(session.log_path)}"
+                f"The emunium extension did not connect within {bridge_timeout:.1f} s"
+                f" ({_label(session)}).{_log_tail_suffix(session.log_path)}"
             )
 
 
 def _early_exit_message(session: BrowserSession, code: int) -> str:
-    message = f"Chrome exited during startup (exit code {code})."
+    message = f"{_label(session)} exited during startup (exit code {code})."
     if session.user_data_dir:
         # Chrome hands the command line to the instance owning the profile and exits.
         message += (
             f" The profile {session.profile_dir} is probably already in use by another"
-            " Chrome instance; close that browser or use a different user_data_dir."
+            " browser instance; close that browser or use a different user_data_dir."
         )
     return message + _log_tail_suffix(session.log_path)
 

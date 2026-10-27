@@ -56,6 +56,7 @@ class Browser:
         bridge_port: int = 0,
         bridge_timeout: float = 60.0,
         *,
+        browser: str | None = None,
         chrome_path: str | None = None,
         extra_args: list[str] | None = None,
         verify_input: bool = True,
@@ -65,14 +66,22 @@ class Browser:
         """Configure a session; nothing starts until ``launch()``.
 
         Args:
-            headless: Run Chrome headless (native input is then refused).
-            user_data_dir: Chrome profile directory to reuse; None uses a
+            headless: Run the browser headless (native input is then refused).
+            user_data_dir: Browser profile directory to reuse; None uses a
                 temporary profile removed on ``close()``.
             bridge_port: Local bridge port; 0 picks a free one.
             bridge_timeout: Seconds ``launch()`` waits for the extension.
-            chrome_path: Chrome binary; None tries ``EMUNIUM_CHROME_PATH``,
-                then Chrome for Testing.
-            extra_args: Extra Chrome command-line flags.
+            browser: Which browser to start: an installed ``chrome``,
+                ``edge``, ``brave``, ``chromium`` or ``firefox``; ``cft``
+                (Chrome for Testing, downloaded on first use); ``auto``; or
+                the path of an executable. None uses ``chrome_path``, then
+                ``EMUNIUM_CHROME_PATH``, then ``auto``: the first installed
+                of chrome, edge, brave, chromium, else Chrome for Testing.
+                Google Chrome gets the extension over its debugging pipe,
+                Firefox over WebDriver BiDi, the others via
+                ``--load-extension``.
+            chrome_path: Browser binary, used when ``browser`` is None.
+            extra_args: Extra browser command-line flags.
             verify_input: Prove the cursor is over an element before a click.
             motion: Human pointer planner: a preset name (``natural``,
                 ``careful``, ``brisk``), a ``MotionPlanner`` or None
@@ -85,6 +94,7 @@ class Browser:
         self._session.bridge = bridge
         self._session.headless = bool(headless)
         self._session.user_data_dir = user_data_dir
+        self._session.browser = browser
         self._session.chrome_path = chrome_path
         # Validated by launch(); a str is reported there rather than split here.
         self._session.extra_args = [] if extra_args is None else extra_args
@@ -110,6 +120,16 @@ class Browser:
     def bridge(self) -> Bridge:
         """The low-level ``Bridge`` (plain-data replies) this browser uses."""
         return self._ctx.bridge
+
+    @property
+    def browser_name(self) -> str | None:
+        """Browser the last ``launch()`` resolved, None before the first launch.
+
+        One of ``chrome``, ``edge``, ``brave``, ``chromium``, ``firefox``,
+        ``cft`` (Chrome for Testing) or ``custom`` (an unrecognised path).
+        """
+        resolved = self._session.resolved
+        return None if resolved is None else resolved.name
 
     @property
     def context(self) -> BrowserContext:

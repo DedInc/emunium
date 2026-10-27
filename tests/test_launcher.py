@@ -19,6 +19,7 @@ import pytest
 
 import emunium.chrome_installer as installer
 from emunium._browser import launcher
+from emunium._browser.discovery import InstalledBrowser
 from emunium._browser.facade import Browser
 from emunium.errors import BridgeError, LaunchError
 
@@ -70,7 +71,9 @@ class FakePopen:
         self.terminated = False
         self.killed = False
         stderr = kwargs.get("stderr")
-        if stderr is not None and FakePopen.stderr_text:
+        piped = stderr is subprocess.PIPE
+        self.stderr = io.BytesIO(FakePopen.stderr_text) if piped else None
+        if stderr is not None and not piped and FakePopen.stderr_text:
             stderr.write(FakePopen.stderr_text)
         FakePopen.instances.append(self)
 
@@ -168,6 +171,14 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher.subprocess, "run", fake_run)
     monkeypatch.setattr(launcher.os, "killpg", fake_killpg, raising=False)
     monkeypatch.setattr(launcher, "ensure_chrome", fake_ensure)
+    # Never the host's browsers: "auto" sees only what a test installs here.
+    installed: list[InstalledBrowser] = []
+    monkeypatch.setattr(launcher, "find_browsers", lambda: list(installed))
+    monkeypatch.setattr(
+        launcher,
+        "find_browser",
+        lambda name: next((b for b in installed if b.name == name), None),
+    )
     monkeypatch.setattr(launcher.time, "sleep", lambda s: None)
     monkeypatch.setattr(launcher.tempfile, "tempdir", str(tmp_root))
     monkeypatch.delenv(installer.CHROME_PATH_ENV, raising=False)
@@ -180,6 +191,7 @@ def env(monkeypatch, tmp_path):
         "events": events,
         "state": state,
         "job_api": job_api,
+        "installed": installed,
     }
 
 
@@ -776,13 +788,483 @@ def test_close_retries_rmtree_until_released(env, monkeypatch):
 def test_facade_session_defaults():
     browser = Browser(headless=True, user_data_dir=None)
     session = browser._session
+    assert session.browser is None
     assert session.chrome_path is None
+    assert session.resolved is None
+    assert browser.browser_name is None
     assert session.extra_args == []
     assert session.session_dir is None
     assert session.extension_dir is None
     assert session.profile_dir is None
     assert session.log_path is None
     assert session.headless is True
+
+
+# -- browser resolution ------------------------------------------------------------------
+
+
+def _installed(name, path=None):
+    method = {"chrome": "cdp-pipe", "firefox": "bidi"}.get(name, "load-extension")
+    family = "firefox" if name == "firefox" else "chromium"
+    return InstalledBrowser(name, family, path or f"/opt/{name}/{name}", method)
+
+
+class Resolver:
+    """resolve_browser() with every OS dependency injected and recorded."""
+
+    def __init__(self, installed=(), files=()):
+        self.installed = list(installed)
+        self.files = set(files)
+        self.calls = []
+
+    def discover(self):
+        self.calls.append("discover")
+        return list(self.installed)
+
+    def find(self, name):
+        self.calls.append(("find", name))
+        return next((b for b in self.installed if b.name == name), None)
+
+    def install_cft(self):
+        self.calls.append("cft")
+        return "/cft/chrome-linux64/chrome"
+
+    def __call__(self, browser=None, chrome_path=None, env=None, **kwargs):
+        kwargs.setdefault("cft_dir", "/cft")
+        return launcher.resolve_browser(
+            browser,
+            chrome_path,
+            env={} if env is None else env,
+            discover=self.discover,
+            find=self.find,
+            install_cft=self.install_cft,
+            is_file=lambda p: p in self.files,
+            **kwargs,
+        )
+
+
+def test_auto_picks_the_first_of_the_default_preference():
+    # find_browsers order is irrelevant: DEFAULT_PREFERENCE decides.
+    resolve = Resolver(
+        [_installed(n) for n in ("firefox", "chromium", "brave", "edge")]
+    )
+    picked = resolve()
+    assert (picked.name, picked.install_method) == ("edge", "load-extension")
+    assert resolve.calls == ["discover"]
+    resolve.installed.append(_installed("chrome"))
+    picked = resolve(browser="auto")
+    assert (picked.name, picked.family, picked.install_method) == (
+        "chrome",
+        "chromium",
+        "cdp-pipe",
+    )
+    assert picked.path == "/opt/chrome/chrome"
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [(("brave", "chromium"), "brave"), (("chromium",), "chromium")],
+)
+def test_auto_order_falls_through(names, expected):
+    assert Resolver([_installed(n) for n in names])().name == expected
+
+
+@pytest.mark.parametrize("installed", [(), ("firefox",)])
+def test_auto_falls_back_to_chrome_for_testing(installed):
+    # Firefox is never picked implicitly.
+    resolve = Resolver([_installed(n) for n in installed])
+    picked = resolve()
+    assert picked == launcher.ResolvedBrowser(
+        "cft", "/cft/chrome-linux64/chrome", "chromium", "load-extension"
+    )
+    assert resolve.calls == ["discover", "cft"]
+
+
+def test_browser_name_uses_find_browser():
+    resolve = Resolver([_installed("firefox", r"C:\Mozilla Firefox\firefox.exe")])
+    picked = resolve(browser="Firefox")
+    assert picked == launcher.ResolvedBrowser(
+        "firefox", r"C:\Mozilla Firefox\firefox.exe", "firefox", "bidi"
+    )
+    assert resolve.calls == [("find", "firefox")]
+
+
+@pytest.mark.parametrize(
+    ("platform", "searched"),
+    [
+        ("win32", r"%PROGRAMFILES%\Microsoft\Edge\Application\msedge.exe"),
+        ("win32", r"App Paths\msedge.exe"),
+        ("darwin", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+        ("linux", "PATH for microsoft-edge, microsoft-edge-stable"),
+    ],
+)
+def test_missing_named_browser_names_what_was_searched(platform, searched):
+    with pytest.raises(LaunchError, match="'edge' is not installed") as info:
+        Resolver()(browser="edge", platform=platform)
+    assert searched in str(info.value)
+
+
+def test_cft_name_installs_without_discovery():
+    resolve = Resolver([_installed("chrome")])
+    assert resolve(browser="cft").name == "cft"
+    assert resolve.calls == ["cft"]
+
+
+def test_browser_path_must_exist():
+    with pytest.raises(LaunchError, match="not found: /nope/chrome") as info:
+        Resolver()(browser="/nope/chrome")
+    assert "chrome, edge, brave, chromium, firefox, cft, auto" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("path", "name", "method"),
+    [
+        (
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "chrome",
+            "cdp-pipe",
+        ),
+        (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "chrome",
+            "cdp-pipe",
+        ),
+        ("/opt/google/chrome/chrome", "chrome", "cdp-pipe"),
+        ("/cft/chrome-win64/chrome.exe", "cft", "load-extension"),
+        (
+            "/x/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            "cft",
+            "load-extension",
+        ),
+        (r"C:\Program Files\Mozilla Firefox\firefox.exe", "firefox", "bidi"),
+        ("/usr/lib/firefox-esr/firefox-esr", "firefox", "bidi"),
+        (
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            "edge",
+            "load-extension",
+        ),
+        (
+            r"C:\BraveSoftware\Brave-Browser\Application\brave.exe",
+            "brave",
+            "load-extension",
+        ),
+        ("/usr/lib/chromium/chrome", "chromium", "load-extension"),
+        ("/opt/tools/chrome", "custom", "load-extension"),
+    ],
+)
+def test_path_classification(path, name, method):
+    resolve = Resolver(files=[path])
+    picked = resolve(browser=path)
+    assert (picked.name, picked.path, picked.install_method) == (name, path, method)
+    assert picked.family == ("firefox" if method == "bidi" else "chromium")
+    assert resolve.calls == []
+
+
+def test_cft_dir_default_is_the_installer_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(launcher, "_install_dir", lambda: tmp_path / "CfT_Browser")
+    exe = str(tmp_path / "CfT_Browser" / "chrome-mac-x64" / "Google" / "Chrome")
+    assert Resolver(files=[exe])(browser=exe, cft_dir=None).name == "cft"
+
+
+def test_precedence_browser_then_chrome_path_then_env_then_auto():
+    resolve = Resolver([_installed("edge")], files=["/a/chrome", "/b/chrome"])
+    env = {installer.CHROME_PATH_ENV: "/b/chrome"}
+    assert resolve("edge", "/a/chrome", env).name == "edge"
+    assert resolve(None, "/a/chrome", env).path == "/a/chrome"
+    assert resolve(None, None, env).path == "/b/chrome"
+    assert resolve.calls == [("find", "edge")]  # no discovery behind an override
+    assert resolve().name == "edge"
+
+
+def test_missing_env_override_names_its_source():
+    env = {installer.CHROME_PATH_ENV: "/gone/chrome"}
+    with pytest.raises(
+        LaunchError, match=r"not found: /gone/chrome \(EMUNIUM_CHROME_PATH\)"
+    ):
+        Resolver()(env=env)
+
+
+# -- launch per install method -------------------------------------------------------------
+
+
+def test_launch_records_the_auto_pick_and_loads_with_flags(env, tmp_path):
+    edge = tmp_path / "Edge" / "msedge.exe"
+    env["installed"].append(_installed("edge", str(edge)))
+    session = _session()
+    launcher.launch(session, bridge_timeout=5)
+    assert session.resolved == launcher.ResolvedBrowser(
+        "edge", str(edge), "chromium", "load-extension"
+    )
+    assert session.executable_path == str(edge)
+    args = FakePopen.instances[0].args
+    assert args[0] == str(edge)
+    assert f"--load-extension={session.extension_dir}" in args
+    assert env["ensure_calls"] == []
+    launcher.close(session)
+    assert session.resolved.name == "edge"  # kept for browser_name
+
+
+def test_launch_falls_back_to_chrome_for_testing(env):
+    session = _session()
+    launcher.launch(session, bridge_timeout=5)
+    assert env["ensure_calls"] == [1]
+    assert (session.resolved.name, session.resolved.path) == ("cft", env["exe"])
+    launcher.close(session)
+
+
+def test_missing_named_browser_fails_before_the_bridge(env):
+    bridge = FakeBridge()
+    with pytest.raises(LaunchError, match="'brave' is not installed; searched"):
+        launcher.launch(_session(bridge, browser="brave"), bridge_timeout=5)
+    assert bridge.calls == [] and FakePopen.instances == []
+
+
+class FakeCdpPipe:
+    instances: ClassVar[list[FakeCdpPipe]] = []
+    load_error = None
+
+    def __init__(self, events):
+        self.events = events
+        FakeCdpPipe.instances.append(self)
+
+    def _log(self, *event):
+        # The Popen count shows where each call falls relative to the spawn.
+        self.events.append(("pipe", *event, len(FakePopen.instances)))
+
+    def prepare(self):
+        self._log("prepare")
+        return ["--remote-debugging-pipe", "--enable-unsafe-extension-debugging"]
+
+    def wrap_args(self, args):
+        self._log("wrap_args")
+        return ["/bin/sh", "-c", "trampoline", "sh", *args]
+
+    def popen_kwargs(self):
+        self._log("popen_kwargs")
+        return {"pass_fds": (11, 12)}
+
+    def after_spawn(self):
+        self._log("after_spawn")
+
+    def load_unpacked(self, path):
+        self._log("load_unpacked", str(path))
+        if FakeCdpPipe.load_error is not None:
+            raise FakeCdpPipe.load_error
+        return "extid"
+
+    def close(self):
+        self._log("close")
+
+
+@pytest.fixture
+def chrome(env, monkeypatch, tmp_path):
+    FakeCdpPipe.instances = []
+    FakeCdpPipe.load_error = None
+    monkeypatch.setattr(launcher, "CdpPipe", lambda: FakeCdpPipe(env["events"]))
+    exe = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+    env["installed"].append(_installed("chrome", str(exe)))
+    return str(exe)
+
+
+def test_cdp_pipe_spawn_sequence(env, chrome, monkeypatch):
+    monkeypatch.setattr(launcher, "_IS_WINDOWS", True)
+    session = _session(headless=True, extra_args=["--x"])
+    launcher.launch(session, bridge_timeout=5)
+    ext = session.extension_dir
+    proc = FakePopen.instances[0]
+    assert proc.args[:4] == ["/bin/sh", "-c", "trampoline", "sh"]
+    args = proc.args[4:]
+    assert args[0] == chrome and args[1] == f"--user-data-dir={session.profile_dir}"
+    assert "--remote-debugging-pipe" in args and args[-2:] == ["--headless=new", "--x"]
+    assert not any(
+        a.startswith(("--load-extension", "--disable-extensions")) for a in args
+    )
+    # Pipe kwargs merged with the usual ones.
+    assert proc.kwargs["pass_fds"] == (11, 12)
+    assert (
+        proc.kwargs["stdin"] is subprocess.DEVNULL and proc.kwargs["stderr"] is not None
+    )
+    assert (
+        json.loads(Path(ext, "session.json").read_text(encoding="utf-8"))["port"]
+        == 48123
+    )
+    assert Path(session.profile_dir, "Default", "Preferences").is_file()
+    assert env["events"][:7] == [
+        ("pipe", "prepare", 0),
+        ("pipe", "wrap_args", 0),
+        ("pipe", "popen_kwargs", 0),
+        ("create_job", 701),
+        ("assign", 701, proc.pid),
+        ("pipe", "after_spawn", 1),
+        ("pipe", "load_unpacked", ext, 1),
+    ]
+    assert session.bridge.calls[-1][0] == "wait"  # bridge waited for after the load
+    assert session.resolved.install_method == "cdp-pipe"
+    del env["events"][:]
+    launcher.close(session)
+    assert [e for e in env["events"] if e[0] != "wait"] == [
+        ("terminate_job", 701, 1),
+        ("close_job", 701),
+        ("pipe", "close", 1),
+    ]
+    assert session._cdp_pipe is None
+
+
+def test_cdp_pipe_load_failure_names_the_browser_and_rolls_back(env, chrome):
+    FakeCdpPipe.load_error = LaunchError("CDP Extensions.loadUnpacked failed: nope")
+    bridge = FakeBridge()
+    session = _session(bridge)
+    with pytest.raises(LaunchError) as info:
+        launcher.launch(session, bridge_timeout=5)
+    assert f"into chrome ({chrome}) over CDP pipe" in str(info.value)
+    assert ("pipe", "close", 1) in env["events"]
+    _assert_rolled_back(session, bridge, env)
+
+
+def test_cdp_pipe_early_exit_reports_the_exit(env, chrome):
+    FakePopen.exit_code = 3
+    FakeCdpPipe.load_error = LaunchError(
+        "CDP Extensions.loadUnpacked: browser closed the pipe"
+    )
+    with pytest.raises(
+        LaunchError, match=r"chrome \(.*\) exited during startup \(exit code 3\)"
+    ):
+        launcher.launch(_session(), bridge_timeout=5)
+
+
+class FakeBidi:
+    instances: ClassVar[list[FakeBidi]] = []
+    events: ClassVar[list[tuple[object, ...]]] = []
+
+    def __init__(self, url):
+        FakeBidi.events.append(("bidi", "connect", url))
+        FakeBidi.instances.append(self)
+
+    def new_session(self):
+        FakeBidi.events.append(("bidi", "new_session"))
+        return {}
+
+    def install_extension(self, path):
+        FakeBidi.events.append(("bidi", "install", str(path)))
+        return "bridge@emunium.dev"
+
+    def close(self):
+        FakeBidi.events.append(("bidi", "close"))
+
+
+@pytest.fixture
+def firefox(env, monkeypatch, tmp_path):
+    FakeBidi.instances = []
+    FakeBidi.events = env["events"]
+    reads = []
+    state = {"error": None}
+
+    def fake_read(stream, timeout, *, sink):
+        reads.append((stream, timeout, sink))
+        env["events"].append(("read_bidi_url", timeout))
+        sink.write(b"WebDriver BiDi listening on ws://127.0.0.1:9333\n")
+        sink.flush()
+        if state["error"] is not None:
+            raise state["error"]
+        return "ws://127.0.0.1:9333"
+
+    monkeypatch.setattr(launcher, "read_bidi_url", fake_read)
+    monkeypatch.setattr(launcher, "BidiSession", FakeBidi)
+    exe = tmp_path / "Mozilla Firefox" / "firefox.exe"
+    env["installed"].append(_installed("firefox", str(exe)))
+    return {"exe": str(exe), "reads": reads, "state": state}
+
+
+@pytest.mark.parametrize("windows", [True, False])
+def test_bidi_spawn_sequence(env, firefox, monkeypatch, windows):
+    monkeypatch.setattr(launcher, "_IS_WINDOWS", windows)
+    session = _session(browser="firefox", headless=True, extra_args=["-x"])
+    launcher.launch(session, bridge_timeout=7)
+    proc = FakePopen.instances[0]
+    profile = session.profile_dir
+    expected = [
+        firefox["exe"],
+        "-profile",
+        profile,
+        "-no-remote",
+        "--remote-debugging-port=0",
+    ]
+    expected += ["-headless", *(["-wait-for-browser"] if windows else []), "-x"]
+    assert proc.args == expected
+    assert proc.kwargs["stderr"] is subprocess.PIPE
+    assert proc.kwargs["start_new_session"] is (not windows)
+    ext = Path(session.extension_dir)
+    manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["browser_specific_settings"]["gecko"]["id"] == "bridge@emunium.dev"
+    assert (
+        json.loads((ext / "session.json").read_text(encoding="utf-8"))["token"] == TOKEN
+    )
+    assert Path(profile, "user.js").is_file()
+    assert not Path(profile, "Default").exists()  # no Chromium prefs
+    stream, timeout, sink = firefox["reads"][0]
+    assert stream is proc.stderr and timeout == 7
+    assert sink.name == session.log_path and session.log_path.endswith("firefox.log")
+    assert not sink.closed and session._log_files is not None
+    bidi_events = [
+        e for e in env["events"] if e[0] in ("bidi", "read_bidi_url", "assign")
+    ]
+    assert bidi_events == [
+        *([("assign", 701, proc.pid)] if windows else []),
+        ("read_bidi_url", 7),
+        ("bidi", "connect", "ws://127.0.0.1:9333"),
+        ("bidi", "new_session"),
+        ("bidi", "install", str(ext)),
+    ]
+    assert session._bidi is FakeBidi.instances[0]
+    log_path = session.log_path
+    del env["events"][:]
+    launcher.close(session)
+    assert env["events"][-1] == ("bidi", "close")
+    if windows:
+        assert env["events"][:2] == [("terminate_job", 701, 1), ("close_job", 701)]
+    assert sink.closed and session._bidi is None and session._log_files is None
+    assert not os.path.exists(log_path)
+
+
+def test_bidi_uses_user_data_dir_as_profile(env, firefox, tmp_path):
+    profile = tmp_path / "ff-profile"
+    session = _session(browser="firefox", user_data_dir=str(profile))
+    launcher.launch(session, bridge_timeout=5)
+    assert FakePopen.instances[0].args[2] == str(profile.resolve())
+    launcher.close(session)
+    assert (profile / "user.js").is_file()
+
+
+def test_bidi_stub_exit_reports_browser_and_log(env, firefox):
+    FakePopen.exit_code = 0
+    firefox["state"]["error"] = LaunchError(
+        "Firefox stderr closed before WebDriver BiDi"
+    )
+    bridge = FakeBridge()
+    session = _session(bridge, browser="firefox")
+    with pytest.raises(LaunchError) as info:
+        launcher.launch(session, bridge_timeout=5)
+    message = str(info.value)
+    assert f"firefox ({firefox['exe']}) exited during startup (exit code 0)" in message
+    assert "WebDriver BiDi listening" in message  # the log tail came from the sink
+    _assert_rolled_back(session, bridge, env)
+
+
+def test_bidi_failure_while_running_names_the_browser(env, firefox):
+    firefox["state"]["error"] = LaunchError(
+        "did not announce WebDriver BiDi within 5s."
+    )
+    bridge = FakeBridge()
+    session = _session(bridge, browser="firefox")
+    with pytest.raises(LaunchError, match="into firefox .* over WebDriver BiDi"):
+        launcher.launch(session, bridge_timeout=5)
+    assert FakePopen.instances[0].returncode is not None  # tree stopped
+    _assert_rolled_back(session, bridge, env)
+
+
+def test_timeout_message_names_the_browser(env):
+    with pytest.raises(LaunchError, match=r"within 0\.2 s \(cft \("):
+        launcher.launch(_session(FakeBridge(connect_after=None)), bridge_timeout=0.2)
 
 
 # -- installer ---------------------------------------------------------------------------

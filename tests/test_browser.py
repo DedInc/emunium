@@ -24,6 +24,7 @@ from emunium._bridge.facade import Bridge
 from emunium._bridge.transport import PINNED, Reply
 from emunium._browser import facade, page
 from emunium._browser.facade import Browser
+from emunium._browser.launcher import ResolvedBrowser
 from emunium._browser.tabs import tab_id_argument
 from emunium._standalone.config import ClickType
 from emunium.element import Element, ElementQuery
@@ -149,6 +150,25 @@ def test_constructor_builds_one_session_and_context(
     ctx = browser.context
     assert ctx.headless is True and ctx.verify_input is False
     assert ctx.bridge is browser.bridge is session.bridge
+
+
+def test_browser_choice_is_stored_and_browser_name_follows_launch(
+    transport: FakeTransport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_launch(session: Any, bridge_timeout: float = 60.0) -> None:
+        assert session.browser == "edge"
+        session.resolved = ResolvedBrowser(
+            "edge", "msedge.exe", "chromium", "load-extension"
+        )
+
+    monkeypatch.setattr(facade, "Bridge", lambda port=0: Bridge(transport=transport))
+    monkeypatch.setattr(facade, "launch", fake_launch)
+    monkeypatch.setattr(facade, "close", lambda session: None)
+    browser = Browser(browser="edge")
+    assert (browser._session.browser, browser.browser_name) == ("edge", None)
+    with browser:
+        assert browser.browser_name == "edge"
+    assert Browser().browser_name is None and Browser()._session.browser is None
 
 
 def test_launch_pins_the_initial_tab(
