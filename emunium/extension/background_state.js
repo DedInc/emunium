@@ -101,6 +101,7 @@
   }
 
   // {present, data}: present is false when the packaged file does not exist (or cannot be read).
+  // Firefox answers a fetch of a missing packaged file with 200 and an empty body.
   async function readPackagedJson(name) {
     let response;
     try {
@@ -111,8 +112,17 @@
     if (!response || !response.ok) {
       return { present: false, data: null };
     }
+    let text;
     try {
-      return { present: true, data: await response.json() };
+      text = await response.text();
+    } catch {
+      return { present: true, data: null };
+    }
+    if (typeof text !== "string" || text.trim() === "") {
+      return { present: false, data: null };
+    }
+    try {
+      return { present: true, data: JSON.parse(text) };
     } catch {
       return { present: true, data: null };
     }

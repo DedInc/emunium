@@ -52,6 +52,8 @@
     return Math.min(value, MAX_PROBE_MS);
   }
 
+  // Closed roots: chrome.dom in Chromium; in Firefox content scripts
+  // element.openOrClosedShadowRoot is a read-only property (a ShadowRoot or null).
   function shadowRootOf(element) {
     try {
       if (globalThis.chrome && chrome.dom && typeof chrome.dom.openOrClosedShadowRoot === "function") {
@@ -60,6 +62,14 @@
       }
     } catch {
       // not a host, or the API is unavailable in this context
+    }
+    try {
+      let root = element.openOrClosedShadowRoot;
+      // Defensive: tolerate an implementation that exposes it as a method.
+      if (typeof root === "function") root = root.call(element);
+      if (root && typeof root === "object") return root;
+    } catch {
+      // not a host, or the property is unavailable in this context
     }
     return element.shadowRoot || null;
   }

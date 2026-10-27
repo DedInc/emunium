@@ -101,6 +101,11 @@
 
   // ── navigation ──────────────────────────────────────────────────────────
 
+  // Firefox's NS_BINDING_ABORTED (0x804B0002), as webNavigation reports it ("Error code 2152398850").
+  function isBindingAborted(error) {
+    return typeof error === "string" && /2152398850|NS_BINDING_ABORTED/.test(error);
+  }
+
   function normalizeUrl(value) {
     if (typeof value !== "string") {
       return null;
@@ -125,6 +130,9 @@
     let committed = false;
     let startedUrl = null;
     let done = false;
+    // Firefox reports NS_BINDING_ABORTED for a top-frame navigation that still commits and
+    // loads: the failure is held and reported only if the wait times out.
+    let heldAbort = null;
     const targetUrl = normalizeUrl(url);
     const startUrls = new Set([targetUrl]);
     // Normalized URLs of our navigation: its start URL and every main-frame redirect target.
@@ -233,7 +241,12 @@
           if (details.error === "net::ERR_ABORTED" && !ownUrls.has(normalizeUrl(failedUrl))) {
             break;
           }
-          finish(codedError("navigation_failed", `navigation to ${failedUrl || url} failed: ${details.error}`));
+          const failure = codedError("navigation_failed", `navigation to ${failedUrl || url} failed: ${details.error}`);
+          if (isBindingAborted(details.error)) {
+            heldAbort = heldAbort || failure;
+            break;
+          }
+          finish(failure);
           break;
         }
         case "removed":
@@ -282,10 +295,11 @@
 
     const timer = delay(timeoutMs, () => {
       finish(
-        codedError(
-          "navigation_timeout",
-          `navigation to ${url} did not reach '${waitUntil}' within ${timeoutMs} ms`
-        )
+        heldAbort ||
+          codedError(
+            "navigation_timeout",
+            `navigation to ${url} did not reach '${waitUntil}' within ${timeoutMs} ms`
+          )
       );
     });
 

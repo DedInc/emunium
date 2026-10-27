@@ -1,9 +1,13 @@
-importScripts(
-  "background_state.js",
-  "background_network.js",
-  "background_handlers.js",
-  "background_runtime.js"
-);
+// A Chromium service worker loads its siblings here; a Firefox background page has no
+// importScripts and lists them before this file in background.scripts instead.
+if (typeof importScripts === "function") {
+  importScripts(
+    "background_state.js",
+    "background_network.js",
+    "background_handlers.js",
+    "background_runtime.js"
+  );
+}
 
 (() => {
   "use strict";
