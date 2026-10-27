@@ -82,6 +82,8 @@ class InstalledBrowser:
 
 def _registry_app_path(exe: str) -> str | None:
     """Default value of ``App Paths\\<exe>`` under HKCU, then HKLM; never raises."""
+    if sys.platform != "win32":
+        return None
     try:
         import winreg
     except ImportError:

@@ -231,6 +231,7 @@ def test_registry_prefers_hkcu_and_opens_read_only(
         ("HKCU", CHROME_KEY): r"C:\user\chrome.exe",
         ("HKLM", CHROME_KEY): r"C:\machine\chrome.exe",
     }
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg(values, opened))
     assert discovery._registry_app_path("chrome.exe") == r"C:\user\chrome.exe"
     assert opened == [("HKCU", CHROME_KEY, 0x20019)]
@@ -242,6 +243,7 @@ def test_registry_falls_back_to_hklm(monkeypatch: pytest.MonkeyPatch) -> None:
         ("HKCU", CHROME_KEY): "",
         ("HKLM", CHROME_KEY): r"C:\machine\chrome.exe",
     }
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg(values, opened))
     assert discovery._registry_app_path("chrome.exe") == r"C:\machine\chrome.exe"
     assert [hive for hive, _, _ in opened] == ["HKCU", "HKLM"]
@@ -253,6 +255,7 @@ def test_registry_errors_never_raise(monkeypatch: pytest.MonkeyPatch) -> None:
         ("HKCU", CHROME_KEY): PermissionError("denied"),
         ("HKLM", CHROME_KEY): OSError("broken hive"),
     }
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg(values, opened))
     assert discovery._registry_app_path("chrome.exe") is None
     assert discovery._registry_app_path("msedge.exe") is None
@@ -262,6 +265,7 @@ def test_registry_non_string_value_is_ignored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     values: dict[tuple[str, str], object] = {("HKLM", CHROME_KEY): 42}
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg(values, []))
     assert discovery._registry_app_path("chrome.exe") is None
 
@@ -269,8 +273,25 @@ def test_registry_non_string_value_is_ignored(
 def test_registry_without_winreg_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A None entry makes ``import winreg`` raise ImportError, as off Windows.
+    # A None entry makes ``import winreg`` raise ImportError.
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", None)
+    assert discovery._registry_app_path("chrome.exe") is None
+
+
+class PoisonWinreg(types.ModuleType):
+    # Dunders stay reachable: pytest's failure report walks sys.modules.
+    def __getattribute__(self, name: str) -> object:
+        if name.startswith("__"):
+            return super().__getattribute__(name)
+        pytest.fail(f"winreg.{name} touched off Windows")
+
+
+def test_registry_off_windows_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, "winreg", PoisonWinreg("winreg"))
     assert discovery._registry_app_path("chrome.exe") is None
 
 
@@ -280,6 +301,7 @@ def test_default_app_paths_is_the_registry_lookup(
     values: dict[tuple[str, str], object] = {
         ("HKLM", CHROME_KEY): r"C:\machine\chrome.exe"
     }
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setitem(sys.modules, "winreg", fake_winreg(values, []))
     found = find_browser(
         "chrome",
