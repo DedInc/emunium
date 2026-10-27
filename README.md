@@ -31,6 +31,7 @@ matching and OCR.
 - [Quick start](#quick-start)
 - [Browser mode](#browser-mode)
 - [Browsers](#browsers)
+- [Connect to your own browser](#connect-to-your-own-browser)
 - [Navigation](#navigation)
 - [Waiting](#waiting)
 - [Element API](#element-api)
@@ -83,6 +84,7 @@ Optional extras:
 | `ocr` | `opencv-python-headless`, `numpy`, `mss`, `easyocr` | `Emunium.find_text_elements()` OCR |
 | `parsing` | `selectolax` | `PageParser` / `Locator` queries |
 | `keyboard` | `keyboard` | non-ASCII keystrokes on macOS when running as root |
+| `hub` | `cryptography` | extension builds for [`Browser.connect`](#connect-to-your-own-browser) |
 
 ```bash
 pip install "emunium[standalone,parsing]"
@@ -260,6 +262,78 @@ Firefox notes:
 `browser.browser_name` is the browser the last `launch()` started: one of the
 names above, `"cft"`, or `"custom"` for a path emunium does not recognise;
 `None` before the first launch.
+
+---
+
+## Connect to your own browser
+
+`Browser.connect()` drives a browser profile of your own that has the emunium
+extension installed persistently, instead of starting a fresh one.
+
+Install the `hub` extra (the build needs `cryptography`) and build the
+extension once:
+
+```bash
+pip install "emunium[hub]"
+python -m emunium extension build --out DIR
+```
+
+The build writes `DIR/emunium-extension/` (plus a `.zip` and a signed `.crx`)
+and prints the extension id and hub URL. It creates the hub state on first use:
+a key that fixes the extension id, and `hub.json` with the hub port (47800 by
+default; `--port N` changes and stores it) and an enrollment secret, in
+`%APPDATA%\emunium`, `~/Library/Application Support/emunium` or
+`$XDG_CONFIG_HOME/emunium` (default `~/.config/emunium`); `EMUNIUM_HOME`
+overrides. The folder carries that
+secret; keep it private. `python -m emunium extension id` prints the id.
+
+Load the extension in Chrome, Edge, Brave or Chromium: open the extensions page
+(`chrome://extensions`, `edge://extensions`, ...), turn on developer mode, click
+**Load unpacked** and pick `DIR/emunium-extension`. The CLI builds no Firefox
+version; `build_extension("DIR", target="firefox")` from
+`emunium._attach.build` writes `DIR/emunium-extension-firefox/` and an unsigned
+`DIR/emunium-extension-firefox.xpi`, which installs permanently only in a
+Firefox that allows unsigned add-ons.
+
+```python
+from emunium import Browser
+
+with Browser.connect("edge") as browser:
+    browser.goto("https://example.com/")
+    print(browser.browser_name)  # "edge"
+# The browser is still running: close() only detaches.
+```
+
+`connect` listens on the hub port and waits up to 5 s for the extension. If
+none connects, it starts the browser detached from Python, without automation
+flags, and waits for the rest of `timeout`. Then it pins the active tab; DOM,
+locators and native input work as after `launch()`.
+
+| Option | Meaning |
+|---|---|
+| `browser=None` | Browser to start, as in `Browser(browser=...)`; also names `browser_name` |
+| `user_data_dir=None` | Profile root for a started browser (`--user-data-dir`, Firefox `-profile`); `None` opens the browser's default profile. Never deleted |
+| `profile_directory=None` | Chromium profile inside it, e.g. `"Profile 1"`; not for Firefox |
+| `start=True` | Start the browser when no extension connects within 5 s; `False` only waits |
+| `close_browser=False` | `close()` also stops a browser that `connect` started; one that was already running always stays |
+| `port=None` | Hub port; `None` uses the stored one, which the build used |
+| `install_id=None` | Accept only this install (a UUID); `None` binds the first install that connects. A session serves one install; others are refused |
+| `timeout=60.0` | Seconds to wait for the extension overall |
+
+`extra_args`, `verify_input`, `motion` and `typing` work as for `Browser()`.
+
+- `close()` detaches and leaves the browser running (unless
+  `close_browser=True` and `connect` started it).
+- Pass `browser=` for a browser that is already running: on Windows emunium
+  then finds its window for native input. Without it, an already-running
+  browser is named only from its user agent (`"edge"`, `"firefox"`, else
+  `None`; Chrome, Brave and Chromium look alike), and its window is not
+  brought to the foreground.
+- An already-running browser can take up to 30 s to retry the connection (the
+  extension's reconnect back-off); keep `timeout` above that.
+- Errors: `LaunchError` when the hub port is taken, the browser cannot start,
+  or no extension connects in time (the message names the build command, hub
+  port and state dir); `ImportError` without `cryptography`.
 
 ---
 

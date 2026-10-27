@@ -204,6 +204,15 @@ observe; they are listed first.
   (`Extensions.loadUnpacked`), since it ignores `--load-extension` from
   version 137; Firefox gets it through WebDriver BiDi `webExtension.install`
   (a temporary install), with a Firefox build of the extension.
+- `Browser.connect()` drives a browser profile that has the emunium extension
+  installed persistently: it waits for the extension on the hub port
+  (default 47800), starts the browser detached when none connects
+  (`start=True`), and `close()` detaches, leaving the browser running unless
+  `close_browser=True` and `connect` started it. The extension is built with
+  `python -m emunium extension build --out DIR [--port N]`; the handshake is
+  mutual and port-bound, and each install gets its own token.
+- `hub` extra (`pip install "emunium[hub]"`): installs `cryptography`, needed
+  for extension builds and `Browser.connect`.
 
 ### Changed
 
@@ -242,3 +251,13 @@ observe; they are listed first.
 - Closing a headed browser on Windows no longer waits out the termination
   grace period: `close()` first closes its tabs through the extension (within
   one second), so Chrome exits on its own and usually closes in under a second.
+- `Browser.connect(browser=...)` to an already-running browser names Chrome for
+  Testing (`"cft"`, or `"auto"` with no installed browser) from the
+  already-downloaded copy; it never downloads one just to name the browser.
+- Linux `microsoft-edge` paths (`microsoft-edge-stable`, `-beta`, `-dev`) are
+  named `edge` instead of `custom`.
+- Logs and errors name the browser neutrally instead of always saying Chrome.
+- Closing Firefox's stderr log is bounded, so `close()` no longer hangs when a
+  surviving child keeps the pipe open.
+- A failure while creating the CDP pipes no longer leaks the first pipe's file
+  descriptors.
