@@ -154,9 +154,8 @@ def load_jobs(path: Path) -> list[Job]:
     seen: set[str] = set()
     for position, item in enumerate(raw):
         spec = {"url": item} if isinstance(item, str) else item
-        if not isinstance(spec, dict) or not isinstance(spec.get("url"), str):
+        if not isinstance(spec, dict) or not isinstance(url := spec.get("url"), str):
             raise JobFileError(f"{path}: job {position} needs a 'url' string")
-        url = spec["url"]
         if not url.startswith(("http://", "https://")):
             raise JobFileError(f"{path}: job {position} url must be http(s): {url!r}")
         job_id = _slug(str(spec.get("id") or f"{position:03d}-{url.split('//', 1)[1]}"))

@@ -115,8 +115,10 @@ def test_humancursor_system_cursor_trapped(net):
     _assert_trapped(net, sys.modules["humancursor.system_cursor"], ["SystemCursor"])
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="user32 is Windows-only")
 def test_ctypes_user32_input_functions_trapped(net):
+    # Skipped in the body, where the type checker sees the platform guard.
+    if sys.platform != "win32":
+        pytest.skip("user32 is Windows-only")
     private = ctypes.WinDLL("user32", use_last_error=True)
     shared = ctypes.windll.user32
     names = sorted(USER32_TRAPS)

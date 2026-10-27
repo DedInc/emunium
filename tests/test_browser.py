@@ -13,9 +13,10 @@ import json
 import pickle
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -23,6 +24,7 @@ from emunium._bridge.facade import Bridge
 from emunium._bridge.transport import PINNED, Reply
 from emunium._browser import facade, page
 from emunium._browser.facade import Browser
+from emunium._browser.tabs import tab_id_argument
 from emunium._standalone.config import ClickType
 from emunium.element import Element, ElementQuery
 from emunium.errors import (
@@ -344,6 +346,14 @@ def test_switch_to_tab_activates_and_pins(
     assert browser.tabs() == [{"tabId": 3}, {"tabId": 5}]
     with pytest.raises(InvalidArgumentError):
         browser.switch_to_tab(True)
+
+
+@pytest.mark.parametrize("value", ["5", 5.0, None, True])
+def test_tab_id_argument_rejects_non_ints(value: object) -> None:
+    # switch_to_tab validates its tab id through tab_id_argument.
+    with pytest.raises(InvalidArgumentError, match="tab_id must be an int"):
+        tab_id_argument(value)
+    assert tab_id_argument(5) == 5
 
 
 def test_closing_the_pinned_tab_repins_the_active_tab(

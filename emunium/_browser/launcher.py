@@ -9,14 +9,17 @@ propagates. The packaged ``emunium/extension/`` directory is only ever read.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +106,7 @@ def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
             logger.exception("Cleanup after a failed launch raised")
         if isinstance(exc, EmuniumError):
             raise
-        raise LaunchError("Chrome launch failed: %s" % (exc,)) from exc
+        raise LaunchError(f"Chrome launch failed: {exc}") from exc
     except BaseException:
         # KeyboardInterrupt / SystemExit: still release everything, never wrap.
         try:
@@ -122,7 +125,7 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
     port = session.bridge.actual_port
     token = session.bridge.token
     if not isinstance(port, int) or isinstance(port, bool) or not 0 < port <= 65535:
-        raise LaunchError("Bridge reported an invalid port: %r" % (port,))
+        raise LaunchError(f"Bridge reported an invalid port: {port!r}")
     if not isinstance(token, str) or not token:
         raise LaunchError("Bridge reported no session token")
     logger.info("Bridge started on port %d", port)
@@ -156,14 +159,13 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
         headless=session.headless,
         extra_args=extra_args,
     )
-    session.process = _spawn(args, session.log_path)
+    process = _spawn(args, session.log_path)
+    session.process = process
     if _IS_WINDOWS:
-        session._job = _attach_job(session.process)
-    logger.info(
-        "Chrome started (pid %s), session dir %s", session.process.pid, session_dir
-    )
+        session._job = _attach_job(process)
+    logger.info("Chrome started (pid %s), session dir %s", process.pid, session_dir)
 
-    _await_connection(session, bridge_timeout)
+    _await_connection(session, process, bridge_timeout)
     logger.info("Extension connected to bridge")
 
 
@@ -175,10 +177,10 @@ def build_args(
     headless: bool = False,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    args = [executable, "--user-data-dir=%s" % profile_dir]
+    args = [executable, f"--user-data-dir={profile_dir}"]
     args.extend(CHROME_FLAGS)
-    args.append("--disable-extensions-except=%s" % extension_dir)
-    args.append("--load-extension=%s" % extension_dir)
+    args.append(f"--disable-extensions-except={extension_dir}")
+    args.append(f"--load-extension={extension_dir}")
     if headless:
         args.append("--headless=new")
     args.extend(extra_args or ())
@@ -219,7 +221,7 @@ def _resolve_executable(session: BrowserSession) -> str:
     override = session.chrome_path or os.environ.get(CHROME_PATH_ENV)
     if override:
         if not os.path.isfile(override):
-            raise LaunchError("Chrome executable not found: %s" % override)
+            raise LaunchError(f"Chrome executable not found: {override}")
         executable = override
     else:
         executable = ensure_chrome()
@@ -235,7 +237,7 @@ def _validated_extra_args(extra_args: Any) -> list[str]:
     args = list(extra_args)
     for arg in args:
         if not isinstance(arg, str):
-            raise LaunchError("extra_args must contain only strings, got %r" % (arg,))
+            raise LaunchError(f"extra_args must contain only strings, got {arg!r}")
     return args
 
 
@@ -245,10 +247,6 @@ def _write_session_file(extension_dir: Path, port: int, token: str) -> None:
 
 
 def _spawn(args: list[str], log_path: str) -> subprocess.Popen:
-    kwargs = {}
-    if not _IS_WINDOWS:
-        # Own process group, so close() can signal the whole tree with killpg.
-        kwargs["start_new_session"] = True
     # The child keeps its own handle to the log; ours can close right away.
     with open(log_path, "wb") as log_file:
         return subprocess.Popen(
@@ -256,33 +254,36 @@ def _spawn(args: list[str], log_path: str) -> subprocess.Popen:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=log_file,
-            **kwargs,
+            # POSIX: own process group, so close() can signal the whole tree with
+            # killpg. Windows Popen ignores the flag.
+            start_new_session=not _IS_WINDOWS,
         )
 
 
-def _await_connection(session: BrowserSession, bridge_timeout: float) -> None:
+def _await_connection(
+    session: BrowserSession, process: subprocess.Popen, bridge_timeout: float
+) -> None:
     deadline = time.monotonic() + bridge_timeout
     while True:
         if session.bridge.wait_for_connection(CONNECT_POLL_SECONDS):
             return
-        code = session.process.poll()
+        code = process.poll()
         if code is not None:
             raise LaunchError(_early_exit_message(session, code))
         if time.monotonic() >= deadline:
             raise LaunchError(
-                "The emunium extension did not connect within %.1f s.%s"
-                % (bridge_timeout, _log_tail_suffix(session.log_path))
+                f"The emunium extension did not connect within {bridge_timeout:.1f} s."
+                f"{_log_tail_suffix(session.log_path)}"
             )
 
 
 def _early_exit_message(session: BrowserSession, code: int) -> str:
-    message = "Chrome exited during startup (exit code %s)." % code
+    message = f"Chrome exited during startup (exit code {code})."
     if session.user_data_dir:
         # Chrome hands the command line to the instance owning the profile and exits.
         message += (
-            " The profile %s is probably already in use by another Chrome"
-            " instance; close that browser or use a different user_data_dir."
-            % session.profile_dir
+            f" The profile {session.profile_dir} is probably already in use by another"
+            " Chrome instance; close that browser or use a different user_data_dir."
         )
     return message + _log_tail_suffix(session.log_path)
 
@@ -291,7 +292,8 @@ def _log_tail_suffix(log_path: str | None) -> str:
     lines = _read_log_tail(log_path)
     if not lines:
         return ""
-    return "\nLast %d line(s) of %s:\n%s" % (len(lines), log_path, "\n".join(lines))
+    tail = "\n".join(lines)
+    return f"\nLast {len(lines)} line(s) of {log_path}:\n{tail}"
 
 
 def _read_log_tail(log_path: str | None, count: int = LOG_TAIL_LINES) -> list[str]:
@@ -392,11 +394,15 @@ _PROCESS_SET_QUOTA = 0x0100
 class _Kernel32Jobs:
     """Thin ctypes wrapper; failures raise OSError carrying GetLastError."""
 
+    _k32: ctypes.CDLL
+    _limit_info: type[ctypes.Structure]
+    _last_error: Callable[[], int]
+
     def __init__(self) -> None:
-        import ctypes
+        if sys.platform != "win32":
+            raise OSError("kernel32 Job Objects are Windows-only")
         from ctypes import wintypes
 
-        self._ctypes = ctypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
         k32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -454,10 +460,11 @@ class _Kernel32Jobs:
             ]
 
         self._limit_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        self._last_error = ctypes.get_last_error
 
     def _fail(self, what: str) -> OSError:
-        err = self._ctypes.get_last_error()
-        return OSError(err, "%s failed (winerror %d)" % (what, err))
+        err = self._last_error()
+        return OSError(err, f"{what} failed (winerror {err})")
 
     def create_kill_on_close_job(self) -> int:
         job = self._k32.CreateJobObjectW(None, None)
@@ -468,8 +475,8 @@ class _Kernel32Jobs:
         ok = self._k32.SetInformationJobObject(
             job,
             _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-            self._ctypes.byref(info),
-            self._ctypes.sizeof(info),
+            ctypes.byref(info),
+            ctypes.sizeof(info),
         )
         if not ok:
             error = self._fail("SetInformationJobObject")
@@ -502,6 +509,10 @@ class _Kernel32Jobs:
         self._k32.CloseHandle(handle)
 
 
+# What the kernel32 wrapper raises: OSError (DLL load, GetLastError failures,
+# non-Windows hosts) and ctypes.ArgumentError (a value the prototype rejects).
+_JOB_API_ERRORS = (OSError, ctypes.ArgumentError)
+
 _JOB_API: Any = None
 
 
@@ -517,12 +528,12 @@ def _attach_job(process: subprocess.Popen) -> int | None:
     try:
         api = _job_api()
         job = api.create_kill_on_close_job()
-    except Exception as exc:
+    except _JOB_API_ERRORS as exc:
         logger.debug("Job Object unavailable, falling back to taskkill: %s", exc)
         return None
     try:
         api.assign(job, process)
-    except Exception as exc:
+    except _JOB_API_ERRORS as exc:
         # e.g. already inside a job that forbids nesting (pre-Windows 8 hosts).
         logger.debug(
             "AssignProcessToJobObject failed, falling back to taskkill: %s", exc
@@ -536,7 +547,7 @@ def _close_job(job: int, terminate: bool) -> bool:
     """Terminate (optionally) and close *job*; True when termination succeeded."""
     try:
         api = _job_api()
-    except Exception as exc:
+    except _JOB_API_ERRORS as exc:
         logger.debug("Job Object API unavailable: %s", exc)
         return False
     terminated = False
@@ -544,11 +555,11 @@ def _close_job(job: int, terminate: bool) -> bool:
         try:
             api.terminate(job, 1)
             terminated = True
-        except Exception as exc:
+        except _JOB_API_ERRORS as exc:
             logger.debug("TerminateJobObject failed: %s", exc)
     try:
         api.close(job)
-    except Exception as exc:
+    except _JOB_API_ERRORS as exc:
         logger.debug("CloseHandle(job) failed: %s", exc)
     return terminated
 
@@ -564,6 +575,7 @@ def _run_taskkill(pid: int, force: bool) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=TASKKILL_TIMEOUT_SECONDS,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("taskkill for pid %s failed: %s", pid, exc)
@@ -630,7 +642,7 @@ def _seed_profile(data_dir: str) -> None:
     if prefs_path.exists():
         try:
             prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):  # unreadable, undecodable or invalid JSON
             prefs = {}
         if not isinstance(prefs, dict):
             prefs = {}

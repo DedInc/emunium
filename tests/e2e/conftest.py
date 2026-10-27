@@ -17,6 +17,7 @@ safety net stays disarmed for these tests only.
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import logging
 import os
@@ -146,35 +147,27 @@ def make_browser(chrome_path: str) -> Iterator[Callable[..., Any]]:
     """
     from emunium import Browser
 
-    launched: list[Any] = []
+    # Closes every browser in reverse launch order; each close runs even when
+    # an earlier one raised, and the errors propagate chained.
+    with contextlib.ExitStack() as closers:
 
-    def launch_one(kwargs: dict[str, Any]) -> Any:
-        browser = Browser(**kwargs)
-        # Registered before launch(): a half-started browser is closed too.
-        launched.append(browser)
-        browser.launch()
-        return browser
+        def launch_one(kwargs: dict[str, Any]) -> Any:
+            browser = Browser(**kwargs)
+            # Registered before launch(): a half-started browser is closed too.
+            closers.callback(browser.close)
+            browser.launch()
+            return browser
 
-    def factory(**kwargs: Any) -> Any:
-        kwargs.setdefault("chrome_path", chrome_path)
-        kwargs.setdefault("bridge_timeout", 30.0)
-        try:
-            return launch_one(kwargs)
-        except Exception:
-            logger.warning(
-                "Browser launch failed; retrying once with a fresh session",
-                exc_info=True,
-            )
-        return launch_one(kwargs)
-
-    try:
-        yield factory
-    finally:
-        errors: list[BaseException] = []
-        for browser in reversed(launched):
+        def factory(**kwargs: Any) -> Any:
+            kwargs.setdefault("chrome_path", chrome_path)
+            kwargs.setdefault("bridge_timeout", 30.0)
             try:
-                browser.close()
-            except Exception as exc:
-                errors.append(exc)
-        if errors:
-            raise errors[0]
+                return launch_one(kwargs)
+            except Exception:
+                logger.warning(
+                    "Browser launch failed; retrying once with a fresh session",
+                    exc_info=True,
+                )
+            return launch_one(kwargs)
+
+        yield factory

@@ -12,6 +12,7 @@ import contextlib
 import ctypes
 import functools
 import importlib
+import logging
 import math
 import os
 import random
@@ -89,6 +90,19 @@ _UNSET: Any = object()
 _UNTYPEABLE_CATEGORIES = ("Cc", "Cs")
 # winmm's success code for timeBeginPeriod.
 _TIMERR_NOERROR = 0
+# pyperclip raises PyperclipException (a RuntimeError) when no clipboard
+# mechanism works, OSError when its helper (xclip, wl-copy, pbcopy) cannot run
+# and UnicodeDecodeError (a ValueError) on undecodable clipboard content.
+_CLIPBOARD_ERRORS = (RuntimeError, OSError, ValueError)
+# keyboard.write: OSError from the injection call (uinput, SendInput, event
+# tap), ImportError from its lazy root check on Linux, ValueError for a name it
+# cannot map.
+_KEYBOARD_WRITE_ERRORS = (OSError, ImportError, ValueError)
+# Screen size lookup: the backend's NativeInputError, a failed or missing
+# ctypes export, or an argument the ctypes prototype rejects.
+_SCREEN_SIZE_ERRORS = (NativeInputError, OSError, AttributeError, ctypes.ArgumentError)
+
+logger = logging.getLogger(__name__)
 
 
 def _win_input_types() -> tuple[type[INPUT], type[KEYBDINPUT]]:
@@ -141,8 +155,23 @@ def _usable_keyboard_module(platform: str) -> Any:
     try:
         # Optional extra (``emunium[keyboard]``), resolved only at runtime.
         return importlib.import_module("keyboard")
-    except Exception:
+    except (ImportError, OSError):
+        # Not installed or not root (ImportError); an unsupported platform or
+        # an OS library it cannot load (OSError).
         return None
+
+
+def _run_after_failure(releases: Sequence[Callable[[], None]], cause: str) -> None:
+    """Run ``releases`` while an earlier error propagates.
+
+    That earlier error wins, so a release's own error (an interrupt included)
+    is recorded at debug level and the remaining releases still run.
+    """
+    for release in releases:
+        try:
+            release()
+        except BaseException:
+            logger.debug("Input release failed after %s", cause, exc_info=True)
 
 
 def _off_corner(point: tuple[int, int], box: tuple[int, int] | None) -> tuple[int, int]:
@@ -289,7 +318,8 @@ class ElementInteractor:
                     self._double_click_time = _windows_double_click_time()
                 else:
                     self._double_click_time = DEFAULT_DOUBLE_CLICK_TIME
-            except Exception:
+            except (OSError, AttributeError):
+                # user32 failed to load, or has no GetDoubleClickTime export.
                 self._double_click_time = DEFAULT_DOUBLE_CLICK_TIME
         return min(0.5 * self._double_click_time, MAX_DOUBLE_CLICK_INTERVAL)
 
@@ -318,7 +348,7 @@ class ElementInteractor:
         target_size: float = DEFAULT_TARGET_SIZE,
     ) -> None:
         """Move to ``(x, y)``; ``target_size`` (input px) is Fitts' ``W``."""
-        target = (int(round(x)), int(round(y)))
+        target = (round(float(x)), round(float(y)))
         with NATIVE_INPUT_LOCK:
             if human:
                 self._human_move(target, target_size)
@@ -365,7 +395,7 @@ class ElementInteractor:
         gui = self._gui()
         with NATIVE_INPUT_LOCK:
             self.move(start[0], start[1], human=human)
-            target = (int(round(end[0])), int(round(end[1])))
+            target = (round(float(end[0])), round(float(end[1])))
 
             def drag_with_button_down() -> None:
                 gui.mouseDown(button="left", _pause=False)
@@ -393,7 +423,7 @@ class ElementInteractor:
     ) -> tuple[int, int]:
         x_offset = offset_x if offset_x is not None else self._rng.uniform(0.0, 1.5)
         y_offset = offset_y if offset_y is not None else self._rng.uniform(0.0, 1.5)
-        return int(round(screen_x + x_offset)), int(round(screen_y + y_offset))
+        return round(float(screen_x + x_offset)), round(float(screen_y + y_offset))
 
     def move_cursor(self, x: float, y: float, *, human: bool = True) -> None:
         self.move(x, y, human=human)
@@ -437,35 +467,24 @@ class ElementInteractor:
         release(key.lower() if len(key) > 1 else key)
 
     @staticmethod
-    def _run_releases(
-        releases: Sequence[Callable[[], None]],
-    ) -> BaseException | None:
-        """Run every release even if one is interrupted; return the first error."""
-        first: BaseException | None = None
-        for release in releases:
+    def _run_releases(releases: Sequence[Callable[[], None]]) -> None:
+        """Run every release even if one is interrupted; the first error propagates."""
+        for index, release in enumerate(releases):
             try:
                 release()
-            except BaseException as exc:
-                if first is None:
-                    first = exc
-        return first
+            except BaseException:
+                _run_after_failure(releases[index + 1 :], "an earlier release failed")
+                raise
 
     @staticmethod
-    def _guarded(
-        action: Callable[[], None],
-        release_all: Callable[[], BaseException | None],
-    ) -> None:
+    def _guarded(action: Callable[[], None], release_all: Callable[[], None]) -> None:
         """Run ``action`` then ``release_all`` no matter what; the action's error wins."""
-        error: BaseException | None = None
         try:
             action()
-        except BaseException as exc:
-            error = exc
-        release_error = release_all()
-        if error is not None:
-            raise error
-        if release_error is not None:
-            raise release_error
+        except BaseException:
+            _run_after_failure([release_all], "the guarded action failed")
+            raise
+        release_all()
 
     def _land(self, target: tuple[int, int]) -> None:
         gui = self._gui()
@@ -481,7 +500,7 @@ class ElementInteractor:
         try:
             size = self._gui().size()
             return int(size[0]), int(size[1])
-        except Exception:
+        except _SCREEN_SIZE_ERRORS:
             return None
 
     def _motion_bounds(
@@ -598,8 +617,8 @@ class ElementInteractor:
             t = index / float(steps)
             point = _off_corner(
                 (
-                    int(round(sx + (target[0] - sx) * t)),
-                    int(round(sy + (target[1] - sy) * t)),
+                    round(float(sx + (target[0] - sx) * t)),
+                    round(float(sy + (target[1] - sy) * t)),
                 ),
                 box,
             )
@@ -651,7 +670,7 @@ class ElementInteractor:
             try:
                 previous = clipboard.paste()
                 restore = isinstance(previous, str)
-            except Exception:
+            except _CLIPBOARD_ERRORS:
                 previous, restore = None, False
             try:
                 clipboard.copy(text)
@@ -666,8 +685,10 @@ class ElementInteractor:
                     try:
                         if clipboard.paste() == text:
                             clipboard.copy(previous)
-                    except Exception:
-                        pass
+                    except _CLIPBOARD_ERRORS:
+                        logger.debug(
+                            "Clipboard restore after paste failed", exc_info=True
+                        )
 
     def hotkey(self, *keys: str) -> None:
         if not keys:
@@ -794,7 +815,7 @@ class ElementInteractor:
             for position, character in enumerate(chunk):
                 try:
                     keyboard.write(character)
-                except Exception:
+                except _KEYBOARD_WRITE_ERRORS:
                     self.paste_text(chunk[position:])
                     self._pace(rhythm, chunk, following)
                     return

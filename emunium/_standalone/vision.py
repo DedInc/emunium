@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import importlib
 import math
+from collections.abc import Mapping, Sequence
 from itertools import product
-from typing import TYPE_CHECKING, Any, Mapping, NamedTuple, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from emunium import _screen
 from emunium._standalone.config import StandaloneConfig
@@ -20,7 +21,7 @@ from emunium._standalone.config import StandaloneConfig
 if TYPE_CHECKING:
     import numpy as np
 
-Region = Tuple[float, float, float, float]
+Region = tuple[float, float, float, float]
 
 STANDALONE_MODULES = ("numpy", "cv2", "mss")
 MISSING_STANDALONE = (

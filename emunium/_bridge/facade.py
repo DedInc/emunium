@@ -8,7 +8,8 @@ every element dict carries ``tabId`` and ``zoom`` from the reply envelope.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from emunium._bridge.commands import (
     WAIT_GRACE,
@@ -21,12 +22,17 @@ from emunium._bridge.commands import (
     to_ms,
 )
 from emunium._bridge.transport import PINNED, Reply, Transport
-from emunium.errors import BridgeProtocolError
+from emunium.errors import BridgeProtocolError, EmuniumError
 
 __all__ = ["FULL_TEXT_CAP", "Bridge"]
 
 # content_shared.js FULL_TEXT_CAP: ``elementText`` cuts longer texts at this length.
 FULL_TEXT_CAP = 1048576
+
+# What a request can raise: EmuniumError for every bridge failure (timeout,
+# disconnect, protocol, command), OSError/RuntimeError for a dying socket or a
+# closed event loop. Anything else is a bug and is not swallowed by ping().
+_PING_ERRORS = (EmuniumError, OSError, RuntimeError)
 
 
 class Bridge:
@@ -44,7 +50,7 @@ class Bridge:
         host: str = "127.0.0.1",
         port: int = 0,
         *,
-        token: Optional[str] = None,
+        token: str | None = None,
         transport: Any = None,
     ) -> None:
         # An injected transport (e.g. an attach-mode hub session) owns its own
@@ -61,22 +67,22 @@ class Bridge:
         return self._transport
 
     @property
-    def token(self) -> Optional[str]:
+    def token(self) -> str | None:
         """The session token the extension must present; None if the transport has none."""
         return getattr(self._transport, "token", None)
 
     @property
-    def actual_port(self) -> Optional[int]:
+    def actual_port(self) -> int | None:
         """The port the bridge listens on; None before ``start()``."""
         return getattr(self._transport, "actual_port", None)
 
     @property
-    def pinned_tab_id(self) -> Optional[int]:
+    def pinned_tab_id(self) -> int | None:
         """The tab commands go to by default; None sends them to the active tab."""
         return self._transport.pinned_tab_id
 
     @pinned_tab_id.setter
-    def pinned_tab_id(self, value: Optional[int]) -> None:
+    def pinned_tab_id(self, value: int | None) -> None:
         self._transport.pinned_tab_id = value
 
     @property
@@ -108,7 +114,7 @@ class Bridge:
     def request(
         self,
         method: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         *,
         tab_id: Any = PINNED,
         timeout: float = 30.0,
@@ -126,7 +132,7 @@ class Bridge:
     def send(
         self,
         method: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         timeout: float = 30.0,
         tab_id: Any = PINNED,
     ) -> Any:
@@ -139,7 +145,7 @@ class Bridge:
     def _call(
         self,
         method: str,
-        params: Optional[Dict[str, Any]],
+        params: dict[str, Any] | None,
         tab_id: Any,
         timeout: float,
     ) -> Reply:
@@ -154,7 +160,7 @@ class Bridge:
     def _wait_call(
         self,
         method: str,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         tab_id: Any,
         timeout: float,
     ) -> Reply:
@@ -166,21 +172,21 @@ class Bridge:
 
     def query_selector(
         self, selector: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Return the first element matching CSS ``selector`` now, or None."""
         reply = self._call("querySelector", {"selector": selector}, tab_id, timeout)
         return element_or_none("querySelector", reply)
 
     def query_selector_all(
         self, selector: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return every element matching CSS ``selector`` now."""
         reply = self._call("querySelectorAll", {"selector": selector}, tab_id, timeout)
         return element_list("querySelectorAll", reply)
 
     def get_all_interactive(
         self, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return the rendered interactive elements (inputs, buttons, links, ...)."""
         reply = self._call("getAllInteractive", {}, tab_id, timeout)
         return element_list("getAllInteractive", reply)
@@ -192,7 +198,7 @@ class Bridge:
         timeout: float = 10.0,
         *,
         tab_id: Any = PINNED,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return the elements whose text contains ``text`` (case-insensitive),
         or equals it with ``exact``."""
         reply = self._call(
@@ -202,7 +208,7 @@ class Bridge:
 
     def query_xpath(
         self, xpath: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return every element ``xpath`` selects now.
 
         Raises:
@@ -213,13 +219,15 @@ class Bridge:
 
     def describe_element(
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return a fresh payload for ``element_id`` (tag, attrs, rect, text, ...).
 
         Raises:
             StaleElementError: The element is gone from its document.
         """
-        reply = self._call("describeElement", {"elementId": element_id}, tab_id, timeout)
+        reply = self._call(
+            "describeElement", {"elementId": element_id}, tab_id, timeout
+        )
         return enrich_element(expect_dict("describeElement", reply), reply)
 
     def element_text(
@@ -246,7 +254,7 @@ class Bridge:
 
     def scroll_into_view(
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Scroll ``element_id`` into view and return its fresh payload.
 
         Raises:
@@ -257,7 +265,7 @@ class Bridge:
 
     def get_element_coords(
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Alias of ``scroll_into_view`` (v3.0 name)."""
         return self.scroll_into_view(element_id, timeout, tab_id=tab_id)
 
@@ -266,11 +274,11 @@ class Bridge:
         selector: str,
         type: str = "css",
         timeout: float = 10.0,
-        state: Optional[str] = None,
-        conditions: Optional[List[Dict[str, Any]]] = None,
+        state: str | None = None,
+        conditions: list[dict[str, Any]] | None = None,
         *,
         tab_id: Any = PINNED,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Wait in the page until ``selector`` satisfies ``state`` and ``conditions``.
 
         ``type`` is ``css``, ``xpath`` or ``text``.
@@ -283,7 +291,7 @@ class Bridge:
             WaitTimeoutError: Nothing matched in time.
             InvalidArgumentError: An unknown condition.
         """
-        params: Dict[str, Any] = {"selector": selector, "type": type}
+        params: dict[str, Any] = {"selector": selector, "type": type}
         if state is not None:
             params["state"] = state
         if conditions is not None:
@@ -303,7 +311,7 @@ class Bridge:
 
     def focus(
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Focus ``element_id`` in the page (DOM ``focus()``).
 
         Raises:
@@ -314,7 +322,7 @@ class Bridge:
 
     def focus_state(
         self, element_id: str, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Report whether the document has focus and ``element_id`` is the active element.
 
         Raises:
@@ -332,7 +340,7 @@ class Bridge:
         wait_ms: int = 300,
         timeout: float = 10.0,
         tab_id: Any = PINNED,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Return the latest trusted pointer sample at or after ``since_ms`` (epoch ms)."""
         params = {
             "elementId": element_id,
@@ -350,7 +358,7 @@ class Bridge:
         timeout: float = 10.0,
         *,
         tab_id: Any = PINNED,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Read attribute ``name`` of ``element_id``; None when absent.
 
         Raises:
@@ -367,7 +375,7 @@ class Bridge:
         timeout: float = 10.0,
         *,
         tab_id: Any = PINNED,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Read the computed CSS property ``prop`` of ``element_id``.
 
         Raises:
@@ -386,7 +394,7 @@ class Bridge:
         *,
         wait_until: str = "load",
         tab_id: Any = PINNED,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Navigate the tab to ``url`` and wait for ``wait_until``.
 
         Raises:
@@ -397,7 +405,9 @@ class Bridge:
         reply = self._wait_call("navigate", params, tab_id, timeout)
         return expect_dict("navigate", reply)
 
-    def page_info(self, timeout: float = 10.0, *, tab_id: Any = PINNED) -> Dict[str, Any]:
+    def page_info(
+        self, timeout: float = 10.0, *, tab_id: Any = PINNED
+    ) -> dict[str, Any]:
         """Return the document's URL, title, ``readyState``, scroll offsets and sizes.
 
         Raises:
@@ -407,7 +417,7 @@ class Bridge:
 
     def scroll_to(
         self, x: float, y: float, timeout: float = 10.0, *, tab_id: Any = PINNED
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Scroll the page to ``(x, y)`` CSS px."""
         reply = self._call("scrollTo", {"x": x, "y": y}, tab_id, timeout)
         return expect_dict("scrollTo", reply)
@@ -428,13 +438,15 @@ class Bridge:
         """Return True when the content script answered; never raises."""
         try:
             result = self._call("ping", {}, tab_id, timeout).result
-        except Exception:  # noqa: BLE001 - a liveness probe reports, it does not raise
+        except _PING_ERRORS:  # a liveness probe reports, it does not raise
             return False
         return isinstance(result, dict) and result.get("pong") is True
 
     # -- tabs ------------------------------------------------------------
 
-    def get_tab_info(self, timeout: float = 10.0, *, tab_id: Any = PINNED) -> Dict[str, Any]:
+    def get_tab_info(
+        self, timeout: float = 10.0, *, tab_id: Any = PINNED
+    ) -> dict[str, Any]:
         """Describe the tab (``tab_id=None``: the active tab of the last focused window).
 
         Raises:
@@ -442,7 +454,7 @@ class Bridge:
         """
         return expect_dict("getTabInfo", self._call("getTabInfo", {}, tab_id, timeout))
 
-    def list_tabs(self, timeout: float = 10.0) -> List[Dict[str, Any]]:
+    def list_tabs(self, timeout: float = 10.0) -> list[dict[str, Any]]:
         """Describe every open tab."""
         return expect_list("listTabs", self._call("listTabs", {}, None, timeout))
 
@@ -454,14 +466,16 @@ class Bridge:
         active: bool = True,
         wait_until: str = "load",
         tab_id: Any = PINNED,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Open ``url`` in a new tab (activated when ``active``) and wait for
         ``wait_until``; the pin is not changed."""
         params = {"url": url, "active": bool(active), "waitUntil": wait_until}
         reply = self._wait_call("createTab", params, tab_id, timeout)
         return expect_dict("createTab", reply)
 
-    def close_tab(self, tab_id: Optional[int] = None, timeout: float = 10.0) -> Dict[str, Any]:
+    def close_tab(
+        self, tab_id: int | None = None, timeout: float = 10.0
+    ) -> dict[str, Any]:
         """Close ``tab_id`` (``None``: the pinned tab); unpins it when it was pinned."""
         target = self.pinned_tab_id if tab_id is None else tab_id
         reply = self._call("closeTab", {}, target, timeout)
@@ -471,13 +485,17 @@ class Bridge:
             self.pinned_tab_id = None
         return result
 
-    def activate_tab(self, timeout: float = 10.0, *, tab_id: Any = PINNED) -> Dict[str, Any]:
+    def activate_tab(
+        self, timeout: float = 10.0, *, tab_id: Any = PINNED
+    ) -> dict[str, Any]:
         """Activate the tab and focus its window.
 
         Raises:
             TargetClosedError: No such tab.
         """
-        return expect_dict("activateTab", self._call("activateTab", {}, tab_id, timeout))
+        return expect_dict(
+            "activateTab", self._call("activateTab", {}, tab_id, timeout)
+        )
 
     # -- network ---------------------------------------------------------
 
@@ -486,10 +504,10 @@ class Bridge:
         pattern: str,
         timeout: float = 10.0,
         *,
-        since: Optional[float] = None,
+        since: float | None = None,
         any_tab: bool = False,
         tab_id: Any = PINNED,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Wait for the first network entry matching glob ``pattern``.
 
         Returns:
@@ -505,10 +523,10 @@ class Bridge:
         self,
         timeout: float = 10.0,
         *,
-        since: Optional[float] = None,
+        since: float | None = None,
         any_tab: bool = True,
         tab_id: Any = PINNED,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return the buffered network entries (last 500, up to 2 min old)
         since ``since`` (epoch ms); every tab unless ``any_tab=False``."""
         params = {"since": since, "anyTab": bool(any_tab)}

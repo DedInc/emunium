@@ -20,6 +20,7 @@ import pytest
 
 from emunium import _screen
 from emunium._element_interactor import ElementInteractor
+from emunium._motion import DEFAULT_TARGET_SIZE
 from emunium._screen import NATIVE_INPUT_LOCK
 from emunium._standalone import facade, vision
 from emunium._standalone import ocr as standalone_ocr
@@ -125,7 +126,7 @@ class FakeInteractor(ElementInteractor):
         self.calls = []
         self.lock_held_while_typing = None
 
-    def move(self, x, y, *, human=True):
+    def move(self, x, y, *, human=True, target_size=DEFAULT_TARGET_SIZE):
         self.calls.append(("move", x, y))
 
     def press(self, button="left", *, clicks=1):

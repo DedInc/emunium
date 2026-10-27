@@ -1207,6 +1207,8 @@ class Win32Windows:
 
     _library: ctypes.CDLL
     _kernel32: ctypes.CDLL
+    _enum_proc: type[ctypes._CFunctionType]
+    _monitor_proc: type[ctypes._CFunctionType]
 
     def __init__(self) -> None:
         if sys.platform != "win32":

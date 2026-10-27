@@ -13,6 +13,7 @@ import stat
 import subprocess
 import zipfile
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -55,8 +56,8 @@ class FakeBridge:
 
 
 class FakePopen:
-    instances = []
-    events = []
+    instances: ClassVar[list[FakePopen]] = []
+    events: ClassVar[list[tuple[object, ...]]] = []
     exit_code = None  # poll() result right after spawn; None -> running
     stderr_text = b""
 
@@ -76,9 +77,11 @@ class FakePopen:
     def poll(self):
         return self.returncode
 
-    def wait(self, timeout=None):
+    def wait(self, timeout: float | None = None):
         FakePopen.events.append(("wait", self.pid, timeout))
         if self.returncode is None:
+            if timeout is None:
+                raise AssertionError("wait() on a running process would block forever")
             raise subprocess.TimeoutExpired(self.args, timeout)
         return self.returncode
 
@@ -288,7 +291,7 @@ def test_chrome_args(env):
     args = FakePopen.instances[0].args
     ext = session.extension_dir
     assert args[0] == env["exe"]
-    assert args[1] == "--user-data-dir=%s" % session.profile_dir
+    assert args[1] == f"--user-data-dir={session.profile_dir}"
     for flag in (
         "--no-first-run",
         "--no-default-browser-check",
@@ -297,8 +300,8 @@ def test_chrome_args(env):
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--hide-crash-restore-bubble",
-        "--disable-extensions-except=%s" % ext,
-        "--load-extension=%s" % ext,
+        f"--disable-extensions-except={ext}",
+        f"--load-extension={ext}",
         "--headless=new",
     ):
         assert flag in args
@@ -361,7 +364,7 @@ def test_user_data_dir_is_used_and_kept(env, tmp_path):
     launcher.launch(session, bridge_timeout=5)
     session_dir = Path(session.session_dir)
     assert not (session_dir / "profile").exists()
-    assert "--user-data-dir=%s" % profile.resolve() in FakePopen.instances[0].args
+    assert f"--user-data-dir={profile.resolve()}" in FakePopen.instances[0].args
     launcher.close(session)
     assert (profile / "Default" / "Preferences").is_file()
     assert not session_dir.exists()
@@ -556,7 +559,7 @@ def test_windows_assign_failure_closes_unused_job(env, monkeypatch):
 def test_windows_no_job_and_parent_gone_warns(env, monkeypatch, caplog):
     env["job_api"].assign_error = OSError(5, "access denied")
     env["state"]["graceful_exits_parent"] = True
-    session, proc = _launch_windows(env, monkeypatch)
+    session, _ = _launch_windows(env, monkeypatch)
     with caplog.at_level(logging.WARNING, logger="emunium.browser"):
         launcher.close(session)
     assert not any(e[0] == "taskkill" and "/F" in e for e in env["events"])
@@ -786,15 +789,11 @@ def test_facade_session_defaults():
 
 
 class FakeResponse(io.BytesIO):
+    """A urlopen() response; BytesIO's own context manager closes it on exit."""
+
     def __init__(self, data):
         super().__init__(data)
         self.headers = {"Content-Length": str(len(data))}
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
 
 
 def _zip_bytes(entries):
@@ -1001,7 +1000,7 @@ def _stale_lock(tmp_path):
 def test_stale_lock_takeover_renames_then_creates(tmp_path):
     lock = _stale_lock(tmp_path)
     assert installer._try_acquire_lock(lock) is True
-    assert lock.read_text(encoding="ascii").startswith("%d " % os.getpid())
+    assert lock.read_text(encoding="ascii").startswith(f"{os.getpid()} ")
     assert sorted(p.name for p in tmp_path.iterdir()) == [installer.LOCK_NAME]
 
 

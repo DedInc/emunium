@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any
 
 import pytest
+from fake_extension import FakeExtension
 from websockets.sync.server import serve
 
-from fake_extension import FakeExtension
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 TOKEN = "smoke-token-0123456789"
 TIMEOUT = 5.0
@@ -22,21 +24,21 @@ TIMEOUT = 5.0
 class MiniBridge:
     """One-connection server: read hello, welcome, send one request, read reply."""
 
-    def __init__(self, request: Dict[str, Any]) -> None:
+    def __init__(self, request: dict[str, Any]) -> None:
         self.request = request
         self.hello: Any = None
         self.reply: Any = None
-        self.errors: List[BaseException] = []
+        self.errors: list[BaseException] = []
         self.done = threading.Event()
         self.server = serve(self._handle, "127.0.0.1", 0)
         self.port = self.server.socket.getsockname()[1]
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
-    def __enter__(self) -> "MiniBridge":
+    def __enter__(self) -> Self:
         self._thread.start()
         return self
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         self.server.shutdown()
         self._thread.join(TIMEOUT)
 
@@ -46,18 +48,21 @@ class MiniBridge:
             ws.send(json.dumps({"type": "welcome", "protocol": 2}))
             ws.send(json.dumps(self.request))
             self.reply = json.loads(ws.recv(timeout=TIMEOUT))
-        except Exception as exc:  # noqa: BLE001 - surfaced by the test
-            self.errors.append(exc)
+        except BaseException as exc:
+            self.errors.append(exc)  # asserted empty by _run
+            raise
         finally:
             self.done.set()
 
 
-def _run(request: Dict[str, Any], handler=None):
-    with MiniBridge(request) as bridge:
-        with FakeExtension(bridge.port, TOKEN, handler=handler) as ext:
-            assert bridge.done.wait(TIMEOUT), "server never finished the exchange"
-            assert ext.wait_welcomed(TIMEOUT)
-            assert ext.wait_requests(1, TIMEOUT)
+def _run(request: dict[str, Any], handler=None):
+    with (
+        MiniBridge(request) as bridge,
+        FakeExtension(bridge.port, TOKEN, handler=handler) as ext,
+    ):
+        assert bridge.done.wait(TIMEOUT), "server never finished the exchange"
+        assert ext.wait_welcomed(TIMEOUT)
+        assert ext.wait_requests(1, TIMEOUT)
     assert bridge.errors == []
     return bridge, ext
 

@@ -7,6 +7,7 @@ sender, the clipboard, the keyboard package and sleep are all injected.
 from __future__ import annotations
 
 import ctypes
+import itertools
 import math
 import random
 import statistics
@@ -193,7 +194,7 @@ def buttons(log):
 
 
 def test_human_move_lands_exactly_without_global_settings():
-    interactor, gui, sleep, log = make()
+    interactor, gui, _, log = make()
     interactor.move(900.4, 600.6)
     path = moves(log)
     assert path[-1] == (900, 601)
@@ -204,11 +205,11 @@ def test_human_move_lands_exactly_without_global_settings():
 
 
 def test_human_move_is_curved_and_eased():
-    interactor, gui, sleep, log = make()
+    interactor, _, _, log = make()
     interactor.move(1100, 100)  # horizontal 1000 px from (100, 100)
     path = moves(log)
     assert max(abs(y - 100) for _, y in path) > 5  # not a straight line
-    steps = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:])]
+    steps = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in itertools.pairwise(path)]
     middle = steps[len(steps) // 2]
     assert steps[0] < middle and steps[-2] < middle
 
@@ -231,7 +232,7 @@ def test_human_move_stays_on_screen_and_off_failsafe_corners():
 
 
 def test_plain_move_is_one_direct_move():
-    interactor, gui, sleep, log = make()
+    interactor, _, sleep, log = make()
     interactor.move(10, 20, human=False)
     assert moves(log) == [(10, 20)] and sleep.calls == []
 
@@ -248,7 +249,7 @@ def test_move_raises_when_cursor_cannot_land():
 
 
 def test_double_click_is_one_move_and_two_presses():
-    interactor, gui, sleep, log = make(double_click_time=0.5)
+    interactor, gui, _, log = make(double_click_time=0.5)
     interactor.click(300, 200, click_type=ClickType.DOUBLE, human=False)
     assert moves(log) == [(300, 200)]
     assert buttons(log) == [("down", "left"), ("up", "left")] * 2
@@ -294,8 +295,14 @@ def test_press_validates_arguments():
     for bad in ({"button": "x"}, {"clicks": 0}, {"clicks": True}, {"clicks": 1.5}):
         with pytest.raises(ValueError):
             interactor.press(**bad)
+    assert log == []
+
+
+@pytest.mark.parametrize("click_type", ["left", 0, None])
+def test_click_rejects_a_non_click_type(click_type: object):
+    interactor, _, _, log = make()
     with pytest.raises(ValueError):
-        interactor.click(1, 1, click_type="left")  # type: ignore[arg-type]
+        interactor.click(1, 1, click_type=click_type)
     assert log == []
 
 
@@ -320,7 +327,7 @@ def test_mouse_up_attempted_when_mouse_down_fails_and_error_wins():
 
 
 def test_drag_sequence():
-    interactor, gui, _, log = make()
+    interactor, _, _, log = make()
     interactor.drag((200, 200), (400, 300), human=True)
     down = log.index(("down", "left"))
     up = log.index(("up", "left"))
@@ -400,7 +407,7 @@ def test_unicode_event_sequence():
 
 def test_windows_typing_uses_sendinput_for_everything():
     sender = FakeSender()
-    interactor, gui, sleep, log = make("win32", unicode_sender=sender)
+    interactor, _, sleep, log = make("win32", unicode_sender=sender)
     interactor.type_text("Hi п\U0001f600\n", human=False)
     assert sender.batches == [keyboard_events("Hi п\U0001f600\n")]
     assert sleep.calls == [] and log == []  # no pyautogui keys, no delay
@@ -424,10 +431,11 @@ def test_non_positive_cpm_means_no_delay(cpm):
     assert sleep.calls == [] and len(sender.batches) == 1
 
 
-def test_type_text_rejects_non_str():
+@pytest.mark.parametrize("text", [b"abc", None, 5])
+def test_type_text_rejects_non_str(text: object):
     interactor, _, _, _ = make("win32", unicode_sender=FakeSender())
     with pytest.raises(TypeError):
-        interactor.type_text(b"abc")  # type: ignore[arg-type]
+        interactor.type_text(text)
 
 
 # -- typing rhythm -------------------------------------------------------------
@@ -798,7 +806,7 @@ def test_input_struct_size_x64():
 
 def test_posix_ascii_via_pyautogui_and_other_via_paste():
     clipboard = FakeClipboard()
-    interactor, gui, sleep, log = make("linux", clipboard=clipboard, keyboard=None)
+    interactor, gui, _, log = make("linux", clipboard=clipboard, keyboard=None)
     interactor.type_text("hi\n\tпр!", human=False)
     keys = [e for e in log if e[0] != "sleep"]
     assert keys == [
@@ -1088,7 +1096,7 @@ def test_mouse_release_uses_platform_layer_past_failsafe():
 
 
 def test_drag_release_uses_platform_layer():
-    interactor, gui, _, log = make_platform()
+    interactor, _, _, log = make_platform()
     interactor.drag((10, 10), (60, 60), human=False)
     assert log[-1] == ("raw_up", 60, 60, "left")
 
@@ -1153,7 +1161,7 @@ def test_keyboard_interrupt_in_mouse_release_propagates_after_release():
 
 
 def test_keyboard_interrupt_during_drag_releases_button():
-    interactor, gui, sleep, log = make_platform()
+    interactor, _, sleep, log = make_platform()
 
     def interrupt_after_down(seconds):
         if ("down", "left") in log:

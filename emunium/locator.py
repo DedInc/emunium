@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Protocol, runtime_checkable
+
 ROLE_SELECTOR_MAP = {
     "button": 'button, [role="button"], input[type="button"], input[type="submit"]',
     "link": 'a[href], [role="link"]',
@@ -23,32 +26,48 @@ _PARSING_HINT = (
 )
 
 
+@runtime_checkable
+class _TextMethod(Protocol):
+    """A selectolax node's ``text()``; ``isinstance`` matches any callable."""
+
+    def __call__(self, *, deep: bool = True) -> str | None: ...
+
+
+@runtime_checkable
+class _AttributeLookup(Protocol):
+    """``attrs`` of a selectolax node or a live Element (a dict)."""
+
+    def get(self, key: str, /) -> str | None: ...
+
+
+def _text_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
 def _node_text(node: object, *, deep: bool = True) -> str | None:
     """Return the text of a selectolax node (``text()``) or a live Element
     (``text`` is a plain str property); ``None`` when the node has no text."""
     if hasattr(node, "text"):
         text = node.text
-        if callable(text):
+        if isinstance(text, _TextMethod):
             return text(deep=deep)
-        return text
+        return _text_or_none(text)
     if hasattr(node, "_text"):
-        return node._text
+        return _text_or_none(node._text)
     return None
 
 
 class Locator:
     """Playwright-like locator for static HTML and live bridge elements."""
 
-    def __init__(self, nodes: list[object]) -> None:
+    def __init__(self, nodes: Sequence[object]) -> None:
         self._nodes = nodes
 
     def filter(self, *, has_text: str | None = None) -> Locator:
         result = self._nodes
         if has_text is not None:
             target = has_text.lower()
-            result = [
-                n for n in self._nodes if target in (_node_text(n) or "").lower()
-            ]
+            result = [n for n in self._nodes if target in (_node_text(n) or "").lower()]
         return Locator(result)
 
     @property
@@ -82,9 +101,9 @@ class Locator:
             return None
         if hasattr(node, "attrs"):
             attrs = node.attrs
-            if isinstance(attrs, dict):
+            # Dicts (live Elements) and selectolax attribute maps both match.
+            if isinstance(attrs, _AttributeLookup):
                 return attrs.get(name)
-            return attrs.get(name) if hasattr(attrs, "get") else None
         return None
 
     def __repr__(self) -> str:

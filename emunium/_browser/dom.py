@@ -15,7 +15,7 @@ import json
 import logging
 import re
 from collections.abc import Mapping
-from typing import Any, Union
+from typing import Any
 
 from emunium._bridge.facade import Bridge
 from emunium._browser.context import BrowserContext
@@ -25,7 +25,7 @@ from emunium.wait import Wait, WaitStrategy
 
 logger = logging.getLogger("emunium.browser")
 
-ContextOrBridge = Union[BrowserContext, Bridge]
+ContextOrBridge = BrowserContext | Bridge
 
 # Bridge timeout (s) of each best-effort probe made after a wait timed out.
 TIMEOUT_PROBE_S = 2.0

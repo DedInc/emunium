@@ -7,8 +7,8 @@ DIP (100, 80). Expected values are the viewport origin in INPUT px.
 from __future__ import annotations
 
 import sys
-import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -17,6 +17,7 @@ from emunium._screen import (
     Calibration,
     Geometry,
     estimate_to_input,
+    geometry_payload,
     input_per_dip,
 )
 
@@ -49,8 +50,12 @@ def windows(monkeypatch):
 
 @pytest.mark.parametrize(
     "case, name",
-    [(CASE_A, "dsf1 zoom1"), (CASE_B, "dsf1 zoom1.5"), (CASE_C, "dsf1.5 zoom1"),
-     (CASE_D, "dsf1.5 zoom1.25")],
+    [
+        (CASE_A, "dsf1 zoom1"),
+        (CASE_B, "dsf1 zoom1.5"),
+        (CASE_C, "dsf1.5 zoom1"),
+        (CASE_D, "dsf1.5 zoom1.25"),
+    ],
 )
 def test_estimate_origin_within_2px(windows, case, name):
     geometry, (true_x, true_y) = case
@@ -86,8 +91,14 @@ def test_input_per_dip_by_platform(monkeypatch):
 
 def test_from_payload_defaults_and_validation():
     geometry = Geometry.from_payload(
-        {"screenX": 1, "screenY": 2, "outerWidth": 3, "outerHeight": 4,
-         "innerWidth": 5, "innerHeight": 6},
+        {
+            "screenX": 1,
+            "screenY": 2,
+            "outerWidth": 3,
+            "outerHeight": 4,
+            "innerWidth": 5,
+            "innerHeight": 6,
+        },
         None,
     )
     assert geometry.dpr == 1.0 and geometry.zoom == 1.0
@@ -98,8 +109,13 @@ def test_from_payload_defaults_and_validation():
         _geometry((1, 1), (1, 1), 1, 0)
     with pytest.raises(ValueError):
         _geometry((1, 1), (1, 1), float("nan"), 1)
-    with pytest.raises(ValueError):
-        Geometry.from_payload("nope", 1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("payload", ["nope", None, 1, [("screenX", 1)]])
+def test_geometry_payload_must_be_a_dict(payload: object):
+    # Geometry.from_payload validates its payload through geometry_payload.
+    with pytest.raises(ValueError, match="geometry must be a dict"):
+        geometry_payload(payload)
 
 
 def test_one_sample_calibration_case_c(windows):
@@ -174,8 +190,16 @@ def test_zoom_change_discards_calibration(windows):
     calibration = Calibration()
     calibration.record(geometry, 10, 10, 118, 233)
     zoomed = Geometry.from_payload(
-        {"screenX": 100, "screenY": 80, "outerWidth": 1200, "outerHeight": 800,
-         "innerWidth": 1184, "innerHeight": 649, "devicePixelRatio": 1}, 1.1,
+        {
+            "screenX": 100,
+            "screenY": 80,
+            "outerWidth": 1200,
+            "outerHeight": 800,
+            "innerWidth": 1184,
+            "innerHeight": 649,
+            "devicePixelRatio": 1,
+        },
+        1.1,
     )
     assert not calibration.is_calibrated(zoomed)
 
@@ -193,30 +217,23 @@ def test_reset_and_bad_sample(windows):
 def test_calibration_is_thread_safe(windows):
     geometry = CASE_C[0]
     calibration = Calibration()
-    errors = []
 
     def worker(seed):
-        try:
-            for i in range(200):
-                calibration.record(geometry, 412, 150, 780, 560)
-                calibration.to_input(geometry, seed, i)
-        except Exception as exc:  # pragma: no cover - only on failure
-            errors.append(exc)
+        for i in range(200):
+            calibration.record(geometry, 412, 150, 780, 560)
+            calibration.to_input(geometry, seed, i)
 
-    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert not errors
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(worker, n) for n in range(8)]
+    for future in futures:
+        future.result()  # re-raises a worker's error here
     assert calibration.to_input(geometry, 0, 0) == pytest.approx((162, 335))
 
 
 def test_locks():
     assert hasattr(_screen.NATIVE_INPUT_LOCK, "acquire")
-    with _screen.NATIVE_INPUT_LOCK:
-        with _screen.NATIVE_INPUT_LOCK:  # re-entrant
-            pass
+    with _screen.NATIVE_INPUT_LOCK, _screen.NATIVE_INPUT_LOCK:  # re-entrant
+        pass
     assert _screen.CLIPBOARD_LOCK.acquire(blocking=False)
     _screen.CLIPBOARD_LOCK.release()
 
@@ -238,7 +255,9 @@ def _windll(calls, context=0, shcore=1, aware=1, context_missing=False):
         user32.SetProcessDpiAwarenessContext = _Fn("context", calls, context)
     return types.SimpleNamespace(
         user32=user32,
-        shcore=types.SimpleNamespace(SetProcessDpiAwareness=_Fn("shcore", calls, shcore)),
+        shcore=types.SimpleNamespace(
+            SetProcessDpiAwareness=_Fn("shcore", calls, shcore)
+        ),
     )
 
 
@@ -288,7 +307,9 @@ def test_ensure_dpi_awareness_noop_off_windows(monkeypatch):
     calls = []
     monkeypatch.setattr(_screen, "_DPI_DONE", False)
     monkeypatch.setattr(_screen, "_platform", lambda: "darwin")
-    monkeypatch.setattr(_screen, "_apply_windows_dpi_awareness", lambda w=None: calls.append(1))
+    monkeypatch.setattr(
+        _screen, "_apply_windows_dpi_awareness", lambda w=None: calls.append(1)
+    )
     _screen.ensure_dpi_awareness()
     assert calls == []
 

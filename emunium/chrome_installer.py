@@ -21,8 +21,8 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
 
 from emunium.errors import LaunchError
 
@@ -106,9 +106,7 @@ def ensure_chrome() -> str:
     override = os.environ.get(CHROME_PATH_ENV)
     if override:
         if not os.path.isfile(override):
-            raise LaunchError(
-                "%s points to a missing file: %s" % (CHROME_PATH_ENV, override)
-            )
+            raise LaunchError(f"{CHROME_PATH_ENV} points to a missing file: {override}")
         return override
 
     plat = _get_platform_tag()
@@ -158,7 +156,7 @@ def _try_acquire_lock(lock_path: Path) -> bool:
     # Stale takeover: of several waiters, only the one whose rename succeeds
     # may recreate the lock; the others see the rename fail and retry later.
     grave = lock_path.with_name(
-        "%s.stale-%d-%s" % (lock_path.name, os.getpid(), secrets.token_hex(4))
+        f"{lock_path.name}.stale-{os.getpid()}-{secrets.token_hex(4)}"
     )
     try:
         os.replace(str(lock_path), str(grave))
@@ -182,7 +180,7 @@ def _create_lock(lock_path: Path) -> bool:
     except FileExistsError:
         return False
     try:
-        os.write(fd, ("%d %f\n" % (os.getpid(), time.time())).encode("ascii"))
+        os.write(fd, f"{os.getpid()} {time.time():f}\n".encode("ascii"))
     finally:
         os.close(fd)
     return True
@@ -238,10 +236,12 @@ def _lock_heartbeat(lock_path: Path) -> Callable[[], None]:
 def _install(dest: Path, plat: str, lock_path: Path) -> None:
     version = _fetch_text(VERSION_URL)
     if not _VERSION_RE.match(version):
-        raise LaunchError("Unexpected Chrome for Testing version string: %r" % version)
+        raise LaunchError(f"Unexpected Chrome for Testing version string: {version!r}")
     zip_url = ZIP_URL_TEMPLATE.format(version=version, plat=plat)
 
-    fd, zip_name = tempfile.mkstemp(prefix=".emunium-download-", suffix=".zip", dir=str(dest))
+    fd, zip_name = tempfile.mkstemp(
+        prefix=".emunium-download-", suffix=".zip", dir=str(dest)
+    )
     os.close(fd)
     zip_path = Path(zip_name)
     staging = Path(tempfile.mkdtemp(prefix=".emunium-staging-", dir=str(dest)))
@@ -255,8 +255,8 @@ def _install(dest: Path, plat: str, lock_path: Path) -> None:
         staged_exe = _chrome_executable(staging, plat)
         if not staged_exe.is_file():
             raise LaunchError(
-                "Chrome archive %s did not contain %s"
-                % (zip_url, staged_exe.relative_to(staging))
+                f"Chrome archive {zip_url} did not contain"
+                f" {staged_exe.relative_to(staging)}"
             )
         if _POSIX_PERMISSIONS:
             mode = staged_exe.stat().st_mode
@@ -277,7 +277,9 @@ def _fetch_text(url: str) -> str:
         return resp.read().decode("utf-8").strip()
 
 
-def _download(url: str, target: Path, heartbeat: Optional[Callable[[], None]] = None) -> None:
+def _download(
+    url: str, target: Path, heartbeat: Callable[[], None] | None = None
+) -> None:
     deadline = time.monotonic() + DOWNLOAD_TIMEOUT
     done = 0
     with urllib.request.urlopen(url, timeout=METADATA_TIMEOUT) as resp:
@@ -297,11 +299,11 @@ def _download(url: str, target: Path, heartbeat: Optional[Callable[[], None]] = 
                     heartbeat()
                 if time.monotonic() > deadline:
                     raise TimeoutError(
-                        "Chrome download exceeded %.0f s (%d bytes received)"
-                        % (DOWNLOAD_TIMEOUT, done)
+                        f"Chrome download exceeded {DOWNLOAD_TIMEOUT:.0f} s"
+                        f" ({done} bytes received)"
                     )
     if total and done != total:
-        raise OSError("Chrome download truncated: %d of %d bytes" % (done, total))
+        raise OSError(f"Chrome download truncated: {done} of {total} bytes")
 
 
 def _use_ditto() -> bool:
@@ -328,7 +330,7 @@ def _entry_mode(info: zipfile.ZipInfo) -> int:
 
 def _extract_zip(zip_path: Path, staging: Path) -> None:
     staging_real = os.path.realpath(str(staging))
-    dir_modes: List[Tuple[str, int]] = []
+    dir_modes: list[tuple[str, int]] = []
     with zipfile.ZipFile(str(zip_path), "r") as zf:
         for info in zf.infolist():
             target = _safe_target(staging_real, info.filename)
@@ -358,15 +360,17 @@ def _safe_target(staging_real: str, name: str) -> str:
     target = os.path.realpath(os.path.join(staging_real, name))
     # realpath also follows symlinks extracted earlier, so a link cannot redirect writes.
     if target != staging_real and not target.startswith(staging_real + os.sep):
-        raise LaunchError("Unsafe path in Chrome archive: %r" % name)
+        raise LaunchError(f"Unsafe path in Chrome archive: {name!r}")
     return target
 
 
 def _move_into_place(staged_root: Path, final_root: Path) -> None:
-    old: Optional[Path] = None
+    old: Path | None = None
     if os.path.lexists(str(final_root)):
         # A half-extracted or outdated tree; os.replace cannot overwrite a directory.
-        old = final_root.parent / (".emunium-old-%d-%d" % (os.getpid(), int(time.time() * 1000)))
+        old = (
+            final_root.parent / f".emunium-old-{os.getpid()}-{int(time.time() * 1000)}"
+        )
         os.replace(str(final_root), str(old))
     os.replace(str(staged_root), str(final_root))
     if old is not None:

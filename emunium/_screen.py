@@ -13,6 +13,8 @@ points.
 
 from __future__ import annotations
 
+import ctypes
+import logging
 import math
 import sys
 import threading
@@ -25,8 +27,13 @@ from emunium._native import InputBackend
 NATIVE_INPUT_LOCK = threading.RLock()
 CLIPBOARD_LOCK = threading.Lock()
 
+logger = logging.getLogger(__name__)
+
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 PROCESS_PER_MONITOR_DPI_AWARE = 2
+# A DPI call can fail to load its DLL (shcore before Windows 8.1) or hit an
+# SEH fault (OSError), miss its export (AttributeError) or reject an argument.
+_DPI_CALL_ERRORS = (OSError, AttributeError, ctypes.ArgumentError)
 
 # Two calibration samples must be at least this far apart (CSS px) on an axis
 # before the per-axis scale is fitted instead of taken from the platform model.
@@ -49,8 +56,6 @@ def _platform() -> str:
 
 def _apply_windows_dpi_awareness(windll: Any = None) -> str | None:
     """Try PMv2 -> shcore per-monitor -> system aware. Returns the API that won."""
-    import ctypes
-
     if windll is None:
         if sys.platform != "win32":
             return None
@@ -58,7 +63,8 @@ def _apply_windows_dpi_awareness(windll: Any = None) -> str | None:
 
     try:
         user32 = windll.user32
-    except Exception:
+    except _DPI_CALL_ERRORS:
+        logger.debug("user32 is unavailable", exc_info=True)
         user32 = None
 
     if user32 is not None:
@@ -71,22 +77,22 @@ def _apply_windows_dpi_awareness(windll: Any = None) -> str | None:
                     ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
                 ):
                     return "SetProcessDpiAwarenessContext"
-        except Exception:
-            pass
+        except _DPI_CALL_ERRORS:
+            logger.debug("SetProcessDpiAwarenessContext failed", exc_info=True)
 
     try:
         shcore = windll.shcore
         if shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) == 0:
             return "SetProcessDpiAwareness"
-    except Exception:
-        pass
+    except _DPI_CALL_ERRORS:
+        logger.debug("SetProcessDpiAwareness failed", exc_info=True)
 
     if user32 is not None:
         try:
             if user32.SetProcessDPIAware():
                 return "SetProcessDPIAware"
-        except Exception:
-            pass
+        except _DPI_CALL_ERRORS:
+            logger.debug("SetProcessDPIAware failed", exc_info=True)
     return None
 
 
@@ -106,7 +112,9 @@ def ensure_dpi_awareness() -> None:
         try:
             _apply_windows_dpi_awareness()
         except Exception:
-            pass
+            # Best effort by contract: input works without awareness, only less
+            # precisely, so no failure here may stop the backend from loading.
+            logger.debug("DPI awareness could not be set", exc_info=True)
 
 
 def input_backend() -> InputBackend:
@@ -149,14 +157,26 @@ def pyautogui() -> Any:
     return _PYAUTOGUI
 
 
+def geometry_payload(value: object) -> dict:
+    """``value`` as a geometry payload dict.
+
+    The payload is extension data, not a caller's argument: one of the wrong
+    type is a bad value, so every geometry check raises ``ValueError``.
+    """
+    if isinstance(value, dict):
+        return value
+    raise ValueError(f"geometry must be a dict, got {value!r}")
+
+
 def _number(payload: dict, key: str, default: float | None = None) -> float:
+    """``payload[key]`` as a finite float; bools and non-numbers are rejected."""
     value = payload.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"geometry.{key} must be a number, got {value!r}")
-    value = float(value)
-    if not math.isfinite(value):
-        raise ValueError(f"geometry.{key} must be finite, got {value!r}")
-    return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number):
+            return number
+        raise ValueError(f"geometry.{key} must be finite, got {number!r}")
+    raise ValueError(f"geometry.{key} must be a number, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -172,8 +192,7 @@ class Geometry:
 
     @classmethod
     def from_payload(cls, geometry: dict, zoom: float | None) -> Geometry:
-        if not isinstance(geometry, dict):
-            raise ValueError(f"geometry must be a dict, got {geometry!r}")
+        payload = geometry_payload(geometry)
         if zoom is None:
             zoom_value = 1.0
         elif isinstance(zoom, bool) or not isinstance(zoom, (int, float)):
@@ -183,13 +202,13 @@ class Geometry:
         if not math.isfinite(zoom_value) or zoom_value <= 0:
             raise ValueError(f"zoom must be positive, got {zoom!r}")
         result = cls(
-            screen_x=_number(geometry, "screenX"),
-            screen_y=_number(geometry, "screenY"),
-            outer_width=_number(geometry, "outerWidth"),
-            outer_height=_number(geometry, "outerHeight"),
-            inner_width=_number(geometry, "innerWidth"),
-            inner_height=_number(geometry, "innerHeight"),
-            dpr=_number(geometry, "devicePixelRatio", 1.0),
+            screen_x=_number(payload, "screenX"),
+            screen_y=_number(payload, "screenY"),
+            outer_width=_number(payload, "outerWidth"),
+            outer_height=_number(payload, "outerHeight"),
+            inner_width=_number(payload, "innerWidth"),
+            inner_height=_number(payload, "innerHeight"),
+            dpr=_number(payload, "devicePixelRatio", 1.0),
             zoom=zoom_value,
         )
         if result.dpr <= 0:

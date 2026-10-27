@@ -126,7 +126,11 @@ def store():
         {
             "elements": [
                 {"tag": "DIV", "attrs": {"class": "wrap"}, "rect": {}},
-                {"tag": "BUTTON", "attrs": {"class": "btn primary", "id": "ok"}, "rect": {}},
+                {
+                    "tag": "BUTTON",
+                    "attrs": {"class": "btn primary", "id": "ok"},
+                    "rect": {},
+                },
                 {"tag": "A", "attrs": {"href": "/a,b", "class": "btn"}, "rect": {}},
                 {"tag": "my-widget", "attrs": {"data-x": "1"}, "rect": {}},
             ]

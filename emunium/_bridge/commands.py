@@ -7,7 +7,7 @@ result shapes, idempotency) and ``docs/architecture/python-internals.md``
 
 from __future__ import annotations
 
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any
 
 from emunium._bridge.transport import Reply
 from emunium.errors import BridgeProtocolError
@@ -15,18 +15,18 @@ from emunium.errors import BridgeProtocolError
 __all__ = [
     "IDEMPOTENT_METHODS",
     "WAIT_GRACE",
-    "is_idempotent",
-    "to_ms",
-    "enrich_element",
-    "element_or_none",
     "element_list",
+    "element_or_none",
+    "enrich_element",
     "expect_dict",
     "expect_list",
+    "is_idempotent",
+    "to_ms",
 ]
 
 # bridge-protocol.md section 6, column "idempotent" = yes. Only these are
 # re-sent once after a reconnect.
-IDEMPOTENT_METHODS: FrozenSet[str] = frozenset(
+IDEMPOTENT_METHODS: frozenset[str] = frozenset(
     {
         "getTabInfo",
         "listTabs",
@@ -62,10 +62,10 @@ def is_idempotent(method: str) -> bool:
 
 
 def to_ms(seconds: float) -> int:
-    return int(round(seconds * 1000))
+    return round(float(seconds) * 1000)
 
 
-def enrich_element(element: Dict[str, Any], reply: Reply) -> Dict[str, Any]:
+def enrich_element(element: dict[str, Any], reply: Reply) -> dict[str, Any]:
     """Copy of ``element`` with the reply envelope's ``tabId`` and ``zoom``."""
     enriched = dict(element)
     enriched["tabId"] = reply.tab_id
@@ -73,7 +73,7 @@ def enrich_element(element: Dict[str, Any], reply: Reply) -> Dict[str, Any]:
     return enriched
 
 
-def element_or_none(method: str, reply: Reply) -> Optional[Dict[str, Any]]:
+def element_or_none(method: str, reply: Reply) -> dict[str, Any] | None:
     result = reply.result
     if result is None:
         return None
@@ -82,7 +82,7 @@ def element_or_none(method: str, reply: Reply) -> Optional[Dict[str, Any]]:
     return enrich_element(result, reply)
 
 
-def element_list(method: str, reply: Reply) -> List[Dict[str, Any]]:
+def element_list(method: str, reply: Reply) -> list[dict[str, Any]]:
     elements = expect_list(method, reply)
     out = []
     for element in elements:
@@ -92,14 +92,14 @@ def element_list(method: str, reply: Reply) -> List[Dict[str, Any]]:
     return out
 
 
-def expect_dict(method: str, reply: Reply) -> Dict[str, Any]:
+def expect_dict(method: str, reply: Reply) -> dict[str, Any]:
     result = reply.result
     if not isinstance(result, dict):
         raise _shape_error(method, "an object", result)
     return result
 
 
-def expect_list(method: str, reply: Reply) -> List[Any]:
+def expect_list(method: str, reply: Reply) -> list[Any]:
     result = reply.result
     if result is None:
         return []
@@ -110,6 +110,6 @@ def expect_list(method: str, reply: Reply) -> List[Any]:
 
 def _shape_error(method: str, expected: str, got: Any) -> BridgeProtocolError:
     return BridgeProtocolError(
-        "%s returned %s, expected %s" % (method, type(got).__name__, expected),
+        f"{method} returned {type(got).__name__}, expected {expected}",
         method=method,
     )

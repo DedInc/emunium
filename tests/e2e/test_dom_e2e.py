@@ -14,7 +14,8 @@ import socket
 import tempfile
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -230,15 +231,11 @@ def test_wait_custom_js(browser: Browser, site_url: str) -> None:
     )
     started = time.monotonic()
     with pytest.raises(ScriptError):
-        browser.wait(
-            "#heading", condition=Wait().custom_js("return ((("), timeout=8
-        )
+        browser.wait("#heading", condition=Wait().custom_js("return ((("), timeout=8)
     assert time.monotonic() - started < 4.0
 
 
-def test_wait_custom_js_that_throws_times_out(
-    browser: Browser, site_url: str
-) -> None:
+def test_wait_custom_js_that_throws_times_out(browser: Browser, site_url: str) -> None:
     """A runtime exception means "not yet": the wait runs out its timeout."""
     browser.goto(site_url + "/index.html")
 
@@ -290,9 +287,7 @@ def test_wait_timeout_raises_and_soft_timeout_returns_none(
     with pytest.raises(TimeoutError) as info:
         browser.wait_for_element("#never-there", timeout=1)
     assert isinstance(info.value.__cause__, WaitTimeoutError)
-    assert (
-        browser.wait("#never-there", timeout=1, raise_on_timeout=False) is None
-    )
+    assert browser.wait("#never-there", timeout=1, raise_on_timeout=False) is None
 
 
 # -- staleness --------------------------------------------------------------------
@@ -338,7 +333,8 @@ def test_new_tab_switch_and_close_follow_the_pin(
 
     second = browser.new_tab(site_url + "/other.html")["tabId"]
     assert browser.bridge.pinned_tab_id == second
-    assert browser.wait_for_element("#heading", timeout=5).text == "Other page"
+    heading = browser.wait_for_element("#heading", timeout=5)
+    assert heading is not None and heading.text == "Other page"
 
     background = browser.new_tab(site_url + "/index.html", switch=False)["tabId"]
     assert browser.bridge.pinned_tab_id == second
@@ -348,6 +344,7 @@ def test_new_tab_switch_and_close_follow_the_pin(
     assert browser.bridge.pinned_tab_id == background
     assert browser.tab_info()["tabId"] == background
     handle_in_background = browser.wait_for_element("#heading", timeout=5)
+    assert handle_in_background is not None
     assert handle_in_background.text == "Hello e2e"
 
     browser.switch_to_tab(first)
@@ -365,9 +362,7 @@ def test_new_tab_switch_and_close_follow_the_pin(
     remaining = {t["tabId"] for t in browser.tabs()}
     assert first not in remaining and background not in remaining
     assert browser.bridge.pinned_tab_id in remaining
-
-    with pytest.raises(InvalidArgumentError):
-        browser.switch_to_tab(str(second))  # type: ignore[arg-type]
+    # A non-int tab id: tests/test_browser.py::test_tab_id_argument_rejects_non_ints.
 
 
 # -- network waits ----------------------------------------------------------------
@@ -563,12 +558,9 @@ def test_execute_script_json_conversion(browser: Browser, site_url: str) -> None
 def test_execute_script_body_may_await(browser: Browser, site_url: str) -> None:
     browser.goto(site_url + "/index.html")
 
-    assert (
-        browser.execute_script(
-            "const r = await fetch('/api/ping.json'); return r.json();"
-        )
-        == {"pong": True}
-    )
+    assert browser.execute_script(
+        "const r = await fetch('/api/ping.json'); return r.json();"
+    ) == {"pong": True}
 
 
 def test_execute_script_on_csp_page(browser: Browser, site_url: str) -> None:
@@ -583,7 +575,8 @@ def test_execute_script_on_csp_page(browser: Browser, site_url: str) -> None:
     with pytest.raises(CSPBlockedError):
         browser.wait("#heading", condition=Wait().custom_js("return true"), timeout=5)
     # Queries and condition-free waits do not evaluate strings: they keep working.
-    assert browser.query_selector("#heading").text == "Strict CSP"
+    heading = browser.query_selector("#heading")
+    assert heading is not None and heading.text == "Strict CSP"
     assert browser.wait("#heading", condition=Wait().visible(), timeout=3) is not None
     assert browser.title == "E2E CSP"
 
@@ -611,7 +604,8 @@ def test_two_concurrent_sessions_are_isolated(
                     index * 10 + round_
                 )
         except BaseException as exc:
-            errors.append(exc)
+            errors.append(exc)  # asserted below
+            raise
 
     threads = [threading.Thread(target=drive, args=(i,)) for i in range(2)]
     for thread in threads:

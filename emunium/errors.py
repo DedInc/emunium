@@ -13,7 +13,7 @@ they represent; other classes default ``.code`` to ``None`` unless built by
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Type
+from typing import Any
 
 __all__ = [
     "BridgeDisconnectedError",
@@ -180,7 +180,7 @@ class ExpectationError(EmuniumError, AssertionError):
 
 
 # bridge-protocol.md section 3, "Error codes".
-_CODE_TO_CLASS: Dict[str, Type[EmuniumError]] = {
+_CODE_TO_CLASS: dict[str, type[EmuniumError]] = {
     "stale_element": StaleElementError,
     "no_target": TargetClosedError,
     "target_closed": TargetClosedError,
@@ -199,7 +199,7 @@ _CODE_TO_CLASS: Dict[str, Type[EmuniumError]] = {
 
 
 def error_from_reply(
-    code: str, message: str, method: Optional[str] = None
+    code: str, message: str, method: str | None = None
 ) -> EmuniumError:
     """Build the exception for an ``ok: false`` reply; unknown codes -> CommandError."""
     cls = _CODE_TO_CLASS.get(code, CommandError)

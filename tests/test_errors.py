@@ -114,7 +114,7 @@ def test_hierarchy(cls, bases):
     exc = cls("msg")
     assert isinstance(exc, EmuniumError)
     for base in bases:
-        assert isinstance(exc, base), "%s is not a %s" % (cls.__name__, base.__name__)
+        assert isinstance(exc, base), f"{cls.__name__} is not a {base.__name__}"
 
 
 def test_named_builtin_relationships():
@@ -135,7 +135,7 @@ def test_named_builtin_relationships():
 def test_every_instance_has_code_method_message(cls):
     exc = cls("only message")
     for attr in ("code", "method", "message"):
-        assert hasattr(exc, attr), "%s instance lacks .%s" % (cls.__name__, attr)
+        assert hasattr(exc, attr), f"{cls.__name__} instance lacks .{attr}"
     assert exc.message == "only message"
     assert exc.method is None
 

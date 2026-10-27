@@ -306,8 +306,8 @@ class FakeInteractor:
         self,
         text: str,
         *,
-        characters_per_minute: int = 280,
-        offset: int = 20,
+        characters_per_minute: int | None = None,
+        offset: int | None = None,
         human: bool = True,
     ) -> None:
         self._check_lock()

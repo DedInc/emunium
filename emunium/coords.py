@@ -160,9 +160,8 @@ def _record_matches(record: ElementRecord, conditions: list[dict]) -> bool:
         elif t == "class":
             if cond["value"] not in record.attrs.get("class", "").split():
                 return False
-        elif t == "attr_present":
-            if cond["name"] not in record.attrs:
-                return False
+        elif t == "attr_present" and cond["name"] not in record.attrs:
+            return False
     return True
 
 

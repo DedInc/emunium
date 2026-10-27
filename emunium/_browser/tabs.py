@@ -50,10 +50,16 @@ def new_tab(
     return Record(result)
 
 
+def tab_id_argument(value: object) -> int:
+    """``value`` as a caller's tab id: an int that is not a bool."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidArgumentError(f"tab_id must be an int, got {value!r}")
+    return value
+
+
 def switch_to_tab(ctx: BrowserContext, tab_id: int) -> Record:
     """Activate ``tab_id`` (focusing its window) and pin it."""
-    if isinstance(tab_id, bool) or not isinstance(tab_id, int):
-        raise InvalidArgumentError(f"tab_id must be an int, got {tab_id!r}")
+    tab_id = tab_id_argument(tab_id)
     result = ctx.bridge.activate_tab(tab_id=tab_id)
     ctx.bridge.pinned_tab_id = tab_id
     return Record(result)
