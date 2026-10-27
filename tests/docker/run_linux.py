@@ -2,8 +2,8 @@
 """Build the Linux test image and run the unit and e2e suites in a container.
 
 The build context is a temporary directory holding only the package, the
-tests and the project metadata (no virtualenv, browser profiles or agent
-state). The container's full output goes to a log file; its tail is printed
+tests, the examples and the project metadata (no virtualenv, browser
+profiles or agent state). The container's full output goes to a log file; its tail is printed
 and the script exits with the container's status.
 
 Usage: ``python tests/docker/run_linux.py [--tail N] [--log PATH] [--timeout S]``
@@ -22,10 +22,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE = "emunium-linux-tests:local"
-CONTEXT_DIRS = ("emunium", "tests")
+CONTEXT_DIRS = ("emunium", "tests", "examples")
 CONTEXT_FILES = ("pyproject.toml", "README.md", "CHANGELOG.md", "LICENSE")
+# "results": local output of examples/parallel runs (gitignored).
 IGNORED = shutil.ignore_patterns(
-    "__pycache__", "*.pyc", ".pytest_cache", "node_modules"
+    "__pycache__", "*.pyc", ".pytest_cache", "node_modules", "results"
 )
 DEFAULT_LOG = Path(tempfile.gettempdir()) / "emunium-linux-tests.log"
 # Exit status when the build fails or the run times out (the container never

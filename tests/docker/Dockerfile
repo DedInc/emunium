@@ -1,8 +1,8 @@
 # tests/docker/Dockerfile
 # Linux test image: the unit suite, then the e2e suite (DOM and real X11 input)
 # against Debian's Chromium under Xvfb with a window manager. Built by
-# tests/docker/run_linux.py from a context holding only the package, the tests
-# and the project metadata.
+# tests/docker/run_linux.py from a context holding only the package, the tests,
+# the examples and the project metadata.
 FROM python:3.10-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
