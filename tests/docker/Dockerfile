@@ -29,7 +29,7 @@ WORKDIR /home/tester/emunium
 COPY pyproject.toml README.md LICENSE ./
 RUN mkdir emunium \
     && touch emunium/__init__.py \
-    && pip install -e ".[standalone]" "pytest>=8" "websockets>=14,<18" \
+    && pip install -e ".[standalone,hub]" "pytest>=8" "websockets>=14,<18" \
     && rm -rf emunium
 
 # Docker Desktop runs containers on a WSL2 kernel ("microsoft" in

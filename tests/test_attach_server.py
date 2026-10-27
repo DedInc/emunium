@@ -704,11 +704,39 @@ def test_listening_socket_is_exclusive_and_loopback_only(hub, state):
     if sys.platform == "win32":
         option = socket.SO_EXCLUSIVEADDRUSE
         assert listening.getsockopt(socket.SOL_SOCKET, option) != 0
-    else:
         assert listening.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 0
+    else:
+        assert listening.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
         reuse_port = getattr(socket, "SO_REUSEPORT", None)
         if reuse_port is not None:
             assert listening.getsockopt(socket.SOL_SOCKET, reuse_port) == 0
+
+
+def test_port_rebinds_right_after_shutdown(state, chrome_origin):
+    first = _started(AttachTransport(state))
+    try:
+        with _worker(first, state, chrome_origin) as worker:
+            worker.handshake()
+            assert first.wait_for_connection(5)
+            # The server closes the accepted connection first, so that side
+            # of it lingers on the hub port (TIME_WAIT on Linux).
+            first.shutdown()
+            worker.expect_close(1001)
+    finally:
+        first.shutdown()
+    if sys.platform.startswith("linux"):
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as plain,
+            pytest.raises(OSError),
+        ):
+            plain.bind(("127.0.0.1", state["port"]))
+    second = _started(AttachTransport(state))
+    try:
+        assert second.actual_port == state["port"]
+        with _worker(second, state, chrome_origin) as worker:
+            worker.handshake()
+    finally:
+        second.shutdown()
 
 
 # -- build artifacts carrying the enrollment secret ----------------------------

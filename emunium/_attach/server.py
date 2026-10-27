@@ -192,11 +192,14 @@ class AttachTransport(Transport):
         return True
 
     def _listen_socket(self) -> socket.socket:
-        """127.0.0.1 only, never shared: no other process can bind or shadow the port."""
+        """127.0.0.1 only, never shared: no other socket can bind or shadow the port."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             if sys.platform == "win32":
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                # Rebinds over TIME_WAIT yet refuses a listening port (no SO_REUSEPORT).
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((LOOPBACK, self.port))
             sock.listen(LISTEN_BACKLOG)
             sock.setblocking(False)
