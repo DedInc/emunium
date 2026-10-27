@@ -86,12 +86,8 @@ exclude = ["emunium/_attach", "emunium/__main__.py", "tests/test_build.py"]
 
 [tool.ruff]
 target-version = "py310"
-extend-exclude = ["tools", ".agents", ".claude", ".spike", ".build-check"]
-
-[tool.ruff.format]
-# ruff also formats code blocks in Markdown; README.md and docs/ are prose
-# owned elsewhere, so the formatter covers Python sources only.
-exclude = ["*.md"]
+# pre-audit.md: the maintainer's untracked audit notes, not project docs.
+extend-exclude = ["tools", ".agents", ".claude", ".spike", ".build-check", "pre-audit.md"]
 
 [tool.ty.environment]
 python = ".venv"

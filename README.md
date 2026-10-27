@@ -102,7 +102,8 @@ with Browser() as browser:
     print(info.url, info.tab_id)  # a result record: the reply dict, plus attributes
 
     expect(browser).to_have_title("Example Domain")  # retries until it holds
-    link = browser.get_by_role("link").first  # a live locator: queried again on every call
+    # A live locator: queried again on every call.
+    link = browser.get_by_role("link").first
     print(link.text())
 
     with browser.expect_navigation("*iana.org*") as nav:
@@ -215,8 +216,8 @@ Properties: `browser.url`, `browser.title`, `browser.bridge`.
 ```python
 result = browser.goto("https://example.com", timeout=30.0, wait_until="load")
 # -> PageInfo {"url": ..., "title": ..., "tabId": ..., "contentReady": ...}
-result["tabId"]   # dict access, as before
-result.tab_id     # the same value as a typed attribute
+result["tabId"]  # dict access, as before
+result.tab_id  # the same value as a typed attribute
 ```
 
 Results of `goto`, `page_info`, `tab_info`, `tabs`, `wait_for_response`,
@@ -255,7 +256,7 @@ transient error of a document swap is retried; any other error propagates.
 browser.page_info()  # PageInfo: url, title, readyState, scrollX, scrollY, scrollWidth, scrollHeight, geometry
 browser.page_info().ready_state  # also .url, .title, .scroll_x, .scroll_y, .scroll_width, .scroll_height
 browser.scroll_to(element_or_selector)  # scroll the element into view
-browser.scroll_to(x, y)                 # scroll the page to absolute CSS pixel coords
+browser.scroll_to(x, y)  # scroll the page to absolute CSS pixel coords
 ```
 
 ---
@@ -280,8 +281,8 @@ when nothing matched in time; see [Errors](#errors) for its message and hint.
 ```python
 browser.wait(
     selector,
-    strategy=None,          # WaitStrategy or None
-    condition=None,         # Wait builder (or its payload list)
+    strategy=None,  # WaitStrategy or None
+    condition=None,  # Wait builder (or its payload list)
     timeout=10.0,
     raise_on_timeout=True,  # False: return None instead of raising TimeoutError
 )
@@ -355,7 +356,9 @@ browser.wait("body", condition=done, timeout=15)
 
 enabled = ~Wait().has_attribute("disabled")
 browser.wait("#submit", condition=Wait().visible() & enabled)
-browser.wait_for_text("Saved", strategy=WaitStrategy.VISIBLE, condition=~Wait().hidden())
+browser.wait_for_text(
+    "Saved", strategy=WaitStrategy.VISIBLE, condition=~Wait().hidden()
+)
 ```
 
 The extension checks the conditions on the first element the selector
@@ -367,8 +370,8 @@ matches, in document order.
 import re
 
 browser.wait_for_url("*/dashboard*", timeout=30.0, wait_until="load")  # -> the URL
-browser.wait_for_url(re.compile(r"/orders/\d+$"))     # re.Pattern: search()
-browser.wait_for_url(lambda url: "#done" in url)      # any predicate
+browser.wait_for_url(re.compile(r"/orders/\d+$"))  # re.Pattern: search()
+browser.wait_for_url(lambda url: "#done" in url)  # any predicate
 ```
 
 `wait_for_url` polls the pinned tab's URL every 100 ms until it matches, then
@@ -384,7 +387,7 @@ last URL seen and, if the URL matched, the last load state seen.
 ```python
 with browser.expect_navigation() as navigation:
     browser.click("a.next-page")
-print(navigation.value.url, navigation.value.title)   # PageInfo of the new page
+print(navigation.value.url, navigation.value.title)  # PageInfo of the new page
 
 with browser.expect_navigation("*/checkout", timeout=15):
     browser.click("#buy")
@@ -412,8 +415,9 @@ browser.wait(".loading-spinner", condition=Wait().detached(), timeout=20)  # -> 
 ### Soft waits
 
 ```python
-promo = browser.wait(".promo-modal", condition=Wait().visible(),
-                     timeout=3.0, raise_on_timeout=False)
+promo = browser.wait(
+    ".promo-modal", condition=Wait().visible(), timeout=3.0, raise_on_timeout=False
+)
 if promo:
     promo.click()
 ```
@@ -428,10 +432,10 @@ A soft wait that times out and a satisfied element-less wait (such as
 `Element` handles are returned by query and wait methods.
 
 ```python
-browser.query_selector(selector)        # -> Element | None
-browser.query_selector_all(selector)    # -> list[Element]
+browser.query_selector(selector)  # -> Element | None
+browser.query_selector_all(selector)  # -> list[Element]
 browser.get_by_text(text, exact=False)  # -> list[Element] (deepest matches only)
-browser.get_all_interactive()           # -> list[Element]
+browser.get_all_interactive()  # -> list[Element]
 ```
 
 Properties: `element_id`, `tag`, `text`, `attrs`, `rect` (CSS px, viewport
@@ -444,15 +448,21 @@ element.double_click(human=True)
 element.right_click(human=True)
 element.middle_click(human=True)
 element.hover(offset_x=None, offset_y=None, human=True)
-element.move_to(offset_x=None, offset_y=None, human=True)   # same as hover
-element.type(text, characters_per_minute=None, offset=None, human=True,
-             click_type=ClickType.LEFT, settle=True)
+element.move_to(offset_x=None, offset_y=None, human=True)  # same as hover
+element.type(
+    text,
+    characters_per_minute=None,
+    offset=None,
+    human=True,
+    click_type=ClickType.LEFT,
+    settle=True,
+)
 element.drag_to(target_element, human=True)
 element.scroll_into_view()
 element.focus()
 element.get_attribute(name)
 element.get_computed_style(prop)
-element.inner_text()            # full rendered text; element.text is a 500-char preview
+element.inner_text()  # full rendered text; element.text is a 500-char preview
 element.refresh(requery=True)
 ```
 
@@ -496,14 +506,14 @@ with Browser() as browser:
 Building locators:
 
 ```python
-browser.locator("button.save")         # CSS ("css=..." works too)
-browser.locator("//table//tr")          # XPath: "//", "(//" or "xpath=..."
-browser.locator("text=Sign in")         # deepest elements containing the text
+browser.locator("button.save")  # CSS ("css=..." works too)
+browser.locator("//table//tr")  # XPath: "//", "(//" or "xpath=..."
+browser.locator("text=Sign in")  # deepest elements containing the text
 browser.get_by_role("button", name="Save", exact=False)
 browser.get_by_label("Email address", exact=False)
 browser.get_by_placeholder("Search", exact=False)
-browser.get_by_test_id("submit")        # data-testid
-Browser.test_id_attribute = "data-qa"   # or set it on one browser instance
+browser.get_by_test_id("submit")  # data-testid
+Browser.test_id_attribute = "data-qa"  # or set it on one browser instance
 ```
 
 - Roles are the implicit roles of `PageParser` (`button`, `link`, `heading`,
@@ -534,13 +544,13 @@ Refining and resolving:
 
 ```python
 rows = browser.locator("tr").filter(has_text="paid", visible=True)
-rows.first, rows.last, rows.nth(2)     # new locators, nothing is queried yet
+rows.first, rows.last, rows.nth(2)  # new locators, nothing is queried yet
 
-rows.element(timeout=10)               # waits for presence, returns an Element
-rows.all()                             # list[Element], no wait
-rows.count(), rows.exists(), rows.is_visible()   # no wait
-rows.wait_for("visible")               # also "attached", "hidden", "detached"
-rows.first.text()                      # waits for presence; the full text
+rows.element(timeout=10)  # waits for presence, returns an Element
+rows.all()  # list[Element], no wait
+rows.count(), rows.exists(), rows.is_visible()  # no wait
+rows.wait_for("visible")  # also "attached", "hidden", "detached"
+rows.first.text()  # waits for presence; the full text
 rows.first.get_attribute("data-id")
 ```
 
@@ -589,18 +599,18 @@ is retried with the time left; running out of time is always an
 `ExpectationError`, chained from the last navigation error if there was one.
 
 ```python
-expect(locator, timeout=5.0).to_be_visible()      # .to_be_hidden()
-expect(locator).to_be_attached()                   # .to_be_detached()
-expect(locator).to_have_text("Saved")              # whole text, whitespace collapsed
+expect(locator, timeout=5.0).to_be_visible()  # .to_be_hidden()
+expect(locator).to_be_attached()  # .to_be_detached()
+expect(locator).to_have_text("Saved")  # whole text, whitespace collapsed
 expect(locator).to_have_text("saved", ignore_case=True)
 expect(locator).to_have_text("Saved", exact=True)  # whole text exactly as rendered
-expect(locator).to_have_text(re.compile(r"^\d+ items$"))   # re.search
-expect(locator).to_contain_text("Sav")             # substring
+expect(locator).to_have_text(re.compile(r"^\d+ items$"))  # re.search
+expect(locator).to_contain_text("Sav")  # substring
 expect(locator).to_contain_text("sav", ignore_case=True)
-expect(locator).to_have_attribute("aria-busy", "false")    # or just the name
+expect(locator).to_have_attribute("aria-busy", "false")  # or just the name
 expect(locator).to_have_count(3)
-expect(browser).to_have_url("*/checkout")          # glob, re.Pattern or callable
-expect(browser).to_have_title("Checkout")          # or a re.Pattern; ignore_case=
+expect(browser).to_have_url("*/checkout")  # glob, re.Pattern or callable
+expect(browser).to_have_title("Checkout")  # or a re.Pattern; ignore_case=
 ```
 
 - `to_have_text`, `to_contain_text` and `to_have_title` are case-sensitive;
@@ -635,9 +645,9 @@ expect(browser).to_have_title("Checkout")          # or a re.Pattern; ignore_cas
 browser.click(selector, human=True, click_type=ClickType.LEFT, timeout=10.0)
 browser.click_at(target, click_type=ClickType.LEFT, human=True, timeout=10.0)
 browser.move_to(target, offset_x=None, offset_y=None, human=True, timeout=10.0)
-browser.hover(target, ...)                      # same as move_to
+browser.hover(target, ...)  # same as move_to
 browser.drag_and_drop(source, target, human=True, timeout=10.0)
-browser.get_center(target)                      # -> Point {"x": int, "y": int}; also .x, .y
+browser.get_center(target)  # -> Point {"x": int, "y": int}; also .x, .y
 ```
 
 `target` is a CSS selector or an `Element`. A selector is resolved with
@@ -658,7 +668,9 @@ sent to cancel the drag, and only then is the button released.
 ### Keyboard
 
 ```python
-browser.type(selector, text, characters_per_minute=None, offset=None, human=True, timeout=10.0)
+browser.type(
+    selector, text, characters_per_minute=None, offset=None, human=True, timeout=10.0
+)
 browser.type_at(target, text, ..., click_type=ClickType.LEFT)
 ```
 
@@ -724,9 +736,10 @@ avoids bot detection.
 ```python
 from emunium import Browser, Emunium, SigmaDriftPlanner, WindMousePlanner
 
-browser = Browser(motion="careful")                        # preset of the default planner
+browser = Browser(motion="careful")  # preset of the default planner
 browser = Browser(motion=WindMousePlanner.preset("brisk"))
-emu = Emunium(motion=SigmaDriftPlanner(sample_hz=250.0))  # standalone mode takes the same argument
+# Standalone mode takes the same argument.
+emu = Emunium(motion=SigmaDriftPlanner(sample_hz=250.0))
 ```
 
 `motion=` (on `Browser` and `Emunium`) is `None` (the `natural` preset of
@@ -791,9 +804,15 @@ from emunium import Browser, MotionStep, ScreenBounds
 class StraightPlanner:
     """Twenty evenly spaced steps over 0.3 seconds."""
 
-    def plan(self, start: tuple[int, int], end: tuple[int, int], *,
-             target_size: float, rng: random.Random,
-             bounds: ScreenBounds | None = None) -> list[MotionStep]:
+    def plan(
+        self,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        *,
+        target_size: float,
+        rng: random.Random,
+        bounds: ScreenBounds | None = None,
+    ) -> list[MotionStep]:
         steps = []
         for i in range(1, 21):
             t = i / 20
@@ -875,14 +894,15 @@ tab opened by `new_tab()`, a tab chosen with `switch_to_tab()`, and the active
 tab after the pinned tab is closed.
 
 ```python
-info = browser.new_tab("https://example.com")              # opens, activates and pins it
-bg = browser.new_tab("https://example.org", switch=False)  # opens in the background, pin unchanged
-browser.tabs()               # -> [TabInfo {"tabId", "url", "title", "active", "windowId"}, ...]
+info = browser.new_tab("https://example.com")  # opens, activates and pins it
+# Opens in the background; the pin is unchanged.
+bg = browser.new_tab("https://example.org", switch=False)
+browser.tabs()  # -> [TabInfo {"tabId", "url", "title", "active", "windowId"}, ...]
 browser.switch_to_tab(bg["tabId"])  # activates the tab, focuses its window, pins it
-browser.switch_to_tab(bg.tab_id)    # the same, through the record attribute
-browser.tab_info()           # pinned tab: TabInfo {"tabId", "url", "title", "status", "active", "windowId"}
-browser.close_tab()          # closes the pinned tab, then pins the active tab
-browser.close_tab(tab_id)    # closes a specific tab
+browser.switch_to_tab(bg.tab_id)  # the same, through the record attribute
+browser.tab_info()  # pinned tab: TabInfo {"tabId", "url", "title", "status", "active", "windowId"}
+browser.close_tab()  # closes the pinned tab, then pins the active tab
+browser.close_tab(tab_id)  # closes a specific tab
 ```
 
 `switch_to_tab` requires an `int` tab id (`InvalidArgumentError` otherwise). A
@@ -1110,7 +1130,7 @@ With OCR (EasyOCR is initialized in the constructor, so a missing model or
 package fails here rather than at the first search):
 
 ```python
-emu = Emunium(ocr_enabled=True, use_gpu=True, langs=["en"])   # ocr=True is an alias
+emu = Emunium(ocr_enabled=True, use_gpu=True, langs=["en"])  # ocr=True is an alias
 hits = emu.find_text_elements("Sign in", min_confidence=0.8)
 if hits:
     emu.click_at(hits[0])
