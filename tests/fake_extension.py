@@ -251,27 +251,30 @@ class FakeExtension:
             return
         self._ws = ws
         self._connected.set()
-        try:
-            if self.send_hello:
-                self.send_raw(self._hello())
-            for message in ws:
-                self._dispatch(message)
-            # Iteration ends quietly on a 1000/1001 close; the sans-I/O protocol
-            # object holds the close frame details.
-            self._record_close(ws.protocol.close_code, ws.protocol.close_reason)
-        except ConnectionClosed as exc:
-            frame = exc.rcvd or exc.sent
-            if frame is None:
+        # A connection used outside ``with`` is deprecated from websockets 17.1;
+        # entering it also closes the socket however the reader ends.
+        with ws:
+            try:
+                if self.send_hello:
+                    self.send_raw(self._hello())
+                for message in ws:
+                    self._dispatch(message)
+                # Iteration ends quietly on a 1000/1001 close; the sans-I/O
+                # protocol object holds the close frame details.
+                self._record_close(ws.protocol.close_code, ws.protocol.close_reason)
+            except ConnectionClosed as exc:
+                frame = exc.rcvd or exc.sent
+                if frame is None:
+                    self._record_close(1006, "")
+                else:
+                    self._record_close(frame.code, frame.reason)
+            except Exception as exc:  # surfaced through handler_errors
+                logger.debug("FakeExtension reader failed", exc_info=True)
+                with self._lock:
+                    self.handler_errors.append(exc)
                 self._record_close(1006, "")
-            else:
-                self._record_close(frame.code, frame.reason)
-        except Exception as exc:  # surfaced through handler_errors
-            logger.debug("FakeExtension reader failed", exc_info=True)
-            with self._lock:
-                self.handler_errors.append(exc)
-            self._record_close(1006, "")
-        finally:
-            self._closed.set()
+            finally:
+                self._closed.set()
 
     def _record_close(self, code: int | None, reason: str | None) -> None:
         if self.closed_code is None:
