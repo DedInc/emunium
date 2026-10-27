@@ -9,6 +9,9 @@
   it locally; the suite never downloads anything).
 - ``make_browser``: launches ``Browser`` instances and closes every one of them
   when the test ends, whatever the outcome.
+- ``browser_name``: parametrizes any test that asks for it over the browser
+  matrix (every discoverable browser name plus ``cft``); ``--browsers a,b``
+  narrows it.
 
 Every test module here sets ``pytestmark = pytest.mark.e2e``, so the root
 conftest skips it unless ``--e2e`` or ``EMUNIUM_E2E=1`` is given, and its input
@@ -37,6 +40,52 @@ ROOT_CONFTEST = Path(__file__).resolve().parent.parent / "conftest.py"
 MAX_DELAY_MS = 10_000
 
 logger = logging.getLogger("emunium.e2e")
+
+# Chrome for Testing; the other matrix names come from discovery.BROWSER_ORDER.
+CFT_BROWSER = "cft"
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--browsers",
+        default=None,
+        help=(
+            "comma-separated browser names the e2e browser matrix runs on"
+            " (chrome, edge, brave, chromium, firefox, cft); default: all,"
+            " each skipped when not installed"
+        ),
+    )
+
+
+def matrix_browsers() -> tuple[str, ...]:
+    """Every browser name the matrix knows, in discovery order, then ``cft``."""
+    from emunium._browser.discovery import BROWSER_ORDER
+
+    return (*BROWSER_ORDER, CFT_BROWSER)
+
+
+def selected_browsers(config: pytest.Config) -> list[str]:
+    """The matrix narrowed by ``--browsers``; unknown names are a usage error."""
+    known = matrix_browsers()
+    # getoption with a default: this conftest may register its options late
+    # (pytest run on the repository root), after the command line was parsed.
+    raw = config.getoption("browsers", default=None)
+    if not raw:
+        return list(known)
+    wanted = [name.strip().lower() for name in str(raw).split(",") if name.strip()]
+    unknown = sorted(set(wanted) - set(known))
+    if unknown:
+        raise pytest.UsageError(
+            f"--browsers: unknown browser name(s) {', '.join(unknown)};"
+            f" choose from {', '.join(known)}"
+        )
+    return [name for name in known if name in wanted]
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    if "browser_name" in metafunc.fixturenames:
+        names = selected_browsers(metafunc.config)
+        metafunc.parametrize("browser_name", names, ids=names)
 
 
 def pytest_configure(config: pytest.Config) -> None:
