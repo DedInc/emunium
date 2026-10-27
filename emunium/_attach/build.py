@@ -26,6 +26,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Union
 
+from emunium._browser.extension_targets import FIREFOX_GECKO_ID, TARGETS, materialize
 from emunium._browser.launcher import (
     EXTENSION_COPY_IGNORE,
     EXTENSION_SOURCE_DIR,
@@ -41,6 +42,7 @@ HUB_FILE = "hub.json"
 ATTACH_FILE = "attach.json"
 MANIFEST_FILE = "manifest.json"
 ARTIFACT_NAME = "emunium-extension"
+FIREFOX_ARTIFACT_NAME = "emunium-extension-firefox"
 LOOPBACK = "127.0.0.1"
 
 RSA_KEY_BITS = 2048
@@ -164,12 +166,23 @@ def build_extension(
     *,
     port: int | None = None,
     state: dict[str, Any] | None = None,
+    target: str = "chromium",
 ) -> dict[str, Any]:
     """Write the unpacked folder, root-level zip and signed CRX3 into ``out_dir``.
+
+    ``target="firefox"`` writes ``emunium-extension-firefox/`` and a root-level
+    ``.xpi`` instead: no manifest ``key`` and no CRX (Firefox ids come from the
+    manifest's ``browser_specific_settings.gecko.id``).
 
     An explicit ``port`` that differs from the stored one is persisted to
     ``hub.json`` so the hub and the built ``attach.json`` agree on the port.
     """
+    if target not in TARGETS:
+        raise ValueError(
+            "unknown extension target {!r}; expected one of {}".format(
+                target, ", ".join(TARGETS)
+            )
+        )
     if state is None:
         state = load_or_create_state() if port is None else load_or_create_state(port)
     if port is not None and _validate_port(port) != state["port"]:
@@ -179,37 +192,38 @@ def build_extension(
     if not isinstance(enrollment, str) or not ENROLLMENT_RE.fullmatch(enrollment):
         raise ExtensionBuildError("state carries no valid enrollment secret")
 
+    attach = {
+        "protocol": PROTOCOL_VERSION,
+        "mode": "attach",
+        "hubUrl": f"ws://{LOOPBACK}:{hub_port:d}",
+        "enrollment": enrollment,
+    }
+    out = Path(out_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    if target == "firefox":
+        unpacked = out / FIREFOX_ARTIFACT_NAME
+        xpi_path = out / (FIREFOX_ARTIFACT_NAME + ".xpi")
+        _stage(target, unpacked, attach, public_der=None)
+        _write_atomic(xpi_path, _zip_tree(unpacked))
+        return {
+            "extension_id": FIREFOX_GECKO_ID,
+            "unpacked_dir": str(unpacked),
+            "xpi_path": str(xpi_path),
+            "port": hub_port,
+            "hub_url": attach["hubUrl"],
+            "state_dir": state["state_dir"],
+        }
+
     private_key = _load_private_key(Path(state["key_path"]))
     public_der = _public_der(private_key)
     ext_id = extension_id(public_der)
 
-    out = Path(out_dir).expanduser().resolve()
-    out.mkdir(parents=True, exist_ok=True)
     unpacked = out / ARTIFACT_NAME
     zip_path = out / (ARTIFACT_NAME + ".zip")
     crx_path = out / (ARTIFACT_NAME + ".crx")
 
-    _remove_path(unpacked)
-    shutil.copytree(
-        EXTENSION_SOURCE_DIR,
-        str(unpacked),
-        ignore=shutil.ignore_patterns(*EXTENSION_COPY_IGNORE),
-    )
-    try:
-        _verify_clean(unpacked)
-        _write_manifest_key(unpacked / MANIFEST_FILE, public_der)
-        attach = {
-            "protocol": PROTOCOL_VERSION,
-            "mode": "attach",
-            "hubUrl": f"ws://{LOOPBACK}:{hub_port:d}",
-            "enrollment": enrollment,
-        }
-        (unpacked / ATTACH_FILE).write_bytes(_dump_json(attach))
-        _verify_clean(unpacked)
-    except BaseException:
-        # Never leave a half-built (or session-carrying) folder that could be installed.
-        shutil.rmtree(str(unpacked), ignore_errors=True)
-        raise
+    _stage(target, unpacked, attach, public_der=public_der)
 
     zip_bytes = _zip_tree(unpacked)
     _write_atomic(zip_path, zip_bytes)
@@ -324,6 +338,29 @@ def _pb_field(field_number: int, payload: bytes) -> bytes:
 
 
 # --- build tree --------------------------------------------------------------
+
+
+def _stage(
+    target: str, unpacked: Path, attach: dict[str, Any], public_der: bytes | None
+) -> None:
+    """Materialize ``target`` into ``unpacked`` with ``attach.json`` (and the key, if given)."""
+    _remove_path(unpacked)
+    try:
+        materialize(
+            target,
+            unpacked,
+            source_dir=EXTENSION_SOURCE_DIR,
+            ignore=EXTENSION_COPY_IGNORE,
+        )
+        _verify_clean(unpacked)
+        if public_der is not None:
+            _write_manifest_key(unpacked / MANIFEST_FILE, public_der)
+        (unpacked / ATTACH_FILE).write_bytes(_dump_json(attach))
+        _verify_clean(unpacked)
+    except BaseException:
+        # Never leave a half-built (or session-carrying) folder that could be installed.
+        shutil.rmtree(str(unpacked), ignore_errors=True)
+        raise
 
 
 def _verify_clean(root: Path) -> None:
