@@ -1,0 +1,145 @@
+# docs/ci/ci.yml
+# CI for emunium: unit tests (Python + JS) on Windows, Linux and macOS, lint,
+# the Linux e2e suite in Docker (Xvfb + openbox + Chromium) and the DOM e2e
+# suite headless on macOS.
+#
+# .github/ is a protected path for the agents working on this repository, so
+# this file lives here. To enable it, copy it by hand to
+# .github/workflows/ci.yml. No secrets are read and nothing is published.
+#
+# Actions are pinned to full commit SHAs; the comment carries the tag.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "stability/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package and test dependencies
+        # Same set as tests/docker/Dockerfile, plus selectolax for the
+        # PageParser tests (they importorskip it otherwise).
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[standalone,parsing]" "pytest>=8"
+      - name: Python unit tests
+        # e2e tests are skipped without --e2e; the input safety net is armed.
+        run: python -m pytest -q tests
+      # The JS suites do not depend on the Python version: once per OS.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: matrix.python-version == '3.12'
+        with:
+          node-version: "22"
+      - name: JS unit tests
+        if: matrix.python-version == '3.12'
+        # bash expands the glob on every runner, Windows included.
+        shell: bash
+        run: |
+          node --test tests/js/*.test.js
+          node tests/js/harness.js --self-test
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install tools and dependencies
+        # A project-root .venv is what ty discovers on its own, so it resolves
+        # the third-party imports without extra flags.
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -e ".[standalone,parsing]" "pytest>=8" "ruff==0.17.2" "ty==0.0.52"
+      - name: ruff check
+        run: .venv/bin/ruff check .
+      - name: ruff format --check
+        if: ${{ !cancelled() }}
+        run: .venv/bin/ruff format --check .
+      - name: ty check
+        if: ${{ !cancelled() }}
+        run: .venv/bin/ty check
+
+  e2e-linux:
+    name: e2e (linux, docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Unit and e2e suites in the Linux test container
+        # The script builds tests/docker/Dockerfile and runs both suites under
+        # Xvfb; --timeout bounds the container run (the build is unbounded,
+        # the job timeout covers it).
+        run: >-
+          python tests/docker/run_linux.py
+          --timeout 1800
+          --tail 120
+          --log "$RUNNER_TEMP/emunium-linux-tests.log"
+      - name: Upload container log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: emunium-linux-tests-log
+          path: ${{ runner.temp }}/emunium-linux-tests.log
+          retention-days: 14
+          if-no-files-found: warn
+
+  e2e-macos-dom:
+    name: e2e (macos, DOM, headless)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . "pytest>=8"
+      - name: Install Chrome for Testing
+        # The suite's chrome_path fixture calls ensure_chrome(); installing it
+        # here, in its own step, keeps a download failure apart from a test
+        # failure. Chrome for Testing (not branded Chrome) still loads the
+        # unpacked bridge extension.
+        run: python -c "from emunium import ensure_chrome; print(ensure_chrome())"
+      - name: DOM e2e suite (headless, no OS input)
+        run: python -m pytest -q --e2e tests/e2e/test_dom_e2e.py
