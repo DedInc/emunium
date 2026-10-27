@@ -30,6 +30,7 @@ matching and OCR.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Browser mode](#browser-mode)
+- [Browsers](#browsers)
 - [Navigation](#navigation)
 - [Waiting](#waiting)
 - [Element API](#element-api)
@@ -87,8 +88,9 @@ Optional extras:
 pip install "emunium[standalone,parsing]"
 ```
 
-Chrome for Testing is downloaded on first launch (see [ensure_chrome](#ensure_chrome))
-unless you point emunium at a binary.
+emunium launches an installed Chrome, Edge, Brave or Chromium; when none is
+installed, Chrome for Testing is downloaded on first launch (see
+[Browsers](#browsers)).
 
 ---
 
@@ -175,17 +177,17 @@ Browser(
     bridge_port=0,         # 0 = OS-assigned port on 127.0.0.1
     bridge_timeout=60.0,   # seconds to wait for the extension to connect
     *,
-    chrome_path=None,      # Chrome/Chromium binary; see below
-    extra_args=None,       # list[str] of extra Chrome command-line flags
+    browser=None,          # "chrome", "edge", "brave", "chromium", "firefox", "cft", "auto" or a path
+    chrome_path=None,      # browser binary, used when browser is None
+    extra_args=None,       # list[str] of extra browser command-line flags
     verify_input=True,     # verify the cursor position before every click
     motion=None,           # pointer planner: "natural" (None), "careful", "brisk" or a MotionPlanner
     typing=None,           # typing rhythm: "natural" (None), "careful", "brisk" or a TypingRhythm
 )
 ```
 
-- `chrome_path` selects the browser binary. Without it, the `EMUNIUM_CHROME_PATH`
-  environment variable is used, and without that, Chrome for Testing is
-  downloaded. A path that does not exist raises `LaunchError`.
+- `browser` and `chrome_path` select the browser; see [Browsers](#browsers). A
+  path that does not exist raises `LaunchError`.
 - `extra_args` must be a list of strings; a single string raises `LaunchError`
   instead of being split.
 - `verify_input=False` skips the pointer check described in
@@ -207,7 +209,57 @@ window again before sending input. On a headed Windows browser, `close()` first
 closes the tabs through the extension (up to one second), so Chrome exits on its
 own before the process tree is terminated.
 
-Properties: `browser.url`, `browser.title`, `browser.bridge`.
+Properties: `browser.url`, `browser.title`, `browser.bridge`,
+`browser.browser_name`.
+
+---
+
+## Browsers
+
+```python
+from emunium import Browser
+
+with Browser(browser="firefox", headless=True) as browser:
+    browser.goto("https://example.com/")
+    print(browser.browser_name)  # "firefox"
+```
+
+`browser=` chooses what `launch()` starts:
+
+| Value | Starts |
+|---|---|
+| `"chrome"`, `"edge"`, `"brave"`, `"chromium"`, `"firefox"` | that installed browser; `LaunchError` listing the searched locations when it is not installed |
+| `"cft"` | Chrome for Testing, downloaded on first use (see [ensure_chrome](#ensure_chrome)) |
+| `"auto"` | the first installed of Chrome, Edge, Brave and Chromium, in that order; Chrome for Testing when none is installed |
+| a path | that executable |
+
+Without `browser`, emunium uses `chrome_path`, then the `EMUNIUM_CHROME_PATH`
+environment variable, then `"auto"`. Firefox is never picked automatically;
+ask for it by name or path. Installed browsers are looked up in Program Files,
+Program Files (x86), LocalAppData and the App Paths registry key on Windows, in
+`/Applications` and `~/Applications` on macOS, and on `PATH` on Linux.
+
+Each browser gets the session's extension copy in its own way:
+
+| Browser | How the extension is installed |
+|---|---|
+| Edge, Brave, Chromium, Chrome for Testing | `--load-extension` |
+| Google Chrome | Chrome ignores `--load-extension` since version 137, so emunium starts it with `--remote-debugging-pipe --enable-unsafe-extension-debugging` and installs the extension over that private pipe (`Extensions.loadUnpacked`). The pipe stays open for the session; closing it ends Chrome. |
+| Firefox | started with `--remote-debugging-port=0`; the extension is installed through WebDriver BiDi `webExtension.install`. The install is temporary: it is gone when Firefox exits. |
+
+Firefox notes:
+
+- Firefox 128 or newer. Firefox gets its own build of the extension
+  (`background.scripts`, an explicit extension-page CSP, the gecko id
+  `bridge@emunium.dev`).
+- `userScripts` is an optional permission in Firefox, so the CSP-bypass retry
+  of `execute_script` (see [JavaScript execution](#javascript-execution)) is
+  unavailable there unless that permission is granted.
+- Headless Firefox runs with `-headless` instead of `--headless=new`.
+
+`browser.browser_name` is the browser the last `launch()` started: one of the
+names above, `"cft"`, or `"custom"` for a path emunium does not recognise;
+`None` before the first launch.
 
 ---
 
@@ -1077,7 +1129,8 @@ except NativeInputError as exc:
 
 ## Headless mode
 
-`Browser(headless=True)` starts Chrome with `--headless=new`. Navigation,
+`Browser(headless=True)` starts a Chromium browser with `--headless=new`
+(Firefox with `-headless`). Navigation,
 queries, waits, tabs, network waits and `execute_script` work. A headless
 browser has no window to send OS input to, so every native-input method
 (`click`, `click_at`, `type`, `type_at`, `move_to`, `hover`, `drag_and_drop`,
@@ -1094,7 +1147,8 @@ Every `Browser` gets its own session:
   session file holding the bridge port and a random token;
 - a WebSocket bridge on `127.0.0.1` (OS-assigned port by default). Every
   connection must present that token. Connections whose `Origin` header is not
-  `chrome-extension://...` (that is, web pages) are rejected; a connection
+  `chrome-extension://...` or `moz-extension://...` (that is, web pages) are
+  rejected; a connection
   without an `Origin` header is allowed but still needs the token. Only one
   connection is active at a time;
 - its own Chrome process (on Windows, the whole process tree is owned by a job
@@ -1207,16 +1261,16 @@ Returns `EMUNIUM_CHROME_PATH` when set (raising `LaunchError` if it points to a
 missing file); otherwise downloads the current stable Chrome for Testing build
 for the platform if it is not installed yet, and returns its path. Installation
 is atomic and safe against concurrent installers. `Browser.launch()` calls it
-when no `chrome_path` is given.
+for `browser="cft"`, and for the automatic choice when no supported browser is
+installed (see [Browsers](#browsers)).
 
 ---
 
 ## Limitations
 
-- **Chrome/Chromium only**, version 116 or newer. The bridge is a Manifest V3
-  extension loaded with `--load-extension`; branded Google Chrome builds from
-  version 137 ignore that flag, so use Chrome for Testing (the default) or
-  Chromium.
+- **Chromium browsers (version 116 or newer) and Firefox (128 or newer)
+  only.** See [Browsers](#browsers) for how the Manifest V3 extension is
+  installed into each.
 - **Top frame only.** Queries, waits and element actions do not reach into
   iframes.
 - **Native input needs a visible, focused window.** The browser window must be

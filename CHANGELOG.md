@@ -78,6 +78,11 @@ observe; they are listed first.
 - **Click-verification hint is generic.** The pointer probe does not report
   which element is under the cursor, so the hint of `ClickVerificationError`
   suggests an overlay or a moving element instead of naming it.
+- **Installed browsers are launched by default.** Without `browser=`,
+  `chrome_path` or `EMUNIUM_CHROME_PATH`, `launch()` starts the first installed
+  of Google Chrome, Edge, Brave and Chromium instead of downloading Chrome for
+  Testing; Chrome for Testing is downloaded only when none is installed.
+  `Browser(browser="cft")` keeps the previous behaviour.
 
 ### Added
 
@@ -192,6 +197,13 @@ observe; they are listed first.
   defaults).
 - README quick start built around `with Browser() as browser:`, locators,
   `expect`, `expect_navigation` / `wait_for_url` and result records.
+- Installed-browser support: `Browser(browser=...)` takes `"chrome"`,
+  `"edge"`, `"brave"`, `"chromium"`, `"firefox"`, `"cft"`, `"auto"` or an
+  executable path, and `Browser.browser_name` reports what was launched.
+  Google Chrome gets the extension over `--remote-debugging-pipe`
+  (`Extensions.loadUnpacked`), since it ignores `--load-extension` from
+  version 137; Firefox gets it through WebDriver BiDi `webExtension.install`
+  (a temporary install), with a Firefox build of the extension.
 
 ### Changed
 
