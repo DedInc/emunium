@@ -118,6 +118,29 @@ test("an empty or whitespace attach.json (Firefox 200 for a missing file) is abs
   }
 });
 
+test("an attach.json whose body read rejects (Firefox AbortError for a missing file) is absent: session.json is used", async (t) => {
+  const globals = {};
+  // Firefox 154 resolves the fetch of a missing packaged file `ok`, then rejects reading its body.
+  globals.fetch = async (input, init) => {
+    if (String(input).split(/[?#]/)[0].endsWith("/attach.json")) {
+      return {
+        ok: true,
+        status: 200,
+        url: String(input),
+        headers: { get: () => null },
+        text: () => Promise.reject(new DOMException("The operation was aborted.", "AbortError")),
+        json: () => Promise.reject(new DOMException("The operation was aborted.", "AbortError")),
+      };
+    }
+    return h.createFakeFetch(globals.chrome)(input, init);
+  };
+  const w = makeWorker(t, { files: { "session.json": SESSION }, globals });
+  const config = plain(await w.bg.loadConfig());
+  assert.ok(config, "config from session.json");
+  assert.equal(config.url, "ws://127.0.0.1:4321");
+  assert.equal(config.token, "tok-abc");
+});
+
 test("a non-empty unparsable attach.json is still present (invalid, retried, never bypassed)", async (t) => {
   const w = makeWorker(t, { files: { "session.json": SESSION, "attach.json": "{not json" } });
   assert.equal(await w.bg.loadConfig(), null);

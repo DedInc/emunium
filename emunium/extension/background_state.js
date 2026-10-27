@@ -101,7 +101,8 @@
   }
 
   // {present, data}: present is false when the packaged file does not exist (or cannot be read).
-  // Firefox answers a fetch of a missing packaged file with 200 and an empty body.
+  // Firefox answers a fetch of a missing packaged file with 200 and an empty body, or (Firefox 154)
+  // resolves it `ok` and rejects the body read with AbortError: both mean absent.
   async function readPackagedJson(name) {
     let response;
     try {
@@ -116,7 +117,7 @@
     try {
       text = await response.text();
     } catch {
-      return { present: true, data: null };
+      return { present: false, data: null };
     }
     if (typeof text !== "string" || text.trim() === "") {
       return { present: false, data: null };
