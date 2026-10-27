@@ -335,6 +335,65 @@ locators and native input work as after `launch()`.
   or no extension connects in time (the message names the build command, hub
   port and state dir); `ImportError` without `cryptography`.
 
+### Profiles started by another app
+
+The attach build works in any Chromium-based browser profile you control once
+the extension is installed in that profile, through the vendor's own extension
+feature or through developer mode → **Load unpacked**. If the vendor has
+port-scan protection, it must allow the hub port (47800 by default).
+
+Pass `start=False`: the vendor app starts that browser, not emunium, so
+`connect` only waits for the extension. `close()` detaches and leaves the
+profile running. Such a profile usually sends a Chrome user agent, so
+`browser_name` is `None` and the window is not brought to the foreground
+unless you pass `browser=`.
+
+Example with a Dolphin Anty profile, started and stopped through Dolphin's
+local API:
+
+```python
+import json
+import urllib.error
+import urllib.request
+
+from emunium import Browser
+
+DOLPHIN_API = "http://localhost:3001/v1.0/browser_profiles"
+PROFILE_ID = "123456789"
+
+
+def dolphin(action: str) -> dict:
+    """One call to the Dolphin Anty local API; returns its JSON answer."""
+    url = f"{DOLPHIN_API}/{PROFILE_ID}/{action}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()  # e.g. 409 with PROFILE_ALREADY_RUNNING in the JSON
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"Dolphin Anty API unreachable: {exc.reason}") from exc
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise SystemExit(f"Dolphin Anty {action}: not JSON: {body[:200]!r}") from None
+
+
+started = dolphin("start")
+if not started.get("success") and started.get("code") != "PROFILE_ALREADY_RUNNING":
+    raise SystemExit(f"Dolphin Anty start failed: {started}")
+try:
+    with Browser.connect(start=False, timeout=90) as browser:
+        browser.goto("https://example.com/")
+        print(browser.title)
+finally:
+    dolphin("stop")
+```
+
+The API paths and authentication follow Dolphin's local API documentation and
+can differ between versions. Whether an extension stays installed in a profile
+depends on the vendor's plan (Dolphin's free plan removes extensions added by
+hand); emunium does not manage that.
+
 ---
 
 ## Navigation
