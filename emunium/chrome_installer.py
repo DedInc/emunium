@@ -101,6 +101,17 @@ def _print_progress(downloaded: int, total_size: int) -> None:
         print()
 
 
+def installed_chrome() -> str | None:
+    """The Chrome binary ``ensure_chrome`` would return without installing, or
+    None. Reads only: no network, no lock, no marker write."""
+    override = os.environ.get(CHROME_PATH_ENV)
+    if override:
+        # ensure_chrome rejects a missing override rather than falling back.
+        return override if os.path.isfile(override) else None
+    exe = _chrome_executable(_install_dir(), _get_platform_tag())
+    return str(exe) if exe.is_file() else None
+
+
 def ensure_chrome() -> str:
     """Return a Chrome binary, installing Chrome for Testing if needed."""
     override = os.environ.get(CHROME_PATH_ENV)

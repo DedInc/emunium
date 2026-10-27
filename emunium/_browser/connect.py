@@ -30,6 +30,7 @@ from emunium._browser.launcher import (
     _validated_extra_args,
     resolve_browser,
 )
+from emunium.chrome_installer import installed_chrome
 from emunium.errors import BridgeError, EmuniumError, InvalidArgumentError, LaunchError
 
 logger = logging.getLogger("emunium.browser")
@@ -460,16 +461,22 @@ def _make_transport(
     return AttachTransport(state, port=port, install_id=install_id)
 
 
-def _no_download() -> str:
-    raise LaunchError("Chrome for Testing is not downloaded just to name the browser")
+def _installed_cft() -> str:
+    path = installed_chrome()
+    if path is None:
+        raise LaunchError(
+            "Chrome for Testing is not installed and is not downloaded just to"
+            " name the browser"
+        )
+    return path
 
 
 def _resolve(browser: str | None, download: bool) -> ResolvedBrowser:
     """``resolve_browser`` as ``launch()`` uses it; without ``download`` Chrome
-    for Testing is never fetched."""
+    for Testing is only found on disk, never fetched."""
     if download:
         return resolve_browser(browser)
-    return resolve_browser(browser, install_cft=_no_download)
+    return resolve_browser(browser, install_cft=_installed_cft)
 
 
 # -- helpers ----------------------------------------------------------------

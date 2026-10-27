@@ -14,9 +14,11 @@ from typing import Any
 
 import pytest
 
+from emunium import chrome_installer
 from emunium._bridge.transport import PINNED, Reply
 from emunium._browser import connect as connect_mod
 from emunium._browser import facade
+from emunium._browser import launcher as launcher_mod
 from emunium._browser.connect import (
     CREATE_NEW_PROCESS_GROUP,
     DETACHED_PROCESS,
@@ -235,6 +237,47 @@ def test_failed_name_resolution_leaves_resolved_none() -> None:
     connection = rig.connect(browser="brave")
     assert connection.resolved is None and rig.resolve_calls == [("brave", False)]
     assert connection.browser_name is None
+
+
+@pytest.fixture
+def cft_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """An empty Chrome for Testing install dir; any download attempt fails."""
+
+    def no_download(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Chrome for Testing download attempted")
+
+    monkeypatch.delenv(chrome_installer.CHROME_PATH_ENV, raising=False)
+    monkeypatch.setattr(chrome_installer, "_install_dir", lambda: tmp_path)
+    monkeypatch.setattr(chrome_installer, "_get_platform_tag", lambda: "win64")
+    monkeypatch.setattr(chrome_installer, "_install", no_download)
+    monkeypatch.setattr(launcher_mod, "ensure_chrome", no_download)
+    return tmp_path
+
+
+def test_downloaded_cft_is_named_without_a_download(cft_dir: Path) -> None:
+    exe = cft_dir / "chrome-win64" / "chrome.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"")
+    resolved = connect_mod._resolve_name_only("cft", connect_mod._resolve)
+    assert resolved is not None
+    assert (resolved.name, resolved.path) == ("cft", str(exe))
+    assert not (exe.parent / chrome_installer.MARKER_NAME).exists()
+
+
+def test_cft_override_is_named_without_a_download(
+    cft_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    override = cft_dir / "custom-chrome.exe"
+    override.write_bytes(b"")
+    monkeypatch.setenv(chrome_installer.CHROME_PATH_ENV, str(override))
+    resolved = connect_mod._resolve_name_only("cft", connect_mod._resolve)
+    assert resolved is not None
+    assert (resolved.name, resolved.path) == ("cft", str(override))
+
+
+def test_absent_cft_is_not_named(cft_dir: Path) -> None:
+    assert connect_mod._resolve_name_only("cft", connect_mod._resolve) is None
+    assert list(cft_dir.iterdir()) == []
 
 
 # -- connect(): spawn path --------------------------------------------------------
