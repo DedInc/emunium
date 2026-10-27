@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any
 
 from emunium._browser import dom, locators, page
 from emunium._browser import tabs as tab_ops
+from emunium._browser.connect import Connection
+from emunium._browser.connect import connect as connect_browser
 from emunium._browser.context import BrowserContext
 from emunium._browser.launcher import BrowserSession, close, launch
 from emunium._browser.locators import ElementLocator
@@ -26,7 +28,12 @@ from emunium._motion import MotionPlanner, TypingRhythm
 from emunium._standalone.config import ClickType
 from emunium.bridge import Bridge
 from emunium.element import Element
-from emunium.errors import ElementNotFoundError, InvalidArgumentError, NativeInputError
+from emunium.errors import (
+    ElementNotFoundError,
+    InvalidArgumentError,
+    LaunchError,
+    NativeInputError,
+)
 from emunium.results import NetworkResponse, PageInfo, Point, Record, TabInfo
 from emunium.wait import Wait, WaitStrategy
 
@@ -106,11 +113,114 @@ class Browser:
             motion=motion,
             typing=typing,
         )
+        # Set by connect(): the attach transport and a browser it may have started.
+        self._connection: Connection | None = None
+
+    @classmethod
+    def connect(
+        cls,
+        browser: str | None = None,
+        *,
+        user_data_dir: str | None = None,
+        profile_directory: str | None = None,
+        port: int | None = None,
+        install_id: str | None = None,
+        start: bool = True,
+        close_browser: bool = False,
+        timeout: float = 60.0,
+        extra_args: list[str] | None = None,
+        verify_input: bool = True,
+        motion: MotionPlanner | str | None = None,
+        typing: TypingRhythm | str | None = None,
+    ) -> Self:
+        """Drive a browser that has the attach build of the extension installed.
+
+        Install it once: ``python -m emunium extension build --out DIR``, then
+        load ``DIR/emunium-extension`` on the browser's extensions page with
+        developer mode on. ``connect`` serves the hub port and waits up to
+        5 s for that extension; if none connects and ``start`` is true it
+        starts ``browser`` (resolved as in ``launch()``) detached from this
+        process, without automation flags, and waits until ``timeout``.
+        Then the active tab is pinned. The session is headed: native input,
+        DOM and locators work as after ``launch()``.
+
+        Args:
+            browser: Browser to start when none is connected (see
+                ``Browser(browser=...)``); also names ``browser_name`` and
+                finds the window's process. With None and a browser that
+                was already connected, nothing is guessed: ``browser_name``
+                comes from the user agent and the window is not managed.
+            user_data_dir: Profile root to start the browser with (Chromium
+                ``--user-data-dir``, Firefox ``-profile``); None uses the
+                browser's default profile. Never deleted.
+            profile_directory: Chromium profile inside it, e.g. ``Profile 1``.
+            port: Hub port; None uses the stored one (the build's port).
+            install_id: Accept only this install (a UUID); None binds the
+                first install that completes the handshake.
+            start: Start the browser when no extension connects within 5 s.
+            close_browser: ``close()`` also stops a browser ``connect``
+                started; a browser that was already running always stays.
+            timeout: Seconds to wait for the extension overall.
+            extra_args: Extra command-line arguments for a started browser.
+            verify_input: Prove the cursor is over an element before a click.
+            motion: Human pointer planner, as for ``Browser()``.
+            typing: Human typing rhythm, as for ``Browser()``.
+
+        Returns:
+            A connected browser; ``close()`` detaches from it.
+
+        Raises:
+            InvalidArgumentError: ``install_id`` is not a UUID, or another
+                argument is malformed (before anything starts).
+            LaunchError: The hub port is held by another program, the browser
+                could not be started, or the extension did not connect in time.
+            ImportError: The optional ``cryptography`` package is missing
+                (``pip install emunium[hub]``).
+        """
+        # Built first: a bad motion or typing preset fails before any I/O.
+        instance = cls(verify_input=verify_input, motion=motion, typing=typing)
+        connection = connect_browser(
+            browser,
+            user_data_dir=user_data_dir,
+            profile_directory=profile_directory,
+            port=port,
+            install_id=install_id,
+            start=start,
+            close_browser=close_browser,
+            timeout=timeout,
+            extra_args=extra_args,
+        )
+        bridge = Bridge(transport=connection.transport)
+        instance._connection = connection
+        session = instance._session
+        session.bridge = bridge
+        session.browser = browser
+        session.user_data_dir = user_data_dir
+        session.resolved = connection.resolved
+        ctx = instance._ctx
+        ctx.bridge = bridge
+        try:
+            tab_ops.pin_active(ctx)
+        except BaseException:
+            try:
+                connection.close()
+            except Exception:
+                logger.exception("Cleanup after a failed connect raised")
+            raise
+        ctx.pid = connection.pid
+        try:
+            ctx.ensure_foreground(None)
+        except NativeInputError as exc:
+            logger.info("Browser window not brought to the foreground: %s", exc)
+        return instance
 
     def __repr__(self) -> str:
         # Cached state only: a repr never sends a request.
-        launched = self._session.process is not None
         port = self._ctx.bridge.actual_port
+        connection = self._connection
+        if connection is not None:
+            return f"Browser(connected={not connection.closed!r}, port={port!r})"
+        launched = self._session.process is not None
         return (
             f"Browser(headless={self._session.headless!r}, "
             f"launched={launched!r}, port={port!r})"
@@ -123,11 +233,17 @@ class Browser:
 
     @property
     def browser_name(self) -> str | None:
-        """Browser the last ``launch()`` resolved, None before the first launch.
+        """Browser the last ``launch()`` or ``connect()`` resolved, else None.
 
+        After ``connect()`` with ``browser=None`` and an already running
+        browser it is only what the extension's user agent proves (``edge``
+        or ``firefox``), else None: Chrome, Brave and Chromium look alike.
         One of ``chrome``, ``edge``, ``brave``, ``chromium``, ``firefox``,
         ``cft`` (Chrome for Testing) or ``custom`` (an unrecognised path).
         """
+        connection = self._connection
+        if connection is not None:
+            return connection.browser_name
         resolved = self._session.resolved
         return None if resolved is None else resolved.name
 
@@ -148,8 +264,10 @@ class Browser:
         Raises:
             LaunchError: Chrome or the extension bridge did not start (other
                 ``EmuniumError`` subclasses, e.g. from pinning the tab, pass
-                through unwrapped).
+                through unwrapped), or this browser came from ``connect()``.
         """
+        if self._connection is not None:
+            raise LaunchError("a Browser from Browser.connect() cannot launch()")
         launch(self._session, bridge_timeout=self._bridge_timeout)
         try:
             tab_ops.pin_active(self._ctx)
@@ -172,8 +290,14 @@ class Browser:
         """Stop Chrome and the bridge and remove the temporary session files.
 
         Safe to call more than once; a ``user_data_dir`` profile is kept.
+        After ``connect()`` it only detaches: the browser keeps running,
+        unless ``close_browser=True`` and ``connect()`` started it.
         """
         self._ctx.pid = None
+        connection = self._connection
+        if connection is not None:
+            connection.close()
+            return
         close(self._session)
 
     # -- navigation and lookups ---------------------------------------------
@@ -747,6 +871,9 @@ class Browser:
         return ResponseExpectation(self._ctx, url_pattern, timeout, any_tab=any_tab)
 
     def __enter__(self) -> Self:
+        # ``with Browser.connect() as browser:`` is already connected.
+        if self._connection is not None:
+            return self
         return self.launch()
 
     def __exit__(self, *exc: object) -> None:
