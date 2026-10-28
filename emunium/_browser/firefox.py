@@ -29,7 +29,7 @@ FIREFOX_RELEASE_XPI = (
     "{version}/emunium-extension-firefox.xpi"
 )
 
-# Browser startup preferences written to the Firefox profile's user.js.
+# Browser startup preferences written to user.js and Enterprise Policy defaults.
 USER_PREFS: dict[str, bool | str] = {
     # Set Firefox's WebDriver visibility preference to false by default.
     "dom.webdriver.enabled": False,
@@ -41,7 +41,9 @@ USER_PREFS: dict[str, bool | str] = {
     "startup.homepage_welcome_url": "",
     "startup.homepage_welcome_url.additional": "",
     "browser.startup.homepage_override.mstone": "ignore",
+    "browser.startup.firstrunSkipsHomepage": True,
     # No telemetry / data-reporting upload, and no data-policy notice tab.
+    "datareporting.policy.firstRunURL": "",
     "datareporting.policy.dataSubmissionEnabled": False,
     "datareporting.healthreport.uploadEnabled": False,
     "toolkit.telemetry.reportingpolicy.firstRun": False,
@@ -170,6 +172,14 @@ def write_firefox_policy(
             raise LaunchError(
                 f"Firefox policy file {policy_path} has a non-object 'policies' value"
             )
+        preferences = policies.setdefault("Preferences", {})
+        if not isinstance(preferences, dict):
+            raise LaunchError(
+                f"Firefox policy file {policy_path} has a non-object 'Preferences' value"
+            )
+        for name, value in USER_PREFS.items():
+            preferences.setdefault(name, {"Value": value, "Status": "default"})
+
         settings = policies.setdefault("ExtensionSettings", {})
         if not isinstance(settings, dict):
             raise LaunchError(

@@ -307,7 +307,11 @@ def test_chrome_args(env):
     for flag in (
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-default-apps",
         "--disable-popup-blocking",
+        "--disable-infobars",
+        "--disable-notifications",
+        "--disable-features=ChromeWhatsNewUI,AutofillServerCommunication,TranslateUI,OptimizationHints",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",

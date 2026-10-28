@@ -44,6 +44,8 @@ def test_write_user_prefs_defaults(tmp_path):
     assert prefs["browser.aboutwelcome.enabled"] is False
     assert prefs["startup.homepage_welcome_url"] == ""
     assert prefs["browser.startup.homepage_override.mstone"] == "ignore"
+    assert prefs["browser.startup.firstrunSkipsHomepage"] is True
+    assert prefs["datareporting.policy.firstRunURL"] == ""
     assert prefs["datareporting.policy.dataSubmissionEnabled"] is False
     assert prefs["datareporting.healthreport.uploadEnabled"] is False
     assert prefs["browser.sessionstore.resume_from_crash"] is False
@@ -119,6 +121,13 @@ def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
         "custom": {"keep": True},
         "policies": {
             "BlockAboutConfig": True,
+            "Preferences": {
+                "browser.aboutwelcome.enabled": {"Value": True, "Status": "locked"},
+                "browser.startup.homepage": {
+                    "Value": "https://example.test/",
+                    "Status": "locked",
+                },
+            },
             "ExtensionSettings": {
                 "*": {"installation_mode": "blocked"},
                 "another@example.com": {"installation_mode": "allowed"},
@@ -136,6 +145,16 @@ def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
     updated = json.loads(policy_path.read_text(encoding="utf-8"))
     assert updated["custom"] == original["custom"]
     assert updated["policies"]["BlockAboutConfig"] is True
+    preferences = updated["policies"]["Preferences"]
+    original_preferences = original["policies"]["Preferences"]
+    for name, value in firefox.USER_PREFS.items():
+        if name in original_preferences:
+            assert preferences[name] == original_preferences[name]
+        else:
+            assert preferences[name] == {"Value": value, "Status": "default"}
+    assert preferences["browser.startup.homepage"] == original_preferences[
+        "browser.startup.homepage"
+    ]
     settings = updated["policies"]["ExtensionSettings"]
     assert settings["*"] == original["policies"]["ExtensionSettings"]["*"]
     assert settings["another@example.com"] == original["policies"]["ExtensionSettings"][
@@ -153,6 +172,7 @@ def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
     [
         "{invalid json",
         json.dumps({"policies": []}),
+        json.dumps({"policies": {"Preferences": []}}),
         json.dumps({"policies": {"ExtensionSettings": []}}),
         json.dumps({"policies": {"ExtensionSettings": {EXTENSION_ID: "blocked"}}}),
     ],
