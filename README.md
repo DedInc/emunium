@@ -233,7 +233,7 @@ with Browser(browser="firefox", headless=True) as browser:
 | `"chrome"`, `"edge"`, `"brave"`, `"chromium"`, `"firefox"` | that installed browser; `LaunchError` listing the searched locations when it is not installed |
 | `"cft"` | Chrome for Testing, downloaded on first use (see [ensure_chrome](#ensure_chrome)) |
 | `"auto"` | the first installed of Chrome, Edge, Brave and Chromium, in that order; Chrome for Testing when none is installed |
-| a path | that executable |
+| a path | that executable; Camoufox, Waterfox, LibreWolf, Floorp, Zen and Firefox ESR paths are recognized as Firefox and use WebDriver BiDi |
 
 Without `browser`, emunium uses `chrome_path`, then the `EMUNIUM_CHROME_PATH`
 environment variable, then `"auto"`. Firefox is never picked automatically;
@@ -247,7 +247,7 @@ Each browser gets the session's extension copy in its own way:
 |---|---|
 | Edge, Brave, Chromium, Chrome for Testing | `--load-extension` |
 | Google Chrome | Chrome ignores `--load-extension` since version 137, so emunium starts it with `--remote-debugging-pipe --enable-unsafe-extension-debugging` and installs the extension over that private pipe (`Extensions.loadUnpacked`). The pipe stays open for the session; closing it ends Chrome. |
-| Firefox | started with `--remote-debugging-port=0`; the extension is installed through WebDriver BiDi `webExtension.install`. The install is temporary: it is gone when Firefox exits. |
+| Firefox and recognized Gecko forks | started with `--remote-debugging-port=0`; the extension is installed through WebDriver BiDi `webExtension.install`. The install is temporary: it is gone when the browser exits. |
 
 Firefox notes:
 
@@ -258,6 +258,36 @@ Firefox notes:
   of `execute_script` (see [JavaScript execution](#javascript-execution)) is
   unavailable there unless that permission is granted.
 - Headless Firefox runs with `-headless` instead of `--headless=new`.
+
+Recognized Gecko paths use the Firefox WebDriver BiDi launch path, so the fork
+must support that interface. Pass a prepared Camoufox profile with
+`user_data_dir`; Camoufox provides its profile configuration, while emunium
+provides navigation and input:
+
+```python
+from time import sleep
+
+from emunium import Browser
+
+camoufox_path = r"C:\Browsers\Camoufox\camoufox.exe"
+camoufox_profile = r"C:\Browsers\Camoufox\profiles\automation"
+
+with Browser(
+    chrome_path=camoufox_path,
+    user_data_dir=camoufox_profile,
+    headless=False,
+    bridge_timeout=120.0,
+) as browser:
+    print(f"Browser: {browser.browser_name}")  # "firefox"
+    browser.goto("https://bot.sannysoft.com/", timeout=60.0)
+    browser.scroll_to(0, 500)
+    browser.click("table", human=True, timeout=60.0)
+    sleep(10)  # Keep the headed window open for inspection.
+```
+
+Although the option is named `chrome_path`, it accepts a Firefox-family binary
+when `browser` is omitted. A recognized Gecko path reports
+`browser.browser_name == "firefox"`.
 
 `browser.browser_name` is the browser the last `launch()` started: one of the
 names above, `"cft"`, or `"custom"` for a path emunium does not recognise;
