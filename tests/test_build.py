@@ -386,6 +386,62 @@ def test_cli_id_and_build(home, source, tmp_path, capsys):
     assert (out / "emunium-extension" / "attach.json").is_file()
 
 
+@needs_crypto
+def test_cli_builds_firefox_target_and_registers_policy(home, source, tmp_path, capsys):
+    executable = tmp_path / "Mozilla Firefox" / "firefox.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"firefox")
+    out = tmp_path / "firefox-dist"
+
+    assert (
+        main(
+            [
+                "extension",
+                "build",
+                "--out",
+                str(out),
+                "--port",
+                "48003",
+                "--target",
+                "firefox",
+                "--firefox-path",
+                str(executable),
+            ]
+        )
+        == 0
+    )
+
+    printed = capsys.readouterr().out
+    xpi = out / "emunium-extension-firefox.xpi"
+    policy = executable.parent / "distribution" / "policies.json"
+    assert "extension id: bridge@emunium.dev" in printed
+    assert f"xpi:          {xpi}" in printed
+    assert f"policy:       {policy}" in printed
+    assert xpi.is_file()
+    assert not (out / "emunium-extension.crx").exists()
+    document = json.loads(policy.read_text(encoding="utf-8"))
+    extension = document["policies"]["ExtensionSettings"]["bridge@emunium.dev"]
+    assert extension["installation_mode"] == "force_installed"
+    assert extension["install_url"] == xpi.resolve().as_uri()
+
+
+def test_cli_firefox_path_requires_firefox_target(tmp_path, capsys):
+    assert (
+        main(
+            [
+                "extension",
+                "build",
+                "--out",
+                str(tmp_path),
+                "--firefox-path",
+                str(tmp_path / "firefox.exe"),
+            ]
+        )
+        == 1
+    )
+    assert "--firefox-path requires --target firefox" in capsys.readouterr().err
+
+
 def test_cli_rejects_bad_port(home, tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         main(["extension", "build", "--out", str(tmp_path), "--port", "0"])

@@ -25,7 +25,9 @@ from emunium._browser import firefox
 from emunium._browser.firefox import (
     BidiSession,
     firefox_args,
+    firefox_policy_path,
     read_bidi_url,
+    write_firefox_policy,
     write_user_prefs,
 )
 from emunium.errors import LaunchError
@@ -95,6 +97,120 @@ def test_write_user_prefs_overwrites(tmp_path):
     (tmp_path / "user.js").write_text('user_pref("stale", 1);\n', encoding="utf-8")
     prefs = _read_prefs(write_user_prefs(tmp_path))
     assert "stale" not in prefs
+
+
+# -- Enterprise Policies -----------------------------------------------------
+
+
+def test_firefox_policy_path_next_to_executable(tmp_path):
+    executable = tmp_path / "Mozilla Firefox" / "firefox.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"firefox")
+
+    assert firefox_policy_path(executable) == (
+        executable.parent / "distribution" / "policies.json"
+    )
+
+
+def test_firefox_policy_path_inside_macos_app_resources(tmp_path):
+    executable = tmp_path / "Firefox.app" / "Contents" / "MacOS" / "firefox"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"firefox")
+
+    assert firefox_policy_path(executable) == (
+        tmp_path
+        / "Firefox.app"
+        / "Contents"
+        / "Resources"
+        / "distribution"
+        / "policies.json"
+    )
+
+
+def test_write_firefox_policy_creates_distribution_and_uses_file_uri(tmp_path):
+    executable = tmp_path / "firefox" / "firefox.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"firefox")
+    xpi = tmp_path / "build with spaces" / "emunium-extension-firefox.xpi"
+    xpi.parent.mkdir()
+    xpi.write_bytes(b"xpi")
+
+    policy_path = write_firefox_policy(executable, xpi)
+
+    assert policy_path == executable.parent / "distribution" / "policies.json"
+    document = json.loads(policy_path.read_text(encoding="utf-8"))
+    extension = document["policies"]["ExtensionSettings"][EXTENSION_ID]
+    assert extension == {
+        "installation_mode": "force_installed",
+        "install_url": xpi.resolve().as_uri(),
+    }
+    assert extension["install_url"].startswith("file:///")
+
+
+def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
+    executable = tmp_path / "firefox.exe"
+    executable.write_bytes(b"firefox")
+    xpi = tmp_path / "emunium.xpi"
+    xpi.write_bytes(b"xpi")
+    policy_path = firefox_policy_path(executable)
+    policy_path.parent.mkdir()
+    original = {
+        "custom": {"keep": True},
+        "policies": {
+            "BlockAboutConfig": True,
+            "ExtensionSettings": {
+                "*": {"installation_mode": "blocked"},
+                "another@example.com": {"installation_mode": "allowed"},
+                EXTENSION_ID: {
+                    "installation_mode": "allowed",
+                    "updates_disabled": True,
+                },
+            },
+        },
+    }
+    policy_path.write_text(json.dumps(original), encoding="utf-8")
+
+    assert write_firefox_policy(executable, xpi) == policy_path
+
+    updated = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert updated["custom"] == original["custom"]
+    assert updated["policies"]["BlockAboutConfig"] is True
+    settings = updated["policies"]["ExtensionSettings"]
+    assert settings["*"] == original["policies"]["ExtensionSettings"]["*"]
+    assert settings["another@example.com"] == original["policies"]["ExtensionSettings"][
+        "another@example.com"
+    ]
+    assert settings[EXTENSION_ID] == {
+        "installation_mode": "force_installed",
+        "install_url": xpi.resolve().as_uri(),
+        "updates_disabled": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{invalid json",
+        json.dumps({"policies": []}),
+        json.dumps({"policies": {"ExtensionSettings": []}}),
+        json.dumps({"policies": {"ExtensionSettings": {EXTENSION_ID: "blocked"}}}),
+    ],
+)
+def test_write_firefox_policy_rejects_invalid_existing_file_without_overwriting(
+    tmp_path, contents
+):
+    executable = tmp_path / "firefox.exe"
+    executable.write_bytes(b"firefox")
+    xpi = tmp_path / "emunium.xpi"
+    xpi.write_bytes(b"xpi")
+    policy_path = firefox_policy_path(executable)
+    policy_path.parent.mkdir()
+    policy_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(LaunchError, match="policies.json"):
+        write_firefox_policy(executable, xpi)
+
+    assert policy_path.read_text(encoding="utf-8") == contents
 
 
 # -- read_bidi_url ------------------------------------------------------------

@@ -19,8 +19,11 @@ import collections
 import inspect
 import itertools
 import json
+import os
 import queue
 import re
+import stat
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,6 +33,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.sync.client import ClientConnection
 from websockets.sync.client import connect as ws_connect
 
+from emunium._browser.extension_targets import FIREFOX_GECKO_ID
 from emunium.errors import LaunchError
 
 __all__ = [
@@ -112,6 +116,131 @@ def write_user_prefs(profile_dir: str | Path) -> Path:
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+_POLICY_LOCK = threading.Lock()
+
+
+def firefox_policy_path(executable: str | Path) -> Path:
+    """Return the Enterprise Policies path for a Firefox executable."""
+    browser_path = Path(executable).expanduser().resolve()
+    if not browser_path.is_file():
+        raise LaunchError(f"Firefox executable does not exist: {browser_path}")
+
+    app_root = next(
+        (parent for parent in browser_path.parents if parent.name.casefold().endswith(".app")),
+        None,
+    )
+    install_root = (
+        app_root / "Contents" / "Resources"
+        if app_root is not None
+        else browser_path.parent
+    )
+    return install_root / "distribution" / "policies.json"
+
+
+def write_firefox_policy(executable: str | Path, xpi_path: str | Path) -> Path:
+    """Merge a force-installed local XPI into Firefox's ``policies.json``.
+
+    Existing policy data and fields on this extension's settings are preserved.
+    The file is replaced atomically so an interrupted write cannot truncate it.
+    """
+    browser_path = Path(executable).expanduser().resolve()
+    if not browser_path.is_file():
+        raise LaunchError(f"Firefox executable does not exist: {browser_path}")
+    xpi = Path(xpi_path).expanduser().resolve()
+    if not xpi.is_file():
+        raise LaunchError(f"Firefox extension XPI does not exist: {xpi}")
+
+    policy_path = firefox_policy_path(browser_path)
+    with _POLICY_LOCK:
+        document: dict[str, Any] = {}
+        previous_mode: int | None = None
+        if policy_path.exists():
+            try:
+                raw = policy_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise LaunchError(
+                    f"Could not read Firefox policy file {policy_path}: {exc}"
+                ) from exc
+            try:
+                loaded = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise LaunchError(
+                    f"Firefox policy file {policy_path} is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise LaunchError(
+                    f"Firefox policy file {policy_path} must contain a JSON object"
+                )
+            document = loaded
+            try:
+                previous_mode = stat.S_IMODE(policy_path.stat().st_mode)
+            except OSError as exc:
+                raise LaunchError(
+                    f"Could not inspect Firefox policy file {policy_path}: {exc}"
+                ) from exc
+
+        policies = document.setdefault("policies", {})
+        if not isinstance(policies, dict):
+            raise LaunchError(
+                f"Firefox policy file {policy_path} has a non-object 'policies' value"
+            )
+        settings = policies.setdefault("ExtensionSettings", {})
+        if not isinstance(settings, dict):
+            raise LaunchError(
+                f"Firefox policy file {policy_path} has a non-object 'ExtensionSettings' value"
+            )
+        extension = settings.setdefault(FIREFOX_GECKO_ID, {})
+        if not isinstance(extension, dict):
+            raise LaunchError(
+                f"Firefox policy file {policy_path} has invalid settings for {FIREFOX_GECKO_ID}"
+            )
+        extension["installation_mode"] = "force_installed"
+        extension["install_url"] = xpi.as_uri()
+
+        try:
+            policy_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise LaunchError(
+                f"Could not create Firefox policy directory for {policy_path}: {exc}"
+            ) from exc
+        _write_policy_atomically(policy_path, document, previous_mode)
+    return policy_path
+
+
+def _write_policy_atomically(
+    policy_path: Path, document: dict[str, Any], previous_mode: int | None
+) -> None:
+    temporary: Path | None = None
+    descriptor: int | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            prefix=f".{policy_path.name}.", suffix=".tmp", dir=str(policy_path.parent)
+        )
+        temporary = Path(name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            descriptor = None
+            json.dump(document, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if previous_mode is not None and os.name != "nt":
+            os.chmod(str(temporary), previous_mode)
+        os.replace(str(temporary), str(policy_path))
+        temporary = None
+    except OSError as exc:
+        raise LaunchError(
+            f"Could not write Firefox policy file {policy_path}: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 class _StderrDrain:
