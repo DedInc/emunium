@@ -84,8 +84,9 @@ class Browser:
                 the path of an executable. None uses ``chrome_path``, then
                 ``EMUNIUM_CHROME_PATH``, then ``auto``: the first installed
                 of chrome, edge, brave, chromium, else Chrome for Testing.
-                Google Chrome gets the extension over its debugging pipe,
-                Firefox over WebDriver BiDi, the others via
+                Google Chrome gets the extension over its debugging pipe.
+                Firefox uses ``Browser.connect()`` with a signed XPI installed
+                through Enterprise Policies; the other browsers use
                 ``--load-extension``.
             chrome_path: Browser binary, used when ``browser`` is None.
             extra_args: Extra browser command-line flags.

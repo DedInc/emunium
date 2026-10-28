@@ -227,4 +227,3 @@ def test_write_firefox_policy_defaults_to_versioned_release_url(tmp_path, monkey
             "emunium-extension-firefox.xpi"
         ),
     }
-

@@ -225,4 +225,3 @@ def _write_policy_atomically(
                 temporary.unlink()
             except OSError:
                 pass
-

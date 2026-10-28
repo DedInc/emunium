@@ -69,7 +69,7 @@ def test_windows_table_finds_every_browser_under_program_roots() -> None:
         InstalledBrowser("edge", "chromium", present[1], "load-extension"),
         InstalledBrowser("brave", "chromium", present[2], "load-extension"),
         InstalledBrowser("chromium", "chromium", present[3], "load-extension"),
-        InstalledBrowser("firefox", "firefox", present[4], "bidi"),
+        InstalledBrowser("firefox", "firefox", present[4], "enterprise-policies"),
     ]
 
 

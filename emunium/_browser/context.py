@@ -277,7 +277,7 @@ class BrowserContext:
             api = self._window_api()
             class_name = (
                 GECKO_WINDOW_CLASS
-                if self.browser_family == "firefox" or self.install_method == "bidi"
+                if self.browser_family == "firefox"
                 else CHROME_WINDOW_CLASS
             )
             candidates = top_level_windows(
