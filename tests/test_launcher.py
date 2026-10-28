@@ -5,15 +5,12 @@ No real Chrome, no network: Popen, taskkill, urlopen and the bridge are fakes.
 
 from __future__ import annotations
 
-import contextlib
 import io
 import json
 import logging
 import os
 import stat
 import subprocess
-import threading
-import time
 import zipfile
 from pathlib import Path
 from typing import ClassVar
@@ -482,76 +479,6 @@ def test_close_without_launch_is_noop(env):
     assert bridge.calls == []
 
 
-class FakeStderr(io.BytesIO):
-    def __init__(self, events, error=None, block=None):
-        super().__init__()
-        self.events = events
-        self.error = error
-        # Stands in for the reader lock held by a drain stuck in readline().
-        self.block = block
-
-    def close(self):
-        self.events.append("stderr_close")
-        if self.block is not None:
-            self.block.wait()
-        super().close()
-        if self.error is not None:
-            raise self.error
-
-
-def _session_with_stderr(monkeypatch, error=None, block=None):
-    events = []
-    monkeypatch.setattr(
-        launcher, "_stop_process_tree", lambda *a, **k: events.append("stop")
-    )
-    proc = FakePopen(["firefox"])
-    proc.stderr = FakeStderr(events, error, block)
-    log_files = contextlib.ExitStack()
-    log_files.callback(events.append, "log_close")
-    session = _session(process=proc, headless=True)
-    session._log_files = log_files
-    return session, proc, events
-
-
-def test_close_closes_stderr_after_the_tree_and_before_the_log(env, monkeypatch):
-    session, proc, events = _session_with_stderr(monkeypatch)
-    launcher.close(session)
-    assert events == ["stop", "stderr_close", "log_close"]
-    assert proc.stderr.closed
-    launcher.close(session)
-    assert events == ["stop", "stderr_close", "log_close"]
-
-
-@pytest.mark.parametrize("error", [OSError(9, "bad fd"), ValueError("busy")])
-def test_close_survives_a_failing_stderr_close(env, monkeypatch, error):
-    session, _, events = _session_with_stderr(monkeypatch, error)
-    launcher.close(session)
-    assert events == ["stop", "stderr_close", "log_close"]
-    assert session.process is None and session._log_files is None
-
-
-def test_close_does_not_hang_on_a_blocked_stderr_close(env, monkeypatch, caplog):
-    assert launcher.STDERR_CLOSE_BUDGET_SECONDS <= 1.0
-    budget = 0.3
-    monkeypatch.setattr(launcher, "STDERR_CLOSE_BUDGET_SECONDS", budget)
-    never_set = threading.Event()
-    session, proc, events = _session_with_stderr(monkeypatch, block=never_set)
-    try:
-        started = time.monotonic()
-        with caplog.at_level(logging.DEBUG, logger="emunium.browser"):
-            launcher.close(session)
-        elapsed = time.monotonic() - started
-        # Upper bound only: join() may return a clock tick (~15.6 ms on
-        # Windows) before monotonic() shows the full budget.
-        assert elapsed < budget + 2.0
-        assert events == ["stop", "stderr_close", "log_close"]
-        assert not proc.stderr.closed  # left to the reader and GC
-        assert session._log_files is None
-        assert any("still busy" in r.getMessage() for r in caplog.records)
-    finally:
-        never_set.set()  # release the daemon closer only after the assertions
-
-
 def _launch_windows(env, monkeypatch, **attrs):
     monkeypatch.setattr(launcher, "_IS_WINDOWS", True)
     session = _session(**attrs)
@@ -901,7 +828,9 @@ def test_facade_session_defaults():
 
 
 def _installed(name, path=None):
-    method = {"chrome": "cdp-pipe", "firefox": "bidi"}.get(name, "load-extension")
+    method = {"chrome": "cdp-pipe", "firefox": "enterprise-policies"}.get(
+        name, "load-extension"
+    )
     family = "firefox" if name == "firefox" else "chromium"
     return InstalledBrowser(name, family, path or f"/opt/{name}/{name}", method)
 
@@ -981,7 +910,10 @@ def test_browser_name_uses_find_browser():
     resolve = Resolver([_installed("firefox", r"C:\Mozilla Firefox\firefox.exe")])
     picked = resolve(browser="Firefox")
     assert picked == launcher.ResolvedBrowser(
-        "firefox", r"C:\Mozilla Firefox\firefox.exe", "firefox", "bidi"
+        "firefox",
+        r"C:\Mozilla Firefox\firefox.exe",
+        "firefox",
+        "enterprise-policies",
     )
     assert resolve.calls == [("find", "firefox")]
 
@@ -1033,12 +965,16 @@ def test_browser_path_must_exist():
             "cft",
             "load-extension",
         ),
-        (r"C:\Program Files\Mozilla Firefox\firefox.exe", "firefox", "bidi"),
-        ("/usr/lib/firefox-esr/firefox-esr", "firefox", "bidi"),
-        (r"C:\Apps\camoufox\camoufox.exe", "firefox", "bidi"),
-        (r"C:\Apps\waterfox\waterfox.exe", "firefox", "bidi"),
-        ("/usr/bin/librewolf", "firefox", "bidi"),
-        ("/opt/zen/zen", "firefox", "bidi"),
+        (
+            r"C:\Program Files\Mozilla Firefox\firefox.exe",
+            "firefox",
+            "enterprise-policies",
+        ),
+        ("/usr/lib/firefox-esr/firefox-esr", "firefox", "enterprise-policies"),
+        (r"C:\Apps\camoufox\camoufox.exe", "firefox", "enterprise-policies"),
+        (r"C:\Apps\waterfox\waterfox.exe", "firefox", "enterprise-policies"),
+        ("/usr/bin/librewolf", "firefox", "enterprise-policies"),
+        ("/opt/zen/zen", "firefox", "enterprise-policies"),
         (
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             "edge",
@@ -1063,7 +999,7 @@ def test_path_classification(path, name, method):
     resolve = Resolver(files=[path])
     picked = resolve(browser=path)
     assert (picked.name, picked.path, picked.install_method) == (name, path, method)
-    assert picked.family == ("firefox" if method == "bidi" else "chromium")
+    assert picked.family == ("firefox" if name == "firefox" else "chromium")
     assert resolve.calls == []
 
 
@@ -1239,134 +1175,21 @@ def test_cdp_pipe_early_exit_reports_the_exit(env, chrome):
         launcher.launch(_session(), bridge_timeout=5)
 
 
-class FakeBidi:
-    instances: ClassVar[list[FakeBidi]] = []
-    events: ClassVar[list[tuple[object, ...]]] = []
-
-    def __init__(self, url):
-        FakeBidi.events.append(("bidi", "connect", url))
-        FakeBidi.instances.append(self)
-
-    def new_session(self):
-        FakeBidi.events.append(("bidi", "new_session"))
-        return {}
-
-    def install_extension(self, path):
-        FakeBidi.events.append(("bidi", "install", str(path)))
-        return "bridge@emunium.dev"
-
-    def close(self):
-        FakeBidi.events.append(("bidi", "close"))
-
-
-@pytest.fixture
-def firefox(env, monkeypatch, tmp_path):
-    FakeBidi.instances = []
-    FakeBidi.events = env["events"]
-    reads = []
-    state = {"error": None}
-
-    def fake_read(stream, timeout, *, sink):
-        reads.append((stream, timeout, sink))
-        env["events"].append(("read_bidi_url", timeout))
-        sink.write(b"WebDriver BiDi listening on ws://127.0.0.1:9333\n")
-        sink.flush()
-        if state["error"] is not None:
-            raise state["error"]
-        return "ws://127.0.0.1:9333"
-
-    monkeypatch.setattr(launcher, "read_bidi_url", fake_read)
-    monkeypatch.setattr(launcher, "BidiSession", FakeBidi)
-    exe = tmp_path / "Mozilla Firefox" / "firefox.exe"
-    env["installed"].append(_installed("firefox", str(exe)))
-    return {"exe": str(exe), "reads": reads, "state": state}
-
-
-@pytest.mark.parametrize("windows", [True, False])
-def test_bidi_spawn_sequence(env, firefox, monkeypatch, windows):
-    monkeypatch.setattr(launcher, "_IS_WINDOWS", windows)
-    session = _session(browser="firefox", headless=True, extra_args=["-x"])
-    launcher.launch(session, bridge_timeout=7)
-    proc = FakePopen.instances[0]
-    profile = session.profile_dir
-    expected = [
-        firefox["exe"],
-        "-profile",
-        profile,
-        "-no-remote",
-        "--remote-debugging-port=0",
-    ]
-    expected += ["-headless", *(["-wait-for-browser"] if windows else []), "-x"]
-    assert proc.args == expected
-    assert proc.kwargs["stderr"] is subprocess.PIPE
-    assert proc.kwargs["start_new_session"] is (not windows)
-    ext = Path(session.extension_dir)
-    manifest = json.loads((ext / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["browser_specific_settings"]["gecko"]["id"] == "bridge@emunium.dev"
-    assert (
-        json.loads((ext / "session.json").read_text(encoding="utf-8"))["token"] == TOKEN
-    )
-    assert Path(profile, "user.js").is_file()
-    assert not Path(profile, "Default").exists()  # no Chromium prefs
-    stream, timeout, sink = firefox["reads"][0]
-    assert stream is proc.stderr and timeout == 7
-    assert sink.name == session.log_path and session.log_path.endswith("firefox.log")
-    assert not sink.closed and session._log_files is not None
-    bidi_events = [
-        e for e in env["events"] if e[0] in ("bidi", "read_bidi_url", "assign")
-    ]
-    assert bidi_events == [
-        *([("assign", 701, proc.pid)] if windows else []),
-        ("read_bidi_url", 7),
-        ("bidi", "connect", "ws://127.0.0.1:9333"),
-        ("bidi", "new_session"),
-        ("bidi", "install", str(ext)),
-    ]
-    assert session._bidi is FakeBidi.instances[0]
-    log_path = session.log_path
-    del env["events"][:]
-    launcher.close(session)
-    assert env["events"][-1] == ("bidi", "close")
-    if windows:
-        assert env["events"][:2] == [("terminate_job", 701, 1), ("close_job", 701)]
-    assert sink.closed and session._bidi is None and session._log_files is None
-    assert not os.path.exists(log_path)
-
-
-def test_bidi_uses_user_data_dir_as_profile(env, firefox, tmp_path):
-    profile = tmp_path / "ff-profile"
-    session = _session(browser="firefox", user_data_dir=str(profile))
-    launcher.launch(session, bridge_timeout=5)
-    assert FakePopen.instances[0].args[2] == str(profile.resolve())
-    launcher.close(session)
-    assert (profile / "user.js").is_file()
-
-
-def test_bidi_stub_exit_reports_browser_and_log(env, firefox):
-    FakePopen.exit_code = 0
-    firefox["state"]["error"] = LaunchError(
-        "Firefox stderr closed before WebDriver BiDi"
-    )
+def test_browser_launch_refuses_firefox_before_starting_resources(env, tmp_path):
+    executable = tmp_path / "firefox.exe"
+    executable.write_bytes(b"firefox")
+    env["installed"].append(_installed("firefox", str(executable)))
     bridge = FakeBridge()
     session = _session(bridge, browser="firefox")
-    with pytest.raises(LaunchError) as info:
-        launcher.launch(session, bridge_timeout=5)
-    message = str(info.value)
-    assert f"firefox ({firefox['exe']}) exited during startup (exit code 0)" in message
-    assert "WebDriver BiDi listening" in message  # the log tail came from the sink
-    _assert_rolled_back(session, bridge, env)
 
-
-def test_bidi_failure_while_running_names_the_browser(env, firefox):
-    firefox["state"]["error"] = LaunchError(
-        "did not announce WebDriver BiDi within 5s."
-    )
-    bridge = FakeBridge()
-    session = _session(bridge, browser="firefox")
-    with pytest.raises(LaunchError, match="into firefox .* over WebDriver BiDi"):
+    with pytest.raises(LaunchError, match="Browser.connect"):
         launcher.launch(session, bridge_timeout=5)
-    assert FakePopen.instances[0].returncode is not None  # tree stopped
-    _assert_rolled_back(session, bridge, env)
+
+    assert session.resolved.family == "firefox"
+    assert bridge.calls == []
+    assert FakePopen.instances == []
+    assert session.session_dir is None
+    assert list(env["tmp_root"].iterdir()) == []
 
 
 def test_timeout_message_names_the_browser(env):

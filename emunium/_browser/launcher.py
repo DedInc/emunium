@@ -3,18 +3,17 @@
 Contract: ``docs/architecture/bridge-protocol.md`` section 1 (session bootstrap).
 
 ``launch()`` is transactional: every resource it creates (bridge, session
-directory, browser process tree, CDP pipe, BiDi session) is released by
+directory, browser process tree, CDP pipe) is released by
 ``close()`` before the error propagates. The packaged ``emunium/extension/``
 directory is only ever read.
 
-``resolve_browser()`` picks the binary and how the extension gets in:
-``load-extension`` (command-line flag), ``cdp-pipe`` (Google Chrome, over
-``--remote-debugging-pipe``) or ``bidi`` (Firefox, over WebDriver BiDi).
+``resolve_browser()`` picks the binary and how the Chromium extension gets in:
+``load-extension`` (command-line flag) or ``cdp-pipe`` (Google Chrome, over
+``--remote-debugging-pipe``). Firefox attach uses ``Browser.connect()``.
 """
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import json
 import logging
@@ -25,7 +24,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -47,13 +45,6 @@ from emunium._browser.discovery import (
     find_browser,
     find_browsers,
 )
-from emunium._browser.extension_targets import materialize
-from emunium._browser.firefox import (
-    BidiSession,
-    firefox_args,
-    read_bidi_url,
-    write_user_prefs,
-)
 from emunium.chrome_installer import CHROME_PATH_ENV, _install_dir, ensure_chrome
 from emunium.errors import EmuniumError, LaunchError
 
@@ -71,8 +62,6 @@ TERMINATE_GRACE_SECONDS = 5.0
 CLOSE_TABS_BUDGET_SECONDS = 1.0
 GRACEFUL_TASKKILL_GRACE_SECONDS = 2.0
 TASKKILL_TIMEOUT_SECONDS = 10.0
-# Upper bound on closing Firefox's stderr pipe (see _close_stream_bounded).
-STDERR_CLOSE_BUDGET_SECONDS = 1.0
 RMTREE_ATTEMPTS = 10
 RMTREE_RETRY_DELAY = 0.3
 LOG_TAIL_LINES = 20
@@ -91,20 +80,18 @@ CHROME_FLAGS = (
     "--disable-blink-features=AutomationControlled",
 )
 
-# Install methods (discovery.INSTALL_METHODS values).
+# Chromium extension installation methods (discovery.INSTALL_METHODS values).
 LOAD_EXTENSION = "load-extension"
 CDP_PIPE = "cdp-pipe"
-BIDI = "bidi"
 # Names resolve_browser() accepts besides the discovery names.
 CFT_NAME = "cft"
 AUTO_NAME = "auto"
 CUSTOM_NAME = "custom"
 CHROME_FOR_TESTING = "chrome for testing"
 # The Windows Firefox launcher stub exits once the real browser is up unless
-# told to wait; the stub's pid is the one launch() watches and stops.
+# told to wait; retained for test/manual policy launches.
 FIREFOX_WAIT_FLAG = "-wait-for-browser"
 CHROMIUM_LOG_NAME = "chrome.log"
-FIREFOX_LOG_NAME = "firefox.log"
 
 _PATH_SEPARATORS = re.compile(r"[\\/]+")
 
@@ -125,11 +112,9 @@ class ResolvedBrowser:
 
 class BrowserSession:
     __slots__ = (
-        "_bidi",
         "_bridge_started",
         "_cdp_pipe",
         "_job",
-        "_log_files",
         "bridge",
         "browser",
         "chrome_path",
@@ -168,9 +153,6 @@ class BrowserSession:
         self._job: int | None = None
         # Google Chrome: the debugging pipe; closing it makes Chrome exit.
         self._cdp_pipe: CdpPipe | None = None
-        # Firefox: the WebDriver BiDi session and the stderr log it copies into.
-        self._bidi: BidiSession | None = None
-        self._log_files: contextlib.ExitStack | None = None
 
 
 def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
@@ -197,6 +179,11 @@ def launch(session: BrowserSession, bridge_timeout: float = 60.0) -> None:
 
 def _launch(session: BrowserSession, bridge_timeout: float) -> None:
     resolved = _resolve_executable(session)
+    if resolved.family == "firefox":
+        raise LaunchError(
+            "Browser.launch() does not start Firefox; use Browser.connect(browser='firefox') "
+            "with the signed XPI registered through Enterprise Policies"
+        )
     extra_args = _validated_extra_args(session.extra_args)
 
     session._bridge_started = True
@@ -213,20 +200,11 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
     session_dir = Path(session.session_dir)
     extension_dir = session_dir / "extension"
 
-    if resolved.install_method == BIDI:
-        # The packaged manifest is Chromium's; Firefox gets its overlay.
-        materialize(
-            "firefox",
-            extension_dir,
-            source_dir=EXTENSION_SOURCE_DIR,
-            ignore=EXTENSION_COPY_IGNORE,
-        )
-    else:
-        shutil.copytree(
-            EXTENSION_SOURCE_DIR,
-            str(extension_dir),
-            ignore=shutil.ignore_patterns(*EXTENSION_COPY_IGNORE),
-        )
+    shutil.copytree(
+        EXTENSION_SOURCE_DIR,
+        str(extension_dir),
+        ignore=shutil.ignore_patterns(*EXTENSION_COPY_IGNORE),
+    )
     session.extension_dir = str(extension_dir)
     _write_session_file(extension_dir, port, token)
 
@@ -238,27 +216,15 @@ def _launch(session: BrowserSession, bridge_timeout: float) -> None:
         profile_dir.mkdir()
     session.profile_dir = str(profile_dir)
 
-    if resolved.install_method == BIDI:
-        write_user_prefs(profile_dir)
-        log_path = str(session_dir / FIREFOX_LOG_NAME)
-        session.log_path = log_path
-        process = _spawn_firefox(
-            session,
-            resolved,
-            _Paths(str(profile_dir), str(extension_dir), log_path),
-            extra_args,
-            bridge_timeout,
-        )
-    else:
-        _seed_profile(str(profile_dir))
-        log_path = str(session_dir / CHROMIUM_LOG_NAME)
-        session.log_path = log_path
-        process = _spawn_chromium(
-            session,
-            resolved,
-            _Paths(str(profile_dir), str(extension_dir), log_path),
-            extra_args,
-        )
+    _seed_profile(str(profile_dir))
+    log_path = str(session_dir / CHROMIUM_LOG_NAME)
+    session.log_path = log_path
+    process = _spawn_chromium(
+        session,
+        resolved,
+        _Paths(str(profile_dir), str(extension_dir), log_path),
+        extra_args,
+    )
 
     _await_connection(session, process, bridge_timeout)
     logger.info("Extension connected to bridge")
@@ -308,48 +274,6 @@ def _spawn_chromium(
         except LaunchError as exc:
             raise _install_failure(session, resolved, process, "CDP pipe", exc) from exc
         logger.info("Extension %s loaded over the CDP pipe", extension_id)
-    return process
-
-
-def _spawn_firefox(
-    session: BrowserSession,
-    resolved: ResolvedBrowser,
-    paths: _Paths,
-    extra_args: list[str],
-    bridge_timeout: float,
-) -> subprocess.Popen:
-    args = firefox_args(resolved.path, paths.profile_dir, headless=session.headless)
-    if _IS_WINDOWS:
-        args.append(FIREFOX_WAIT_FLAG)
-    args.extend(extra_args)
-    # Kept open until close(): the stderr drain copies every Firefox line into it.
-    with contextlib.ExitStack() as stack:
-        log_file = stack.enter_context(open(paths.log_path, "wb"))
-        # Ownership moves to the session; close() releases it.
-        session._log_files = stack.pop_all()
-    process = subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        start_new_session=not _IS_WINDOWS,
-    )
-    _register_process(session, resolved, process)
-
-    try:
-        stream = process.stderr
-        if stream is None:
-            raise LaunchError("Firefox stderr is not piped")
-        url = read_bidi_url(stream, bridge_timeout, sink=log_file)
-        bidi = BidiSession(url)
-        session._bidi = bidi
-        bidi.new_session()
-        extension_id = bidi.install_extension(paths.extension_dir)
-    except LaunchError as exc:
-        raise _install_failure(
-            session, resolved, process, "WebDriver BiDi", exc
-        ) from exc
-    logger.info("Extension %s installed over WebDriver BiDi", extension_id)
     return process
 
 
@@ -428,23 +352,6 @@ def close(session: BrowserSession) -> None:
             pipe.close()
         except Exception:
             logger.exception("CDP pipe close raised")
-    bidi, session._bidi = session._bidi, None
-    if bidi is not None:
-        try:
-            bidi.close()
-        except Exception:
-            logger.exception("WebDriver BiDi session close raised")
-    # Firefox's stderr pipe, after the tree is gone so the drain thread sees EOF.
-    stderr = process.stderr if process is not None else None
-    if stderr is not None:
-        _close_stream_bounded(stderr, STDERR_CLOSE_BUDGET_SECONDS)
-    log_files, session._log_files = session._log_files, None
-    if log_files is not None:
-        try:
-            log_files.close()
-        except OSError as exc:
-            logger.debug("Closing %s failed: %s", session.log_path, exc)
-
     if session._bridge_started:
         session._bridge_started = False
         if session.bridge is not None:
@@ -461,31 +368,6 @@ def close(session: BrowserSession) -> None:
         _remove_tree(session_dir)
     if process is not None:
         logger.info("Browser closed")
-
-
-def _close_stream_bounded(stream: Any, budget: float) -> None:
-    """Close *stream* without letting ``close()`` wait more than *budget* seconds.
-
-    A surviving child can keep the pipe's write end open; the Firefox stderr
-    drain then sits in ``readline()`` holding the reader's lock, and
-    ``stream.close()`` would block on that lock forever. The close runs on a
-    daemon thread instead; past the budget the stream is left to the drain and GC.
-    """
-
-    def run() -> None:
-        try:
-            stream.close()
-        except (OSError, ValueError) as exc:
-            logger.debug("Closing the browser stderr pipe failed: %s", exc)
-
-    closer = threading.Thread(target=run, name="emunium-stderr-close", daemon=True)
-    closer.start()
-    closer.join(budget)
-    if closer.is_alive():
-        logger.debug(
-            "Browser stderr pipe still busy after %.1f s; leaving it to the reader",
-            budget,
-        )
 
 
 def _resolve_executable(session: BrowserSession) -> ResolvedBrowser:
@@ -593,7 +475,7 @@ def _from_path(path: str, cft_dir: str | None) -> ResolvedBrowser:
         or stem.startswith("firefox-")
         or stem in ("librewolf", "floorp", "zen")
     ):
-        return ResolvedBrowser("firefox", path, "firefox", BIDI)
+        return ResolvedBrowser("firefox", path, "firefox", "enterprise-policies")
     if _is_chrome_for_testing(parts, cft_dir):
         return ResolvedBrowser(CFT_NAME, path, "chromium", LOAD_EXTENSION)
     if any("google" in p for p in parts) and any("chrome" in p for p in parts):

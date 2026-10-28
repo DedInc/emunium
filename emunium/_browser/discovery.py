@@ -26,14 +26,14 @@ FAMILIES = {
     "chromium": "chromium",
     "firefox": "firefox",
 }
-# Google-branded Chrome ignores --load-extension since 137, so the extension
-# has to be installed over the CDP pipe instead.
+# Google-branded Chrome ignores --load-extension since 137, so its extension
+# loads over the CDP pipe. Firefox reads its signed XPI from Enterprise Policies.
 INSTALL_METHODS = {
     "chrome": "cdp-pipe",
     "edge": "load-extension",
     "brave": "load-extension",
     "chromium": "load-extension",
-    "firefox": "bidi",
+    "firefox": "enterprise-policies",
 }
 
 WINDOWS_ROOT_ENV = ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
