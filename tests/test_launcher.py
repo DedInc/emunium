@@ -315,6 +315,7 @@ def test_chrome_args(env):
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--hide-crash-restore-bubble",
+        "--disable-blink-features=AutomationControlled",
         f"--disable-extensions-except={ext}",
         f"--load-extension={ext}",
         "--headless=new",

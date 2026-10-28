@@ -88,6 +88,7 @@ CHROME_FLAGS = (
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
     "--hide-crash-restore-bubble",
+    "--disable-blink-features=AutomationControlled",
 )
 
 # Install methods (discovery.INSTALL_METHODS values).

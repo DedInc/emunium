@@ -73,7 +73,7 @@ def _read_prefs(path: Path) -> dict[str, Any]:
     return prefs
 
 
-def test_write_user_prefs_ux_only(tmp_path):
+def test_write_user_prefs_defaults(tmp_path):
     path = write_user_prefs(tmp_path)
     assert path == tmp_path / "user.js"
     prefs = _read_prefs(path)
@@ -84,7 +84,8 @@ def test_write_user_prefs_ux_only(tmp_path):
     assert prefs["datareporting.policy.dataSubmissionEnabled"] is False
     assert prefs["datareporting.healthreport.uploadEnabled"] is False
     assert prefs["browser.sessionstore.resume_from_crash"] is False
-    # Only user-experience prefs: nothing about signing, security or the network.
+    assert prefs["dom.webdriver.enabled"] is False
+    # Nothing about signing, security or network transport is changed.
     forbidden = ("xpinstall", "security.", "extensions.", "network.", "remote.")
     assert not [name for name in prefs if name.startswith(forbidden)]
     assert prefs == firefox.USER_PREFS

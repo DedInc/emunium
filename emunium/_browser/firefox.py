@@ -64,8 +64,10 @@ def _parse_bidi_line(line: str) -> str | None:
     return f"ws://{match.group('host')}:{port}"
 
 
-# User-experience prefs only: no security, signing or networking changes.
+# Browser startup preferences written to the Firefox profile's user.js.
 USER_PREFS: dict[str, bool | str] = {
+    # Set Firefox's WebDriver visibility preference to false by default.
+    "dom.webdriver.enabled": False,
     # No default-browser check.
     "browser.shell.checkDefaultBrowser": False,
     # No about:welcome / first-run / what's-new pages.
