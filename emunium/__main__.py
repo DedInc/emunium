@@ -52,7 +52,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     build.add_argument(
         "--firefox-path",
-        help="Firefox executable; with --target firefox, register the built XPI in its Enterprise Policies",
+        help="Firefox executable; with --target firefox, register the signed release XPI in Enterprise Policies",
+    )
+    build.add_argument(
+        "--firefox-xpi",
+        help="signed local XPI path or HTTPS URL (default: EMUNIUM_FIREFOX_XPI or this emunium version's release)",
     )
     actions.add_parser("id", help="print the stable extension id")
     return parser
@@ -62,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.action == "build":
+            if args.firefox_xpi is not None and args.firefox_path is None:
+                raise ValueError("--firefox-xpi requires --firefox-path")
             if args.firefox_path is not None and args.target != "firefox":
                 raise ValueError("--firefox-path requires --target firefox")
             result = build_extension(args.out, port=args.port, target=args.target)
@@ -72,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("xpi:          {}".format(result["xpi_path"]))
                 if args.firefox_path is not None:
                     policy_path = write_firefox_policy(
-                        args.firefox_path, result["xpi_path"]
+                        args.firefox_path, args.firefox_xpi
                     )
                     print(f"policy:       {policy_path}")
             else:

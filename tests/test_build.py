@@ -32,6 +32,8 @@ from emunium._attach.build import (
     load_or_create_state,
     state_dir,
 )
+from emunium._browser import firefox
+from emunium._browser.firefox import FIREFOX_XPI_ENV, firefox_install_url
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -387,7 +389,11 @@ def test_cli_id_and_build(home, source, tmp_path, capsys):
 
 
 @needs_crypto
-def test_cli_builds_firefox_target_and_registers_policy(home, source, tmp_path, capsys):
+def test_cli_builds_firefox_target_and_registers_policy(
+    home, source, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(FIREFOX_XPI_ENV, raising=False)
+    monkeypatch.setattr(firefox.metadata, "version", lambda package: "3.1.0")
     executable = tmp_path / "Mozilla Firefox" / "firefox.exe"
     executable.parent.mkdir()
     executable.write_bytes(b"firefox")
@@ -422,7 +428,37 @@ def test_cli_builds_firefox_target_and_registers_policy(home, source, tmp_path, 
     document = json.loads(policy.read_text(encoding="utf-8"))
     extension = document["policies"]["ExtensionSettings"]["bridge@emunium.dev"]
     assert extension["installation_mode"] == "force_installed"
-    assert extension["install_url"] == xpi.resolve().as_uri()
+    assert extension["install_url"] == firefox_install_url()
+
+
+@needs_crypto
+def test_cli_registers_explicit_signed_firefox_xpi(home, source, tmp_path, monkeypatch):
+    executable = tmp_path / "firefox.exe"
+    executable.write_bytes(b"firefox")
+    out = tmp_path / "firefox-dist"
+    signed_xpi = tmp_path / "signed-firefox.xpi"
+    signed_xpi.write_bytes(b"signed xpi placeholder")
+    monkeypatch.setenv(FIREFOX_XPI_ENV, str(tmp_path / "ignored-env.xpi"))
+
+    assert main(
+        [
+            "extension",
+            "build",
+            "--out",
+            str(out),
+            "--target",
+            "firefox",
+            "--firefox-path",
+            str(executable),
+            "--firefox-xpi",
+            str(signed_xpi),
+        ]
+    ) == 0
+
+    policy = executable.parent / "distribution" / "policies.json"
+    document = json.loads(policy.read_text(encoding="utf-8"))
+    extension = document["policies"]["ExtensionSettings"]["bridge@emunium.dev"]
+    assert extension["install_url"] == signed_xpi.resolve().as_uri()
 
 
 def test_cli_firefox_path_requires_firefox_target(tmp_path, capsys):
@@ -440,6 +476,23 @@ def test_cli_firefox_path_requires_firefox_target(tmp_path, capsys):
         == 1
     )
     assert "--firefox-path requires --target firefox" in capsys.readouterr().err
+
+
+def test_cli_firefox_xpi_requires_firefox_path(tmp_path, capsys):
+    assert (
+        main(
+            [
+                "extension",
+                "build",
+                "--out",
+                str(tmp_path),
+                "--firefox-xpi",
+                str(tmp_path / "firefox.xpi"),
+            ]
+        )
+        == 1
+    )
+    assert "--firefox-xpi requires --firefox-path" in capsys.readouterr().err
 
 
 def test_cli_rejects_bad_port(home, tmp_path, capsys):

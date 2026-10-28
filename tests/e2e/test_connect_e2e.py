@@ -49,12 +49,9 @@ from emunium._browser.cdp_pipe import CdpPipe
 from emunium._browser.extension_targets import FIREFOX_GECKO_ID
 from emunium._browser.firefox import (
     firefox_policy_path,
-    write_firefox_policy,
-    write_user_prefs,
 )
 from emunium._browser.launcher import (
     CDP_PIPE,
-    FIREFOX_WAIT_FLAG,
     PROTOCOL_VERSION,
     ResolvedBrowser,
     _attach_job,
@@ -292,15 +289,11 @@ def _start_cdp_pipe(
     return process
 
 
-def _start_firefox_policy(
+def _preserve_firefox_policy(
     resolved: ResolvedBrowser,
-    xpi_path: str,
-    profile: str,
-    log_path: Path,
     cleanup: contextlib.ExitStack,
-) -> subprocess.Popen:
-    """Register the attach XPI with Enterprise Policies, then start Firefox."""
-    xpi = Path(xpi_path)
+) -> None:
+    """Arrange to restore Firefox's installation-wide policy after the test."""
     policy_path = firefox_policy_path(resolved.path)
     policy_dir_existed = policy_path.parent.exists()
     try:
@@ -310,26 +303,6 @@ def _start_firefox_policy(
     cleanup.callback(
         _restore_firefox_policy, policy_path, previous_policy, policy_dir_existed
     )
-    try:
-        write_firefox_policy(resolved.path, xpi)
-    except LaunchError as exc:
-        pytest.skip(f"Firefox Enterprise Policies are unavailable at {policy_path}: {exc}")
-
-    write_user_prefs(profile)
-    args = [resolved.path, "-profile", profile, "-no-remote", "-headless"]
-    if IS_WINDOWS:
-        # The launcher stub would exit at once; the tree kill needs it alive.
-        args.append(FIREFOX_WAIT_FLAG)
-    with open(log_path, "wb") as log_file:
-        process = subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=log_file,
-            start_new_session=NEW_SESSION,
-        )
-    _own_tree(process, resolved.label, cleanup)
-    return process
 
 
 def _restore_firefox_policy(
@@ -353,9 +326,7 @@ def _start_with_build(
     log_path: Path,
     cleanup: contextlib.ExitStack,
 ) -> subprocess.Popen:
-    if resolved.family == "firefox":
-        start = _start_firefox_policy
-    elif resolved.install_method == CDP_PIPE:
+    if resolved.install_method == CDP_PIPE:
         start = _start_cdp_pipe
     else:
         start = _start_load_extension
@@ -418,13 +389,18 @@ def _kill_leftovers(profile: str) -> None:
 
 
 def test_connect_to_installed_build(
-    browser_name: str, site_url: str, hub_port: int, tmp_path: Path
+    browser_name: str,
+    site_url: str,
+    hub_port: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reason = _skip_reason(browser_name)
     if reason is not None:
         pytest.skip(reason)
     resolved = resolve_browser(browser_name)
-    if resolved.family == "firefox":
+    is_firefox = resolved.family == "firefox"
+    if is_firefox:
         if _existing_firefox_processes():
             pytest.skip(
                 "Firefox is already running; its installation-wide policy would "
@@ -432,23 +408,39 @@ def test_connect_to_installed_build(
             )
         xpi, signed_port, enrollment = _signed_firefox_xpi()
         _seed_signed_firefox_hub(signed_port, enrollment)
-        extension_path = str(xpi)
     else:
         extension_path = _build(resolved, tmp_path, hub_port)
     profile = _profile_dir(tmp_path)
 
     try:
         with contextlib.ExitStack() as cleanup:
-            process = _start_with_build(
-                resolved, extension_path, profile, tmp_path / "browser.log", cleanup
-            )
+            process: subprocess.Popen | None = None
+            extra_args: list[str] | None = None
+            start = False
+            if is_firefox:
+                _preserve_firefox_policy(resolved, cleanup)
+                monkeypatch.setenv(FIREFOX_XPI_ENV, str(xpi))
+                # This unique profile is the only process the cleanup may kill.
+                cleanup.callback(_kill_leftovers, profile)
+                extra_args = ["-no-remote", "-headless"]
+                start = True
+            else:
+                process = _start_with_build(
+                    resolved, extension_path, profile, tmp_path / "browser.log", cleanup
+                )
 
-            first = Browser.connect(
-                browser_name,
-                user_data_dir=profile,
-                start=False,
-                timeout=CONNECT_TIMEOUT,
-            )
+            try:
+                first = Browser.connect(
+                    browser_name,
+                    user_data_dir=profile,
+                    start=start,
+                    timeout=CONNECT_TIMEOUT,
+                    extra_args=extra_args,
+                )
+            except LaunchError as exc:
+                if is_firefox and "Firefox policy" in str(exc):
+                    pytest.skip(f"Firefox Enterprise Policies are unavailable: {exc}")
+                raise
             cleanup.callback(first.close)
             _check_session(first, browser_name, site_url)
             first.close()
@@ -458,8 +450,11 @@ def test_connect_to_installed_build(
             assert confirmed is False, f"install {install_id}: confirmed={confirmed!r}"
 
             # close() detaches only: the browser keeps running.
-            assert process.poll() is None, f"{browser_name} exited on close()"
-            _assert_profile_in_use(profile)
+            if process is None:
+                _assert_profile_in_use(profile)
+            else:
+                assert process.poll() is None, f"{browser_name} exited on close()"
+                _assert_profile_in_use(profile)
 
             # The install now holds a token: this is the stored-token handshake.
             second = Browser.connect(

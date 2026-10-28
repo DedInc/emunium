@@ -24,6 +24,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from emunium._browser.firefox import write_firefox_policy
 from emunium._browser.launcher import (
     ResolvedBrowser,
     _stop_process_tree,
@@ -216,6 +217,8 @@ def connect(
             resolved = resolve(browser, True)
             connection.resolved = resolved
             argv = spawn_argv(resolved, user_data_dir, profile_directory, extra)
+            if resolved.family == "firefox":
+                write_firefox_policy(resolved.path)
             if user_data_dir is not None:
                 Path(user_data_dir).expanduser().resolve().mkdir(
                     parents=True, exist_ok=True

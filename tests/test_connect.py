@@ -40,7 +40,9 @@ STATE_DIR = "C:/Users/me/AppData/Roaming/emunium"
 STATE = {"port": 47800, "state_dir": STATE_DIR, "hub_path": STATE_DIR + "/hub.json"}
 CHROME = ResolvedBrowser("chrome", "C:/Chrome/chrome.exe", "chromium", "cdp-pipe")
 EDGE = ResolvedBrowser("edge", "C:/Edge/msedge.exe", "chromium", "load-extension")
-FIREFOX = ResolvedBrowser("firefox", "C:/Firefox/firefox.exe", "firefox", "bidi")
+FIREFOX = ResolvedBrowser(
+    "firefox", "C:/Firefox/firefox.exe", "firefox", "enterprise-policies"
+)
 
 
 class FakeClock:
@@ -135,6 +137,8 @@ class Rig:
         self.resolved = resolved
         self.resolve_calls: list[tuple[str | None, bool]] = []
         self.spawned: list[list[str]] = []
+        self.policy_calls: list[str] = []
+        self.events: list[str] = []
         self.stopped: list[Any] = []
         self.loaded_ports: list[int | None] = []
         self.table: list[ProcessEntry] = []
@@ -161,11 +165,16 @@ class Rig:
         return self.resolved
 
     def spawn(self, argv: list[str]) -> Any:
+        self.events.append("spawn")
         self.spawned.append(argv)
         if self.connect_after_spawn:
             # The extension connects once the browser is up.
             self.transport.connect_on_wait = len(self.transport.waits)
         return FakeProcess(self.next_pid)
+
+    def register_firefox_policy(self, executable: str) -> None:
+        self.events.append("policy")
+        self.policy_calls.append(executable)
 
     def process_table(self) -> list[ProcessEntry]:
         return self.table
@@ -187,6 +196,7 @@ class Rig:
 @pytest.fixture
 def rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
     rig = Rig()
+    monkeypatch.setattr(connect_mod, "write_firefox_policy", rig.register_firefox_policy)
     monkeypatch.setattr(
         connect_mod,
         "_stop_process_tree",
@@ -341,6 +351,28 @@ def test_firefox_spawn_argv_uses_profile(rig: Rig, tmp_path: Path) -> None:
     rig.resolved = FIREFOX
     rig.connect(browser="firefox", user_data_dir=str(tmp_path), extra_args=["-x"])
     assert rig.spawned == [[FIREFOX.path, "-profile", str(tmp_path.resolve()), "-x"]]
+
+
+def test_firefox_policy_is_registered_before_spawn(rig: Rig) -> None:
+    rig.resolved = FIREFOX
+
+    rig.connect(browser="firefox")
+
+    assert rig.policy_calls == [FIREFOX.path]
+    assert rig.events == ["policy", "spawn"]
+
+
+def test_firefox_policy_is_not_touched_when_extension_is_already_connected(
+    rig: Rig,
+) -> None:
+    rig.resolved = FIREFOX
+    rig.transport.connect_on_wait = 0
+
+    connection = rig.connect(browser="firefox")
+
+    assert not connection.started_browser
+    assert rig.policy_calls == []
+    assert rig.spawned == []
 
 
 def test_firefox_without_profile_uses_its_default(rig: Rig) -> None:
