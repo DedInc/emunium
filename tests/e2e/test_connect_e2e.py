@@ -4,10 +4,10 @@
 The attach build is installed the way a persistent install looks to emunium:
 a browser runs headless on its own temporary profile with the build loaded
 (``--load-extension`` for Edge, Brave, Chromium and Chrome for Testing,
-``Extensions.loadUnpacked`` over the CDP pipe for Google Chrome, WebDriver
-BiDi ``webExtension.install`` for Firefox). ``connect`` must then reach that
-extension through ``AttachTransport``, detach on ``close()`` without stopping
-the browser, and connect again with the stored install token.
+``Extensions.loadUnpacked`` over the CDP pipe for Google Chrome, and a local
+Firefox XPI registered through Enterprise Policies). ``connect`` must then
+reach that extension through ``AttachTransport``, detach on ``close()`` without
+stopping the browser, and connect again with the stored install token.
 
 Parametrized by ``browser_name`` like the AB7 matrix; a missing browser or a
 missing ``cryptography`` package is a skip. No OS input is sent.
@@ -22,10 +22,19 @@ import os
 import signal
 import socket
 import subprocess
+import sys
+import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
-from test_browsers_e2e import _leftovers_after_close, _processes_using, _skip_reason
+from test_browsers_e2e import (
+    _leftovers_after_close,
+    _linux_processes,
+    _processes_using,
+    _skip_reason,
+    _windows_processes,
+)
 
 from emunium import Browser
 from emunium._attach.build import (
@@ -33,25 +42,26 @@ from emunium._attach.build import (
     STATE_DIR_ENV,
     build_extension,
     load_install,
+    load_or_create_state,
     state_dir,
 )
 from emunium._browser.cdp_pipe import CdpPipe
+from emunium._browser.extension_targets import FIREFOX_GECKO_ID
 from emunium._browser.firefox import (
-    BidiSession,
-    firefox_args,
-    read_bidi_url,
+    firefox_policy_path,
+    write_firefox_policy,
     write_user_prefs,
 )
 from emunium._browser.launcher import (
-    BIDI,
     CDP_PIPE,
     FIREFOX_WAIT_FLAG,
+    PROTOCOL_VERSION,
     ResolvedBrowser,
     _attach_job,
-    _close_stream_bounded,
     _stop_process_tree,
     resolve_browser,
 )
+from emunium.errors import LaunchError
 
 pytestmark = pytest.mark.e2e
 
@@ -61,14 +71,18 @@ NEW_SESSION = not IS_WINDOWS
 # A cold profile may take a while to start the extension's service worker, and
 # a reconnect waits out the extension's back-off (1 s doubling, 30 s cap).
 CONNECT_TIMEOUT = 60.0
-BIDI_ANNOUNCE_TIMEOUT = 60.0
-STDERR_CLOSE_BUDGET_SECONDS = 1.0
 TASKKILL_TIMEOUT_SECONDS = 30.0
 SITE_PAGE = "/index.html"
 FIRST_RUN_FLAGS = ("--no-first-run", "--no-default-browser-check")
 HEADLESS_FLAG = "--headless=new"
 # Browsers the start=True test may use, in order of preference.
 START_CANDIDATES = ("edge", "cft")
+FIREFOX_XPI_ENV = "EMUNIUM_FIREFOX_XPI"
+DEFAULT_FIREFOX_XPI = (
+    Path(__file__).resolve().parents[2]
+    / "attach_build"
+    / "emunium-extension-firefox.xpi"
+)
 
 
 @pytest.fixture
@@ -101,6 +115,111 @@ def _build(resolved: ResolvedBrowser, tmp_path: Path, port: int) -> str:
     build = build_extension(tmp_path / "build", port=port, target=target)
     assert build["port"] == port
     return build["unpacked_dir"]
+
+
+def _signed_firefox_xpi() -> tuple[Path, int, str]:
+    """Read the signed local Firefox artifact and its loopback hub settings."""
+    candidate = Path(
+        os.environ.get(FIREFOX_XPI_ENV, str(DEFAULT_FIREFOX_XPI))
+    ).expanduser()
+    if not candidate.is_file():
+        pytest.skip(
+            f"signed Firefox XPI not found at {candidate}; set {FIREFOX_XPI_ENV}"
+        )
+    try:
+        with zipfile.ZipFile(candidate) as archive:
+            names = {name.casefold() for name in archive.namelist()}
+            manifest = json.loads(archive.read("manifest.json"))
+            attach = json.loads(archive.read("attach.json"))
+    except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        pytest.fail(f"could not read signed Firefox XPI metadata: {type(exc).__name__}")
+
+    signature_files = {
+        "meta-inf/manifest.mf",
+        "meta-inf/mozilla.sf",
+        "meta-inf/mozilla.rsa",
+    }
+    if not signature_files.issubset(names):
+        pytest.fail("Firefox XPI is missing Mozilla signature metadata")
+    gecko_id = (
+        manifest.get("browser_specific_settings", {})
+        .get("gecko", {})
+        .get("id")
+    )
+    if gecko_id != FIREFOX_GECKO_ID:
+        pytest.fail("Firefox XPI has an unexpected Gecko extension ID")
+    if attach.get("protocol") != PROTOCOL_VERSION or attach.get("mode") != "attach":
+        pytest.fail("Firefox XPI has incompatible attach metadata")
+    endpoint = urlsplit(str(attach.get("hubUrl", "")))
+    if (
+        endpoint.scheme != "ws"
+        or endpoint.hostname not in {"127.0.0.1", "localhost"}
+        or endpoint.path
+        or endpoint.query
+        or endpoint.fragment
+        or endpoint.port is None
+    ):
+        pytest.fail("Firefox XPI must target a loopback WebSocket hub")
+    enrollment = attach.get("enrollment")
+    if not isinstance(enrollment, str) or len(enrollment) < 43:
+        pytest.fail("Firefox XPI has invalid enrollment metadata")
+    return candidate.resolve(), endpoint.port, enrollment
+
+
+def _seed_signed_firefox_hub(port: int, enrollment: str) -> None:
+    """Use the signed XPI's fixed port and enrollment in this test's temp hub."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            pytest.skip(f"signed Firefox XPI hub port {port} is already in use")
+
+    state = load_or_create_state(port=port)
+    hub_path = Path(state["hub_path"])
+    hub = json.loads(hub_path.read_text(encoding="utf-8"))
+    if not isinstance(hub, dict) or not isinstance(hub.get("installs"), dict):
+        pytest.fail("temporary Firefox hub state has an invalid shape")
+    hub["port"] = port
+    hub["enrollment"] = enrollment
+    hub["installs"] = {}
+    hub_path.write_text(json.dumps(hub, indent=2) + "\n", encoding="utf-8")
+
+
+def _existing_firefox_processes() -> list[str]:
+    """Firefox policies affect every profile, so don't race an open instance."""
+    if IS_WINDOWS:
+        processes = _windows_processes()
+    elif sys.platform.startswith("linux"):
+        processes = _linux_processes()
+    elif sys.platform == "darwin":
+        result = subprocess.run(
+            ["pgrep", "-fl", "firefox"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        processes = []
+        if result.returncode == 0:
+            processes = [
+                (int(line.split(maxsplit=1)[0]), line.split(maxsplit=1)[-1])
+                for line in result.stdout.splitlines()
+                if line.split(maxsplit=1)[0].isdigit()
+            ]
+    else:
+        return []
+
+    def is_firefox(command: str) -> bool:
+        command = os.path.normcase(command)
+        if IS_WINDOWS:
+            return "firefox.exe" in command
+        executable = command.split(maxsplit=1)[0].rsplit("/", maxsplit=1)[-1]
+        return executable.startswith("firefox")
+
+    return [
+        command
+        for pid, command in processes
+        if pid != os.getpid() and is_firefox(command)
+    ]
 
 
 def _own_tree(
@@ -173,57 +292,74 @@ def _start_cdp_pipe(
     return process
 
 
-def _start_bidi(
+def _start_firefox_policy(
     resolved: ResolvedBrowser,
-    unpacked: str,
+    xpi_path: str,
     profile: str,
     log_path: Path,
     cleanup: contextlib.ExitStack,
 ) -> subprocess.Popen:
-    """Firefox loads no unpacked extension from the command line: BiDi install."""
+    """Register the attach XPI with Enterprise Policies, then start Firefox."""
+    xpi = Path(xpi_path)
+    policy_path = firefox_policy_path(resolved.path)
+    policy_dir_existed = policy_path.parent.exists()
+    try:
+        previous_policy = policy_path.read_bytes() if policy_path.exists() else None
+    except OSError as exc:
+        pytest.skip(f"Firefox Enterprise Policy file is not readable at {policy_path}: {exc}")
+    cleanup.callback(
+        _restore_firefox_policy, policy_path, previous_policy, policy_dir_existed
+    )
+    try:
+        write_firefox_policy(resolved.path, xpi)
+    except LaunchError as exc:
+        pytest.skip(f"Firefox Enterprise Policies are unavailable at {policy_path}: {exc}")
+
     write_user_prefs(profile)
-    args = firefox_args(resolved.path, profile, headless=True)
+    args = [resolved.path, "-profile", profile, "-no-remote", "-headless"]
     if IS_WINDOWS:
         # The launcher stub would exit at once; the tree kill needs it alive.
         args.append(FIREFOX_WAIT_FLAG)
-    # Kept open until cleanup: the stderr drain copies every Firefox line into it.
-    with contextlib.ExitStack() as log_stack:
-        log_file = log_stack.enter_context(open(log_path, "wb"))
-        cleanup.enter_context(log_stack.pop_all())
-    process = subprocess.Popen(
-        args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        start_new_session=NEW_SESSION,
-    )
-    stderr = process.stderr
-    assert stderr is not None
-    # After the tree is gone, so the stderr drain sees EOF.
-    cleanup.callback(_close_stream_bounded, stderr, STDERR_CLOSE_BUDGET_SECONDS)
+    with open(log_path, "wb") as log_file:
+        process = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            start_new_session=NEW_SESSION,
+        )
     _own_tree(process, resolved.label, cleanup)
-    url = read_bidi_url(stderr, BIDI_ANNOUNCE_TIMEOUT, sink=log_file)
-    bidi = BidiSession(url)
-    cleanup.callback(bidi.close)
-    bidi.new_session()
-    bidi.install_extension(unpacked)
     return process
+
+
+def _restore_firefox_policy(
+    policy_path: Path, previous_policy: bytes | None, policy_dir_existed: bool
+) -> None:
+    """Restore the exact prior file, removing only test-created policy data."""
+    if previous_policy is None:
+        with contextlib.suppress(FileNotFoundError):
+            policy_path.unlink()
+        if not policy_dir_existed:
+            with contextlib.suppress(OSError):
+                policy_path.parent.rmdir()
+        return
+    policy_path.write_bytes(previous_policy)
 
 
 def _start_with_build(
     resolved: ResolvedBrowser,
-    unpacked: str,
+    extension_path: str,
     profile: str,
     log_path: Path,
     cleanup: contextlib.ExitStack,
 ) -> subprocess.Popen:
-    if resolved.install_method == BIDI:
-        start = _start_bidi
+    if resolved.family == "firefox":
+        start = _start_firefox_policy
     elif resolved.install_method == CDP_PIPE:
         start = _start_cdp_pipe
     else:
         start = _start_load_extension
-    return start(resolved, unpacked, profile, log_path, cleanup)
+    return start(resolved, extension_path, profile, log_path, cleanup)
 
 
 def _check_session(browser: Browser, name: str, site_url: str) -> None:
@@ -288,13 +424,23 @@ def test_connect_to_installed_build(
     if reason is not None:
         pytest.skip(reason)
     resolved = resolve_browser(browser_name)
-    unpacked = _build(resolved, tmp_path, hub_port)
+    if resolved.family == "firefox":
+        if _existing_firefox_processes():
+            pytest.skip(
+                "Firefox is already running; its installation-wide policy would "
+                "share the signed XPI's fixed hub port with this test"
+            )
+        xpi, signed_port, enrollment = _signed_firefox_xpi()
+        _seed_signed_firefox_hub(signed_port, enrollment)
+        extension_path = str(xpi)
+    else:
+        extension_path = _build(resolved, tmp_path, hub_port)
     profile = _profile_dir(tmp_path)
 
     try:
         with contextlib.ExitStack() as cleanup:
             process = _start_with_build(
-                resolved, unpacked, profile, tmp_path / "browser.log", cleanup
+                resolved, extension_path, profile, tmp_path / "browser.log", cleanup
             )
 
             first = Browser.connect(
