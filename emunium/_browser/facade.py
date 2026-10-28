@@ -199,6 +199,15 @@ class Browser:
         session.resolved = connection.resolved
         ctx = instance._ctx
         ctx.bridge = bridge
+        resolved = connection.resolved
+        ctx.browser_family = (
+            resolved.family
+            if resolved is not None
+            else "firefox"
+            if connection.browser_name == "firefox"
+            else None
+        )
+        ctx.install_method = None if resolved is None else resolved.install_method
         try:
             tab_ops.pin_active(ctx)
         except BaseException:
@@ -279,6 +288,9 @@ class Browser:
             raise
         process = self._session.process
         self._ctx.pid = None if process is None else process.pid
+        resolved = self._session.resolved
+        self._ctx.browser_family = None if resolved is None else resolved.family
+        self._ctx.install_method = None if resolved is None else resolved.install_method
         try:
             self._ctx.ensure_foreground(None)
         except NativeInputError as exc:

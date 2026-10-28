@@ -1034,6 +1034,10 @@ def test_browser_path_must_exist():
         ),
         (r"C:\Program Files\Mozilla Firefox\firefox.exe", "firefox", "bidi"),
         ("/usr/lib/firefox-esr/firefox-esr", "firefox", "bidi"),
+        (r"C:\Apps\camoufox\camoufox.exe", "firefox", "bidi"),
+        (r"C:\Apps\waterfox\waterfox.exe", "firefox", "bidi"),
+        ("/usr/bin/librewolf", "firefox", "bidi"),
+        ("/opt/zen/zen", "firefox", "bidi"),
         (
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
             "edge",

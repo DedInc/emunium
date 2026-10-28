@@ -18,6 +18,8 @@ from emunium._bridge.facade import Bridge
 from emunium._element_interactor import ElementInteractor
 from emunium._motion import DEFAULT_TARGET_SIZE, MotionPlanner, TypingRhythm
 from emunium._native.win32 import (
+    CHROME_WINDOW_CLASS,
+    GECKO_WINDOW_CLASS,
     Win32Windows,
     WindowApi,
     bring_to_foreground,
@@ -213,6 +215,9 @@ class BrowserContext:
         self.pid = pid
         # Window API, created on first use (Win32Windows needs Windows).
         self._windows = windows
+        # Browser.launch/connect populate these before foreground selection.
+        self.browser_family: str | None = None
+        self.install_method: str | None = None
 
     @classmethod
     def of(cls, ctx_or_bridge: BrowserContext | Bridge) -> BrowserContext:
@@ -270,7 +275,14 @@ class BrowserContext:
             return
         try:
             api = self._window_api()
-            candidates = top_level_windows(descendant_pids(pid, api), api)
+            class_name = (
+                GECKO_WINDOW_CLASS
+                if self.browser_family == "firefox" or self.install_method == "bidi"
+                else CHROME_WINDOW_CLASS
+            )
+            candidates = top_level_windows(
+                descendant_pids(pid, api), api, class_name=class_name
+            )
             if geometry is None:
                 window = pick_browser_window(candidates, None, 1.0)
             else:

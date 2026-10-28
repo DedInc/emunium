@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol, TypeAlias
 
 from emunium._native import check_failsafe
@@ -1077,6 +1077,7 @@ CLASS_NAME_CHARS = 256
 
 # Class of Chrome's top-level browser windows (owned by the browser process).
 CHROME_WINDOW_CLASS = "Chrome_WidgetWin_1"
+GECKO_WINDOW_CLASS = "MozillaWindowClass"
 # Largest edge distance, in physical px, at which a window still matches the
 # geometry Chrome reports: rounding of DIPs and the frame's invisible resize
 # borders (7-8 px on Windows 10/11) both fit inside it.
@@ -1405,12 +1406,13 @@ def top_level_windows(
     pid_set: Collection[int],
     api: WindowApi | None = None,
     *,
-    class_name: str = CHROME_WINDOW_CLASS,
+    class_name: str | tuple[str, ...] | Callable[[str], bool] = CHROME_WINDOW_CLASS,
 ) -> list[WindowInfo]:
-    """Visible top-level ``class_name`` windows owned by ``pid_set``, in Z order.
+    """Visible matching-class windows owned by ``pid_set``, in Z order.
 
     Invisible, zero-size and tool windows are skipped, as is a window that
-    vanishes while it is being read. Minimized windows stay in the list.
+    vanishes while it is being read. ``class_name`` may be one exact name, a
+    tuple of exact names, or a predicate. Minimized windows stay in the list.
     """
     windows = api if api is not None else Win32Windows()
     wanted = frozenset(pid_set)
@@ -1424,7 +1426,13 @@ def top_level_windows(
         if windows.ex_style(hwnd) & WS_EX_TOOLWINDOW:
             continue
         name = windows.class_name(hwnd)
-        if name != class_name:
+        if isinstance(class_name, str):
+            matches_class = name == class_name
+        elif isinstance(class_name, tuple):
+            matches_class = name in class_name
+        else:
+            matches_class = class_name(name)
+        if not matches_class:
             continue
         rect = windows.window_rect(hwnd)
         if rect is None:

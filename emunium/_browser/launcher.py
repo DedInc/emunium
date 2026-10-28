@@ -586,7 +586,12 @@ def _auto(
 def _from_path(path: str, cft_dir: str | None) -> ResolvedBrowser:
     parts = [p.lower() for p in _PATH_SEPARATORS.split(path) if p]
     basename = parts[-1] if parts else ""
-    if "firefox" in basename:
+    stem = Path(path).stem.lower()
+    if (
+        stem.endswith("fox")
+        or stem.startswith("firefox-")
+        or stem in ("librewolf", "floorp", "zen")
+    ):
         return ResolvedBrowser("firefox", path, "firefox", BIDI)
     if _is_chrome_for_testing(parts, cft_dir):
         return ResolvedBrowser(CFT_NAME, path, "chromium", LOAD_EXTENSION)
