@@ -196,7 +196,9 @@ class Rig:
 @pytest.fixture
 def rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
     rig = Rig()
-    monkeypatch.setattr(connect_mod, "write_firefox_policy", rig.register_firefox_policy)
+    monkeypatch.setattr(
+        connect_mod, "write_firefox_policy", rig.register_firefox_policy
+    )
     monkeypatch.setattr(
         connect_mod,
         "_stop_process_tree",

@@ -70,8 +70,6 @@ packages = ["emunium"]
 include = ["LICENSE"]
 # PEP 561 marker; listed so it ships even if a VCS ignore rule ever matched it.
 artifacts = ["emunium/py.typed"]
-# Internal persistent-extension builder; not part of this release's API.
-exclude = ["emunium/_attach", "emunium/__main__.py"]
 
 [tool.hatch.build.targets.sdist]
 # Allow-list: local scratch (.spike/ browser profiles), agent tooling and docs
@@ -85,8 +83,6 @@ only-include = [
     "pyproject.toml",
 ]
 artifacts = ["emunium/py.typed"]
-# tests/test_build.py imports emunium._attach, which the sdist does not ship.
-exclude = ["emunium/_attach", "emunium/__main__.py", "tests/test_build.py"]
 
 [tool.ruff]
 target-version = "py310"

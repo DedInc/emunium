@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -440,20 +441,23 @@ def test_cli_registers_explicit_signed_firefox_xpi(home, source, tmp_path, monke
     signed_xpi.write_bytes(b"signed xpi placeholder")
     monkeypatch.setenv(FIREFOX_XPI_ENV, str(tmp_path / "ignored-env.xpi"))
 
-    assert main(
-        [
-            "extension",
-            "build",
-            "--out",
-            str(out),
-            "--target",
-            "firefox",
-            "--firefox-path",
-            str(executable),
-            "--firefox-xpi",
-            str(signed_xpi),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "extension",
+                "build",
+                "--out",
+                str(out),
+                "--target",
+                "firefox",
+                "--firefox-path",
+                str(executable),
+                "--firefox-xpi",
+                str(signed_xpi),
+            ]
+        )
+        == 0
+    )
 
     policy = executable.parent / "distribution" / "policies.json"
     document = json.loads(policy.read_text(encoding="utf-8"))
@@ -551,3 +555,87 @@ def test_sdist_ships_py_typed():
     with tarfile.open(sdist, "r:gz") as archive:
         names = archive.getnames()
     assert names.count(f"emunium-{version}/emunium/py.typed") == 1
+
+
+REQUIRED_RUNTIME_FILES = {
+    "emunium/__main__.py",
+    "emunium/_attach/__init__.py",
+    "emunium/_attach/build.py",
+    "emunium/_attach/server.py",
+    "emunium/py.typed",
+    "emunium/extension/manifest.json",
+    "emunium/extension/background.js",
+}
+
+
+def test_distributions_ship_attach_runtime():
+    version = _project()["project"]["version"]
+    with zipfile.ZipFile(_distribution(f"emunium-{version}-py3-none-any.whl")) as wheel:
+        assert REQUIRED_RUNTIME_FILES <= set(wheel.namelist())
+    with tarfile.open(_distribution(f"emunium-{version}.tar.gz")) as sdist:
+        prefix = f"emunium-{version}/"
+        names = {name.removeprefix(prefix) for name in sdist.getnames()}
+        assert REQUIRED_RUNTIME_FILES | {"tests/test_build.py"} <= names
+
+
+@needs_crypto
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+def test_installed_distribution_builds_attach_extension(kind, tmp_path):
+    """Install outside the checkout; an editable install must not mask missing files."""
+    version = _project()["project"]["version"]
+    filename = (
+        f"emunium-{version}-py3-none-any.whl"
+        if kind == "wheel"
+        else f"emunium-{version}.tar.gz"
+    )
+    artifact = _distribution(filename)
+    target = tmp_path / "installed"
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--no-build-isolation",
+        "--target",
+        str(target),
+        str(artifact),
+    ]
+    installed = subprocess.run(
+        command, cwd=tmp_path, capture_output=True, text=True, timeout=120, check=False
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    env = dict(os.environ, EMUNIUM_HOME=str(tmp_path / "home"))
+    # -I ignores PYTHONPATH and the current directory. Assert every imported
+    # emunium module came from the installed distribution, then exercise the CLI.
+    script = """
+import json, pathlib, runpy, sys
+target = pathlib.Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(target))
+from emunium import Browser
+import emunium._browser.connect
+import emunium._attach.server
+assert callable(Browser.connect)
+sys.argv = ['emunium', 'extension', 'build', '--out', 'extension-out']
+try:
+    runpy.run_module('emunium', run_name='__main__')
+except SystemExit as exc:
+    assert exc.code in (None, 0), exc.code
+for name, module in list(sys.modules.items()):
+    if name == 'emunium' or name.startswith('emunium.'):
+        assert pathlib.Path(module.__file__).resolve().is_relative_to(target), name
+folder = pathlib.Path('extension-out/emunium-extension')
+assert json.loads((folder / 'attach.json').read_text())['mode'] == 'attach'
+assert (folder / 'background.js').is_file()
+assert pathlib.Path('extension-out/emunium-extension.crx').is_file()
+"""
+    smoke = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(target)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert smoke.returncode == 0, smoke.stdout + smoke.stderr

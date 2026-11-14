@@ -2,9 +2,10 @@
 """One smoke case per browser: headless launch, DOM work, close, no leftovers.
 
 Parametrized by ``browser_name`` (see ``conftest.py``): every discoverable
-browser plus Chrome for Testing, narrowed with ``--browsers``. A browser that
-is not installed is skipped with the reason. No OS input is sent: the click
-goes through the DOM.
+browser plus Chrome for Testing, narrowed with ``--browsers``. Firefox launch
+is refused; its successful DOM coverage uses connect in test_connect_e2e.py.
+A browser that is not installed is skipped with the reason. No OS input is
+sent: the click goes through the DOM.
 """
 
 from __future__ import annotations
@@ -19,11 +20,11 @@ import time
 import pytest
 
 from emunium import Browser
+from emunium.errors import LaunchError
 
 pytestmark = pytest.mark.e2e
 
-# The extension may take a while on a cold profile (Firefox installs it over
-# WebDriver BiDi after start-up).
+# The extension may take a while on a cold profile.
 BRIDGE_TIMEOUT = 60.0
 # close() stops the process tree before returning; the grace only absorbs the
 # OS publishing the exits.
@@ -158,6 +159,10 @@ def test_browser_matrix(browser_name: str, site_url: str) -> None:
     with contextlib.ExitStack() as cleanup:
         # Registered before launch(): a half-started browser is closed too.
         cleanup.callback(browser.close)
+        if browser_name == "firefox":
+            with pytest.raises(LaunchError, match=r"Browser\.connect"):
+                browser.launch()
+            return
         browser.launch()
         assert browser.browser_name == browser_name
         # Read before close(), which forgets it; a temporary profile lives in

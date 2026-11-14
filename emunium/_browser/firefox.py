@@ -75,7 +75,11 @@ def firefox_policy_path(executable: str | Path) -> Path:
         raise LaunchError(f"Firefox executable does not exist: {browser_path}")
 
     app_root = next(
-        (parent for parent in browser_path.parents if parent.name.casefold().endswith(".app")),
+        (
+            parent
+            for parent in browser_path.parents
+            if parent.name.casefold().endswith(".app")
+        ),
         None,
     )
     install_root = (
@@ -110,14 +114,18 @@ def firefox_install_url(source: str | Path | None = None) -> str:
                 and not parsed.fragment
             ):
                 return source
-            raise LaunchError("Firefox XPI URL must be a valid HTTPS URL ending in .xpi")
+            raise LaunchError(
+                "Firefox XPI URL must be a valid HTTPS URL ending in .xpi"
+            )
         if len(parsed.scheme) > 1:
             raise LaunchError("Firefox XPI source must be a local path or an HTTPS URL")
 
     try:
         xpi = Path(source).expanduser().resolve()
     except TypeError as exc:
-        raise LaunchError("Firefox XPI source must be a local path or an HTTPS URL") from exc
+        raise LaunchError(
+            "Firefox XPI source must be a local path or an HTTPS URL"
+        ) from exc
     if not xpi.is_file():
         raise LaunchError(f"Firefox extension XPI does not exist: {xpi}")
     return xpi.as_uri()
@@ -129,6 +137,7 @@ def write_firefox_policy(
     """Merge a force-installed signed XPI into Firefox's ``policies.json``.
 
     Existing policy data and fields on this extension's settings are preserved.
+    First-run Terms are skipped unless explicitly configured otherwise.
     The file is replaced atomically so an interrupted write cannot truncate it.
     Without an explicit source, use ``EMUNIUM_FIREFOX_XPI`` or the signed release
     artifact for the installed ``emunium`` version.
@@ -172,6 +181,8 @@ def write_firefox_policy(
             raise LaunchError(
                 f"Firefox policy file {policy_path} has a non-object 'policies' value"
             )
+        # Firefox 138+: about:welcome preferences do not suppress the Terms modal.
+        policies.setdefault("SkipTermsOfUse", True)
         preferences = policies.setdefault("Preferences", {})
         if not isinstance(preferences, dict):
             raise LaunchError(

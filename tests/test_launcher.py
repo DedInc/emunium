@@ -309,7 +309,6 @@ def test_chrome_args(env):
         "--no-default-browser-check",
         "--disable-default-apps",
         "--disable-popup-blocking",
-        "--disable-infobars",
         "--disable-notifications",
         "--disable-features=ChromeWhatsNewUI,AutofillServerCommunication,TranslateUI,OptimizationHints",
         "--disable-background-timer-throttling",
@@ -323,6 +322,7 @@ def test_chrome_args(env):
     ):
         assert flag in args
     assert args[-1] == "--window-size=800,600"
+    assert "--disable-infobars" not in args
     assert args.index("--headless=new") < args.index("--window-size=800,600")
     assert SITE_ISOLATION_FLAG not in args
     assert not any("IsolateOrigins" in a or "site-per-process" in a for a in args)

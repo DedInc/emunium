@@ -74,7 +74,6 @@ CHROME_FLAGS = (
     "--no-default-browser-check",
     "--disable-default-apps",
     "--disable-popup-blocking",
-    "--disable-infobars",
     "--disable-notifications",
     "--disable-features=ChromeWhatsNewUI,AutofillServerCommunication,TranslateUI,OptimizationHints",
     "--disable-background-timer-throttling",

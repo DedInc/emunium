@@ -128,7 +128,13 @@ def _signed_firefox_xpi() -> tuple[Path, int, str]:
             names = {name.casefold() for name in archive.namelist()}
             manifest = json.loads(archive.read("manifest.json"))
             attach = json.loads(archive.read("attach.json"))
-    except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (
+        OSError,
+        zipfile.BadZipFile,
+        KeyError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
         pytest.fail(f"could not read signed Firefox XPI metadata: {type(exc).__name__}")
 
     signature_files = {
@@ -138,11 +144,7 @@ def _signed_firefox_xpi() -> tuple[Path, int, str]:
     }
     if not signature_files.issubset(names):
         pytest.fail("Firefox XPI is missing Mozilla signature metadata")
-    gecko_id = (
-        manifest.get("browser_specific_settings", {})
-        .get("gecko", {})
-        .get("id")
-    )
+    gecko_id = manifest.get("browser_specific_settings", {}).get("gecko", {}).get("id")
     if gecko_id != FIREFOX_GECKO_ID:
         pytest.fail("Firefox XPI has an unexpected Gecko extension ID")
     if attach.get("protocol") != PROTOCOL_VERSION or attach.get("mode") != "attach":
@@ -299,7 +301,9 @@ def _preserve_firefox_policy(
     try:
         previous_policy = policy_path.read_bytes() if policy_path.exists() else None
     except OSError as exc:
-        pytest.skip(f"Firefox Enterprise Policy file is not readable at {policy_path}: {exc}")
+        pytest.skip(
+            f"Firefox Enterprise Policy file is not readable at {policy_path}: {exc}"
+        )
     cleanup.callback(
         _restore_firefox_policy, policy_path, previous_policy, policy_dir_existed
     )

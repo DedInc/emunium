@@ -102,6 +102,7 @@ def test_write_firefox_policy_creates_distribution_and_uses_file_uri(tmp_path):
 
     assert policy_path == executable.parent / "distribution" / "policies.json"
     document = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert document["policies"]["SkipTermsOfUse"] is True
     extension = document["policies"]["ExtensionSettings"][EXTENSION_ID]
     assert extension == {
         "installation_mode": "force_installed",
@@ -110,7 +111,8 @@ def test_write_firefox_policy_creates_distribution_and_uses_file_uri(tmp_path):
     assert extension["install_url"].startswith("file:///")
 
 
-def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
+@pytest.mark.parametrize("skip_terms", [True, False])
+def test_write_firefox_policy_merges_existing_policy_data(tmp_path, skip_terms):
     executable = tmp_path / "firefox.exe"
     executable.write_bytes(b"firefox")
     xpi = tmp_path / "emunium.xpi"
@@ -121,6 +123,7 @@ def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
         "custom": {"keep": True},
         "policies": {
             "BlockAboutConfig": True,
+            "SkipTermsOfUse": skip_terms,
             "Preferences": {
                 "browser.aboutwelcome.enabled": {"Value": True, "Status": "locked"},
                 "browser.startup.homepage": {
@@ -145,6 +148,7 @@ def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
     updated = json.loads(policy_path.read_text(encoding="utf-8"))
     assert updated["custom"] == original["custom"]
     assert updated["policies"]["BlockAboutConfig"] is True
+    assert updated["policies"]["SkipTermsOfUse"] is skip_terms
     preferences = updated["policies"]["Preferences"]
     original_preferences = original["policies"]["Preferences"]
     for name, value in firefox.USER_PREFS.items():
@@ -152,14 +156,16 @@ def test_write_firefox_policy_merges_existing_policy_data(tmp_path):
             assert preferences[name] == original_preferences[name]
         else:
             assert preferences[name] == {"Value": value, "Status": "default"}
-    assert preferences["browser.startup.homepage"] == original_preferences[
-        "browser.startup.homepage"
-    ]
+    assert (
+        preferences["browser.startup.homepage"]
+        == original_preferences["browser.startup.homepage"]
+    )
     settings = updated["policies"]["ExtensionSettings"]
     assert settings["*"] == original["policies"]["ExtensionSettings"]["*"]
-    assert settings["another@example.com"] == original["policies"]["ExtensionSettings"][
-        "another@example.com"
-    ]
+    assert (
+        settings["another@example.com"]
+        == original["policies"]["ExtensionSettings"]["another@example.com"]
+    )
     assert settings[EXTENSION_ID] == {
         "installation_mode": "force_installed",
         "install_url": xpi.resolve().as_uri(),

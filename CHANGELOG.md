@@ -198,12 +198,16 @@ observe; they are listed first.
 - README quick start built around `with Browser() as browser:`, locators,
   `expect`, `expect_navigation` / `wait_for_url` and result records.
 - Installed-browser support: `Browser(browser=...)` takes `"chrome"`,
-  `"edge"`, `"brave"`, `"chromium"`, `"firefox"`, `"cft"`, `"auto"` or an
+  `"edge"`, `"brave"`, `"chromium"`, `"cft"`, `"auto"` or an
   executable path, and `Browser.browser_name` reports what was launched.
   Google Chrome gets the extension over `--remote-debugging-pipe`
   (`Extensions.loadUnpacked`), since it ignores `--load-extension` from
-  version 137; Firefox gets it through WebDriver BiDi `webExtension.install`
-  (a temporary install), with a Firefox build of the extension.
+  version 137. Firefox and recognized Gecko forks use `Browser.connect`
+  with a signed XPI installed through Enterprise Policies; `Browser.launch()`
+  refuses them. The CLI supports `--target firefox`, `--firefox-path` and
+  `--firefox-xpi`; `EMUNIUM_FIREFOX_XPI` overrides the versioned release XPI.
+  Policy updates preserve existing entries and add user-overridable preference
+  defaults plus `SkipTermsOfUse=true` when that policy is absent.
 - `Browser.connect()` drives a browser profile that has the emunium extension
   installed persistently: it waits for the extension on the hub port
   (default 47800), starts the browser detached when none connects
