@@ -1,11 +1,7 @@
-# docs/ci/ci.yml
+# .github/workflows/ci.yml
 # CI for emunium: unit tests (Python + JS) on Windows, Linux and macOS, lint,
 # the Linux e2e suite in Docker (Xvfb + openbox + Chromium) and the DOM e2e
-# suite headless on macOS.
-#
-# .github/ is a protected path for the agents working on this repository, so
-# this file lives here. To enable it, copy it by hand to
-# .github/workflows/ci.yml. No secrets are read and nothing is published.
+# suite headless on macOS. No secrets are read and nothing is published.
 #
 # Actions are pinned to full commit SHAs; the comment carries the tag.
 
@@ -47,7 +43,7 @@ jobs:
         # PageParser tests (they importorskip it otherwise).
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[standalone,parsing]" "pytest>=8"
+          python -m pip install -e ".[standalone,parsing,hub]" "pytest>=8"
       - name: Python unit tests
         # e2e tests are skipped without --e2e; the input safety net is armed.
         run: python -m pytest -q tests
@@ -81,7 +77,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -e ".[standalone,parsing]" "pytest>=8" "ruff==0.17.2" "ty==0.0.52"
+          .venv/bin/python -m pip install -e ".[standalone,parsing,hub]" pyautogui tomli "pytest>=8" "ruff==0.17.2" "ty==0.0.52"
       - name: ruff check
         run: .venv/bin/ruff check .
       - name: ruff format --check
